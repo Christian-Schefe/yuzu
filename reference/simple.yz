@@ -1,0 +1,9 @@
+4 + 2 * 2;
+let a = 5;
+a = a + 3;
+let c = { hi: 25, a: 2 };
+c.hi = c.a;
+print(a, 5, "hi", c.hi + c.a);
+
+let arr = [5, c.hi, {a = 77; a}];
+print(arr);

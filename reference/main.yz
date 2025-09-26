@@ -1,0 +1,24 @@
+let a = 5;
+let c = a + 2 * a;
+let my_var = (c + 2 * a) - 4 / 3;
+
+if (a > 3) 5 else 8;
+
+let float = 5.5;
+
+{ let a = 6; }
+
+print({ let a = 6; a * 2 });
+
+"\n
+string
+";
+
+if (a == b and c != This_Is_A_Weird_Case) {
+    let a = /* comment */ 6;
+    //single line comment
+    /*
+    multi line
+    comment
+    */
+}
