@@ -17,9 +17,14 @@ pub enum Value {
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<HashMap<String, Value>>>),
     Function(Rc<FunctionValue>),
-    BuiltinFunction(Rc<dyn Fn(Vec<Value>) -> Result<Value, RuntimeError>>),
+    BuiltinFunction(
+        Rc<dyn Fn(Vec<Value>, &LocatedExpression) -> Result<Value, LocatedControlFlow>>,
+    ),
     Prototype(Rc<PrototypeValue>),
 }
+
+type BuiltinFunctionType =
+    Rc<dyn Fn(Vec<Value>, &LocatedExpression) -> Result<Value, LocatedControlFlow>>;
 
 pub struct FunctionValue {
     parameters: Vec<String>,
@@ -93,7 +98,6 @@ impl Environment {
     }
 }
 
-#[derive(Debug)]
 pub enum RuntimeError {
     TypeError(String),
     UndefinedVariable(String),
@@ -101,23 +105,34 @@ pub enum RuntimeError {
     ArrayIndexOutOfBounds(i64),
     FunctionArgumentError(String),
     DuplicateVariableDefinition(String),
+    Custom(Value),
+    UnhandledControlFlow,
 }
 
-pub struct LocatedRuntimeError {
-    pub error: RuntimeError,
+pub enum ControlFlow {
+    Return(Value),
+    Break,
+    Continue,
+    Error(RuntimeError),
+}
+
+pub type LocatedControlFlow = Located<ControlFlow>;
+
+pub struct Located<T> {
+    pub data: T,
     pub span: core::ops::Range<usize>,
 }
 
 impl RuntimeError {
-    pub fn at(self, expr: &LocatedExpression) -> LocatedRuntimeError {
-        LocatedRuntimeError {
-            error: self,
+    pub fn at(self, expr: &LocatedExpression) -> LocatedControlFlow {
+        LocatedControlFlow {
+            data: ControlFlow::Error(self),
             span: expr.span.clone(),
         }
     }
-    pub fn from_to(self, from: &LocatedExpression, to: &LocatedExpression) -> LocatedRuntimeError {
-        LocatedRuntimeError {
-            error: self,
+    pub fn from_to(self, from: &LocatedExpression, to: &LocatedExpression) -> LocatedControlFlow {
+        LocatedControlFlow {
+            data: ControlFlow::Error(self),
             span: from.span.start..to.span.end,
         }
     }
@@ -136,6 +151,13 @@ impl fmt::Display for RuntimeError {
             Self::DuplicateVariableDefinition(name) => {
                 write!(f, "Variable already defined in this scope: {}", name)
             }
+            Self::UnhandledControlFlow => {
+                write!(
+                    f,
+                    "Unhandled control flow (return, break, continue) outside of function or loop"
+                )
+            }
+            Self::Custom(val) => write!(f, "Error: {}", variable_to_string(val)),
         }
     }
 }
@@ -171,13 +193,22 @@ fn variable_to_string(var: &Value) -> String {
     }
 }
 
-pub fn interpret_global(expr: &LocatedExpression) -> Result<Value, LocatedRuntimeError> {
+pub fn interpret_global(expr: &LocatedExpression) -> Result<Value, Located<RuntimeError>> {
     let global_env = Rc::new(Environment::new(None));
     define_globals(&*global_env);
-    interpret(expr, global_env)
+    match interpret(expr, global_env) {
+        Ok(v) => Ok(v),
+        Err(LocatedControlFlow { data, span }) => match data {
+            ControlFlow::Error(e) => Err(Located { data: e, span }),
+            _ => Err(Located {
+                data: RuntimeError::UnhandledControlFlow,
+                span,
+            }),
+        },
+    }
 }
 
-fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, LocatedRuntimeError> {
+fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, LocatedControlFlow> {
     match &expr.expr {
         Expression::Number(n) => Ok(Value::Number(*n)),
         Expression::Integer(i) => Ok(Value::Integer(*i)),
@@ -213,13 +244,46 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 let val = interpret(property, env.clone())?;
                 map.insert(name.clone(), val);
             }
+            let constructor = match map.remove("new") {
+                Some(Value::Function(f)) => Some(f),
+                None => None,
+                Some(_) => {
+                    return Err(RuntimeError::TypeError(
+                        "Constructor 'new' must be a function".to_string(),
+                    )
+                    .at(expr));
+                }
+            };
             map.insert(
                 "new".to_string(),
-                Value::BuiltinFunction(Rc::new(instantiate_prototype(map.clone()))),
+                Value::BuiltinFunction(instantiate_prototype(map.clone(), constructor)),
             );
             Ok(Value::Prototype(Rc::new(PrototypeValue {
                 properties: map,
             })))
+        }
+        Expression::Break => Err(LocatedControlFlow {
+            data: ControlFlow::Break,
+            span: expr.span.clone(),
+        }),
+        Expression::Continue => Err(LocatedControlFlow {
+            data: ControlFlow::Continue,
+            span: expr.span.clone(),
+        }),
+        Expression::Return(ret_expr) => {
+            let val = if let Some(expr) = ret_expr {
+                interpret(expr, env)?
+            } else {
+                Value::Null
+            };
+            Err(LocatedControlFlow {
+                data: ControlFlow::Return(val),
+                span: expr.span.clone(),
+            })
+        }
+        Expression::Raise(err_expr) => {
+            let val = interpret(err_expr, env.clone())?;
+            Err(RuntimeError::Custom(val).at(expr))
         }
         Expression::Ident(name) => {
             if let Some(val) = env.get(name) {
@@ -233,11 +297,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             if env.define(name, val) {
                 Ok(Value::Null)
             } else {
-                Err(RuntimeError::DuplicateVariableDefinition(format!(
-                    "Variable {} is already defined in this scope",
-                    name
-                ))
-                .at(expr))
+                Err(RuntimeError::DuplicateVariableDefinition(name.to_string()).at(expr))
             }
         }
         Expression::Block(exprs, ret) => {
@@ -272,31 +332,12 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 ),
             }
         }
-        Expression::ForLoop {
+        Expression::Loop {
             init,
             condition,
             increment,
             body,
-        } => {
-            let loop_env = Rc::new(Environment::new(Some(env)));
-            interpret(init, loop_env.clone())?;
-            while {
-                let cond = interpret(condition, loop_env.clone())?;
-                match cond {
-                    Value::Bool(b) => b,
-                    _ => {
-                        return Err(RuntimeError::TypeError(
-                            "Condition of for loop must be a boolean".to_string(),
-                        )
-                        .at(&condition));
-                    }
-                }
-            } {
-                interpret(body, loop_env.clone())?;
-                interpret(increment, loop_env.clone())?;
-            }
-            Ok(Value::Null)
-        }
+        } => interpret_for_loop(env, init, condition, increment, body),
         Expression::UnaryOp { op, expr } => {
             let val = interpret(expr, env.clone())?;
             match (op, val) {
@@ -310,13 +351,77 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 .at(expr)),
             }
         }
+        Expression::IterLoop {
+            item,
+            iterable,
+            body,
+        } => {
+            let iterable_val = interpret(iterable, env.clone())?;
+            match &iterable_val {
+                Value::Object(properties) => {
+                    let Some(iter_fn) = properties.borrow().get("iter").cloned() else {
+                        return Err(
+                            RuntimeError::TypeError("Object is not iterable".to_string())
+                                .at(&iterable),
+                        );
+                    };
+                    let iter = do_function_call(iter_fn, &iterable, vec![iterable_val.clone()])?;
+                    let Value::Object(iter_map) = &iter else {
+                        return Err(RuntimeError::TypeError(
+                            "Iterator is not an object".to_string(),
+                        )
+                        .at(&iterable));
+                    };
+                    let Some(next_fn) = iter_map.borrow().get("next").cloned() else {
+                        return Err(RuntimeError::TypeError(
+                            "Iterator does not have next method".to_string(),
+                        )
+                        .at(&iterable));
+                    };
+                    loop {
+                        let next = match do_function_call(
+                            next_fn.clone(),
+                            &iterable,
+                            vec![iter.clone()],
+                        ) {
+                            Err(Located {
+                                data: ControlFlow::Error(RuntimeError::Custom(Value::String(s))),
+                                ..
+                            }) if s.iter().collect::<String>() == "IterStop" => { // TODO: better way to signal end of iteration
+                                break;
+                            }
+                            other => other?,
+                        };
+                        let loop_env = Rc::new(Environment::new(Some(env.clone())));
+                        loop_env.define(item, next);
+                        if let Err(LocatedControlFlow { data, span }) =
+                            interpret(body, loop_env.clone())
+                        {
+                            match data {
+                                ControlFlow::Break => break,
+                                ControlFlow::Continue => continue,
+                                other => {
+                                    return Err(LocatedControlFlow { data: other, span });
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                _ => Err(
+                    RuntimeError::TypeError("Can only iterate over arrays".to_string())
+                        .at(&iterable),
+                ),
+            }
+        }
         Expression::BinaryOp { op, left, right } => interpret_binary_op(&env, op, left, right),
         Expression::FunctionCall {
             function,
             arguments,
         } => {
             let func_val = interpret(function, env.clone())?;
-            do_function_call(func_val, &function, arguments, env)
+            let arg_vals = interpret_args(arguments, env.clone())?;
+            do_function_call(func_val, &function, arg_vals)
         }
         Expression::PropertyFunctionCall {
             object,
@@ -324,48 +429,31 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             arguments,
         } => {
             let obj_val = interpret(object, env.clone())?;
-            let res = match &obj_val {
+            let arg_vals = interpret_args(arguments, env.clone())?;
+            match &obj_val {
                 Value::Object(object_map) => {
                     let function = object_map.borrow().get(function).cloned();
-                    function
-                        .map(|v| {
-                            do_target_function_call(
-                                Some(&obj_val),
-                                &object,
-                                v,
-                                arguments,
-                                env.clone(),
-                            )
-                        })
-                        .transpose()?
+                    if let Some(f) = function {
+                        return do_target_function_call(Some(&obj_val), &object, f, arg_vals);
+                    }
                 }
                 Value::Prototype(p) => {
                     let function = p.properties.get(function).cloned();
-                    function
-                        .map(|v| do_target_function_call(None, &object, v, arguments, env.clone()))
-                        .transpose()?
-                }
-                _ => None,
-            };
-            if let Some(v) = res {
-                Ok(v)
-            } else {
-                let prototype = obj_val.get_prototype_name();
-                if let Some(Value::Prototype(p)) = env.get(prototype) {
-                    if let Some(val) = p.properties.get(function).cloned() {
-                        do_target_function_call(
-                            Some(&obj_val),
-                            &object,
-                            val,
-                            arguments,
-                            env.clone(),
-                        )
-                    } else {
-                        Err(RuntimeError::FieldAccessError(function.clone()).at(&object))
+                    if let Some(f) = function {
+                        return do_target_function_call(None, &object, f, arg_vals);
                     }
+                }
+                _ => {}
+            };
+            let prototype = obj_val.get_prototype_name();
+            if let Some(Value::Prototype(p)) = env.get(prototype) {
+                if let Some(val) = p.properties.get(function).cloned() {
+                    do_target_function_call(Some(&obj_val), &object, val, arg_vals)
                 } else {
                     Err(RuntimeError::FieldAccessError(function.clone()).at(&object))
                 }
+            } else {
+                Err(RuntimeError::FieldAccessError(function.clone()).at(&object))
             }
         }
         Expression::FieldAccess { object, field } => {
@@ -393,14 +481,14 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
         Expression::ArrayIndex { array, index } => {
             let arr_val = interpret(array, env.clone())?;
             let idx_val = interpret(index, env.clone())?;
-            let Value::Integer(i) = idx_val else {
-                return Err(
-                    RuntimeError::TypeError("Array index must be an integer".to_string())
-                        .at(&index),
-                );
-            };
             match arr_val {
                 Value::Array(elements) => {
+                    let Value::Integer(i) = idx_val else {
+                        return Err(RuntimeError::TypeError(
+                            "Array index must be an integer".to_string(),
+                        )
+                        .at(&index));
+                    };
                     let elements = elements.borrow();
                     if let Ok(i) = TryInto::<usize>::try_into(i)
                         && i < elements.len()
@@ -411,12 +499,33 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                     }
                 }
                 Value::String(string) => {
+                    let Value::Integer(i) = idx_val else {
+                        return Err(RuntimeError::TypeError(
+                            "Array index must be an integer".to_string(),
+                        )
+                        .at(&index));
+                    };
                     if let Ok(i) = TryInto::<usize>::try_into(i)
                         && i < string.len()
                     {
                         Ok(Value::String(vec![string[i]]))
                     } else {
                         Err(RuntimeError::ArrayIndexOutOfBounds(i).at(&index))
+                    }
+                }
+                Value::Object(object_map) => {
+                    let Value::String(key_chars) = idx_val else {
+                        return Err(RuntimeError::TypeError(
+                            "Object index must be a string".to_string(),
+                        )
+                        .at(&index));
+                    };
+                    let key: String = key_chars.iter().collect();
+                    let map = object_map.borrow();
+                    if let Some(val) = map.get(&key) {
+                        Ok(val.clone())
+                    } else {
+                        Err(RuntimeError::FieldAccessError(key).at(&index))
                     }
                 }
                 _ => {
@@ -430,18 +539,111 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
     }
 }
 
+fn interpret_for_loop(
+    env: Rc<Environment>,
+    init: &Option<Box<LocatedExpression>>,
+    condition: &Box<LocatedExpression>,
+    increment: &Option<Box<LocatedExpression>>,
+    body: &Box<LocatedExpression>,
+) -> Result<Value, Located<ControlFlow>> {
+    let loop_env = Rc::new(Environment::new(Some(env)));
+    if let Some(init) = init {
+        interpret(init, loop_env.clone())?;
+    }
+    loop {
+        let cond = match interpret(condition, loop_env.clone()) {
+            Err(LocatedControlFlow { data, span }) => match data {
+                ControlFlow::Break => break,
+                ControlFlow::Continue => continue,
+                other => {
+                    return Err(LocatedControlFlow { data: other, span });
+                }
+            },
+            Ok(v) => v,
+        };
+        let Value::Bool(cond) = cond else {
+            return Err(RuntimeError::TypeError(
+                "Condition of for loop must be a boolean".to_string(),
+            )
+            .at(&condition));
+        };
+        if !cond {
+            break;
+        }
+
+        if let Err(LocatedControlFlow { data, span }) = interpret(body, loop_env.clone()) {
+            match data {
+                ControlFlow::Break => break,
+                ControlFlow::Continue => continue,
+                other => {
+                    return Err(LocatedControlFlow { data: other, span });
+                }
+            }
+        }
+        if let Some(increment) = increment {
+            if let Err(LocatedControlFlow { data, span }) = interpret(increment, loop_env.clone()) {
+                match data {
+                    ControlFlow::Break => break,
+                    ControlFlow::Continue => continue,
+                    other => {
+                        return Err(LocatedControlFlow { data: other, span });
+                    }
+                }
+            }
+        }
+    }
+    Ok(Value::Null)
+}
+
 fn interpret_binary_op(
     env: &Rc<Environment>,
     op: &BinaryOp,
     left: &Box<LocatedExpression>,
     right: &Box<LocatedExpression>,
-) -> Result<Value, LocatedRuntimeError> {
-    if let BinaryOp::Assign = op {
+) -> Result<Value, LocatedControlFlow> {
+    if op == &BinaryOp::Assign
+        || op == &BinaryOp::AddAssign
+        || op == &BinaryOp::SubtractAssign
+        || op == &BinaryOp::MultiplyAssign
+        || op == &BinaryOp::DivideAssign
+    {
+        fn compute_result(
+            op: &BinaryOp,
+            left: impl FnOnce() -> Result<Value, RuntimeError>,
+            right: Value,
+        ) -> Result<Value, RuntimeError> {
+            match op {
+                BinaryOp::Assign => Ok(right),
+                BinaryOp::AddAssign
+                | BinaryOp::SubtractAssign
+                | BinaryOp::MultiplyAssign
+                | BinaryOp::DivideAssign => {
+                    let actual_op = match op {
+                        BinaryOp::AddAssign => BinaryOp::Add,
+                        BinaryOp::SubtractAssign => BinaryOp::Subtract,
+                        BinaryOp::MultiplyAssign => BinaryOp::Multiply,
+                        BinaryOp::DivideAssign => BinaryOp::Divide,
+                        _ => unreachable!(),
+                    };
+                    interpret_simple_binary_op(&actual_op, left()?, right)
+                }
+                _ => unreachable!(),
+            }
+        }
         match &left.expr {
             Expression::Ident(name) => {
                 let val = interpret(right, env.clone())?;
-                if env.set(name, val.clone()) {
-                    Ok(val)
+                let result = compute_result(
+                    op,
+                    || {
+                        env.get(name)
+                            .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()))
+                    },
+                    val,
+                )
+                .map_err(|e| e.at(left))?;
+                if env.set(name, result.clone()) {
+                    Ok(result)
                 } else {
                     Err(RuntimeError::UndefinedVariable(name.clone()).at(left))
                 }
@@ -451,9 +653,20 @@ fn interpret_binary_op(
                 match obj_val {
                     Value::Object(object_map) => {
                         let val = interpret(right, env.clone())?;
+                        let result = compute_result(
+                            op,
+                            || {
+                                let map = object_map.borrow();
+                                map.get(field)
+                                    .cloned()
+                                    .ok_or_else(|| RuntimeError::FieldAccessError(field.clone()))
+                            },
+                            val,
+                        )
+                        .map_err(|e| e.at(left))?;
                         let mut map = object_map.borrow_mut();
-                        map.insert(field.clone(), val.clone());
-                        Ok(val)
+                        map.insert(field.clone(), result.clone());
+                        Ok(result)
                     }
                     _ => Err(RuntimeError::TypeError(
                         "Field access must be on an object".to_string(),
@@ -476,13 +689,23 @@ fn interpret_binary_op(
                     )
                     .at(&index));
                 };
-                let mut elements = elements.borrow_mut();
-                if let Ok(i) = TryInto::<usize>::try_into(i)
-                    && i < elements.len()
-                {
+                if let Ok(i) = TryInto::<usize>::try_into(i) {
                     let val = interpret(right, env.clone())?;
-                    elements[i] = val.clone();
-                    Ok(val)
+                    let result = compute_result(
+                        op,
+                        || {
+                            let elements = elements.borrow();
+                            if i >= elements.len() {
+                                return Err(RuntimeError::ArrayIndexOutOfBounds(i as i64));
+                            }
+                            Ok(elements[i].clone())
+                        },
+                        val,
+                    )
+                    .map_err(|e| e.at(left))?;
+                    let mut elements = elements.borrow_mut();
+                    elements[i] = result.clone();
+                    Ok(result)
                 } else {
                     Err(RuntimeError::ArrayIndexOutOfBounds(i).at(&index))
                 }
@@ -514,15 +737,31 @@ fn interpret_simple_binary_op(
     match (op, left, right) {
         (BinaryOp::Add, Value::Number(l), Value::Number(r)) => Ok(Value::Number(l + r)),
         (BinaryOp::Add, Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l + r)),
+        (BinaryOp::Add, Value::Integer(l), Value::Number(r)) => Ok(Value::Number(l as f64 + r)),
+        (BinaryOp::Add, Value::Number(l), Value::Integer(r)) => Ok(Value::Number(l + r as f64)),
 
         (BinaryOp::Subtract, Value::Number(l), Value::Number(r)) => Ok(Value::Number(l - r)),
         (BinaryOp::Subtract, Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l - r)),
+        (BinaryOp::Subtract, Value::Integer(l), Value::Number(r)) => {
+            Ok(Value::Number(l as f64 - r))
+        }
+        (BinaryOp::Subtract, Value::Number(l), Value::Integer(r)) => {
+            Ok(Value::Number(l - r as f64))
+        }
 
         (BinaryOp::Multiply, Value::Number(l), Value::Number(r)) => Ok(Value::Number(l * r)),
         (BinaryOp::Multiply, Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l * r)),
+        (BinaryOp::Multiply, Value::Integer(l), Value::Number(r)) => {
+            Ok(Value::Number(l as f64 * r))
+        }
+        (BinaryOp::Multiply, Value::Number(l), Value::Integer(r)) => {
+            Ok(Value::Number(l * r as f64))
+        }
 
         (BinaryOp::Divide, Value::Number(l), Value::Number(r)) => Ok(Value::Number(l / r)),
         (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l / r)),
+        (BinaryOp::Divide, Value::Integer(l), Value::Number(r)) => Ok(Value::Number(l as f64 / r)),
+        (BinaryOp::Divide, Value::Number(l), Value::Integer(r)) => Ok(Value::Number(l / r as f64)),
 
         (BinaryOp::And, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l && r)),
         (BinaryOp::Or, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l || r)),
@@ -565,9 +804,8 @@ fn is_value_equal(l: &Value, r: &Value) -> bool {
 fn do_function_call(
     function_val: Value,
     function: &LocatedExpression,
-    arguments: &Vec<LocatedExpression>,
-    env: Rc<Environment>,
-) -> Result<Value, LocatedRuntimeError> {
+    arguments: Vec<Value>,
+) -> Result<Value, LocatedControlFlow> {
     match function_val {
         Value::Function(f) => {
             let FunctionValue {
@@ -584,21 +822,15 @@ fn do_function_call(
                 .at(&function));
             }
             let call_env = Rc::new(Environment::new(Some(func_env.clone())));
-            for (param, arg) in parameters.iter().zip(arguments.iter()) {
-                let arg_val = interpret(arg, env.clone())?;
-                if !call_env.define(param, arg_val) {
+            for (param, arg) in parameters.iter().zip(arguments.into_iter()) {
+                if !call_env.define(param, arg) {
                     unreachable!("Parameter name should not be duplicated: {}", param);
                 }
             }
-            interpret(&body, call_env)
+            handle_return_control_flow(interpret(&body, call_env), &body)
         }
         Value::BuiltinFunction(func) => {
-            let mut arg_vals = Vec::new();
-            for arg in arguments {
-                let val = interpret(arg, env.clone())?;
-                arg_vals.push(val);
-            }
-            func(arg_vals).map_err(|e| e.at(&function))
+            handle_return_control_flow(func(arguments, &function), &function)
         }
         _ => Err(
             RuntimeError::TypeError("Attempted to call a non-function value".to_string())
@@ -611,9 +843,8 @@ fn do_target_function_call(
     target_val: Option<&Value>,
     target: &LocatedExpression,
     function_val: Value,
-    arguments: &Vec<LocatedExpression>,
-    env: Rc<Environment>,
-) -> Result<Value, LocatedRuntimeError> {
+    arguments: Vec<Value>,
+) -> Result<Value, LocatedControlFlow> {
     match function_val {
         Value::Function(f) => {
             let FunctionValue {
@@ -631,37 +862,59 @@ fn do_target_function_call(
                 .at(&target));
             }
             let call_env = Rc::new(Environment::new(Some(func_env.clone())));
-            for i in 0..parameters.len() {
-                let param = &parameters[i];
-                let arg = if i == 0
-                    && let Some(target_val) = target_val
-                {
-                    target_val.clone()
-                } else {
-                    let index = if target_val.is_some() { i - 1 } else { i };
-                    interpret(&arguments[index], env.clone())?
-                };
+            if let Some(target_val) = target_val {
+                call_env.define(&parameters[0], target_val.clone());
+            }
+            for (param, arg) in parameters.iter().skip(1).zip(arguments.into_iter()) {
                 if !call_env.define(param, arg) {
                     unreachable!("Parameter name should not be duplicated: {}", param);
                 }
             }
-            interpret(&body, call_env)
+            handle_return_control_flow(interpret(&body, call_env), &body)
         }
         Value::BuiltinFunction(func) => {
-            let mut arg_vals = if let Some(target_val) = target_val {
-                vec![target_val.clone()]
-            } else {
-                Vec::new()
-            };
-            for arg in arguments {
-                let val = interpret(arg, env.clone())?;
-                arg_vals.push(val);
-            }
-            func(arg_vals).map_err(|e| e.at(&target))
+            let arg_vals = target_val
+                .cloned()
+                .into_iter()
+                .chain(arguments.into_iter())
+                .collect::<Vec<_>>();
+            handle_return_control_flow(func(arg_vals, &target), &target)
         }
         _ => Err(
             RuntimeError::TypeError("Attempted to call a non-function value".to_string())
                 .at(&target),
         ),
     }
+}
+
+fn handle_return_control_flow(
+    res: Result<Value, LocatedControlFlow>,
+    expr: &LocatedExpression,
+) -> Result<Value, LocatedControlFlow> {
+    match res {
+        Ok(v) => Ok(v),
+        Err(LocatedControlFlow { data, span }) => match data {
+            ControlFlow::Error(e) => Err(Located {
+                data: ControlFlow::Error(e),
+                span,
+            }),
+            ControlFlow::Return(v) => Ok(v),
+            _ => Err(Located {
+                data: ControlFlow::Error(RuntimeError::UnhandledControlFlow),
+                span: expr.span.clone(),
+            }),
+        },
+    }
+}
+
+fn interpret_args(
+    args: &Vec<LocatedExpression>,
+    env: Rc<Environment>,
+) -> Result<Vec<Value>, LocatedControlFlow> {
+    let mut arg_vals = Vec::new();
+    for arg in args {
+        let val = interpret(arg, env.clone())?;
+        arg_vals.push(val);
+    }
+    Ok(arg_vals)
 }

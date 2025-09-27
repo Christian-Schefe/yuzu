@@ -53,10 +53,10 @@ fn main() {
     if let Err(err) = interpreted {
         Report::build(ReportKind::Error, ((), err.span.clone()))
             .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-            .with_message(err.error.to_string())
+            .with_message(err.data.to_string())
             .with_label(
                 Label::new(((), err.span))
-                    .with_message(err.error.to_string())
+                    .with_message(err.data.to_string())
                     .with_color(Color::Red),
             )
             .finish()

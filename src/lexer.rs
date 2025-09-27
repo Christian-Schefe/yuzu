@@ -77,6 +77,15 @@ pub enum Token<'a> {
     #[token("/")]
     Slash,
 
+    #[token("+=")]
+    PlusAssign,
+    #[token("-=")]
+    MinusAssign,
+    #[token("*=")]
+    StarAssign,
+    #[token("/=")]
+    SlashAssign,
+
     #[token("==")]
     Equal,
     #[token("!=")]
@@ -111,12 +120,16 @@ pub enum Token<'a> {
     For,
     #[token("while")]
     While,
+    #[token("in")]
+    In,
     #[token("return")]
     Return,
     #[token("break")]
     Break,
     #[token("continue")]
     Continue,
+    #[token("raise")]
+    Raise,
 
     #[token("or")]
     Or,
@@ -181,6 +194,10 @@ impl fmt::Display for Token<'_> {
             Self::Minus => write!(f, "-"),
             Self::Star => write!(f, "*"),
             Self::Slash => write!(f, "/"),
+            Self::PlusAssign => write!(f, "+="),
+            Self::MinusAssign => write!(f, "-="),
+            Self::StarAssign => write!(f, "*="),
+            Self::SlashAssign => write!(f, "/="),
             Self::Equal => write!(f, "=="),
             Self::NotEqual => write!(f, "!="),
             Self::Less => write!(f, "<"),
@@ -202,6 +219,8 @@ impl fmt::Display for Token<'_> {
             Self::Return => write!(f, "return"),
             Self::Break => write!(f, "break"),
             Self::Continue => write!(f, "continue"),
+            Self::Raise => write!(f, "raise"),
+            Self::In => write!(f, "in"),
             Self::Ident(s) => write!(f, "Ident({})", s),
             Self::Number(n) => write!(f, "Number({})", n),
             Self::Integer(i) => write!(f, "Integer({})", i),

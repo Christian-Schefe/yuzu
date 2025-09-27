@@ -44,10 +44,15 @@ pub enum Expression {
         then_branch: Box<LocatedExpression>,
         else_branch: Option<Box<LocatedExpression>>,
     },
-    ForLoop {
-        init: Box<LocatedExpression>,
+    Loop {
+        init: Option<Box<LocatedExpression>>,
         condition: Box<LocatedExpression>,
-        increment: Box<LocatedExpression>,
+        increment: Option<Box<LocatedExpression>>,
+        body: Box<LocatedExpression>,
+    },
+    IterLoop {
+        item: String,
+        iterable: Box<LocatedExpression>,
         body: Box<LocatedExpression>,
     },
     Ident(String),
@@ -68,6 +73,10 @@ pub enum Expression {
         function: String,
         arguments: Vec<LocatedExpression>,
     },
+    Break,
+    Continue,
+    Return(Option<Box<LocatedExpression>>),
+    Raise(Box<LocatedExpression>),
 }
 
 impl fmt::Display for Expression {
@@ -134,16 +143,37 @@ impl fmt::Display for Expression {
                     write!(f, "None)")
                 }
             }
-            Self::ForLoop {
+            Self::Loop {
                 init,
                 condition,
                 increment,
                 body,
-            } => write!(
-                f,
-                "ForLoop({}, {}, {}, {})",
-                init.expr, condition.expr, increment.expr, body.expr
-            ),
+            } => {
+                write!(f, "Loop(")?;
+                if let Some(init) = init {
+                    write!(f, "init: {}, ", init.expr)?;
+                } else {
+                    write!(f, "init: None, ")?;
+                }
+                write!(f, "condition: {}, ", condition.expr)?;
+                if let Some(increment) = increment {
+                    write!(f, "increment: {}, ", increment.expr)?;
+                } else {
+                    write!(f, "increment: None, ")?;
+                }
+                write!(f, "body: {})", body.expr)
+            }
+            Self::IterLoop {
+                item,
+                iterable,
+                body,
+            } => {
+                write!(
+                    f,
+                    "IterLoop(item: {}, iterable: {}, body: {})",
+                    item, iterable.expr, body.expr
+                )
+            }
             Self::Ident(name) => write!(f, "Ident({})", name),
             Self::ArrayIndex { array, index } => {
                 write!(f, "ArrayIndex({}, {})", array.expr, index.expr)
@@ -172,6 +202,16 @@ impl fmt::Display for Expression {
                 }
                 write!(f, "])")
             }
+            Self::Break => write!(f, "Break"),
+            Self::Continue => write!(f, "Continue"),
+            Self::Return(expr) => {
+                if let Some(expr) = expr {
+                    write!(f, "Return({})", expr.expr)
+                } else {
+                    write!(f, "Return(None)")
+                }
+            }
+            Self::Raise(expr) => write!(f, "Raise({})", expr.expr),
         }
     }
 }
@@ -189,7 +229,7 @@ fn located(expr: Expression, span: SimpleSpan) -> LocatedExpression {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BinaryOp {
     Add,
     Subtract,
@@ -207,6 +247,10 @@ pub enum BinaryOp {
     Or,
 
     Assign,
+    AddAssign,
+    SubtractAssign,
+    MultiplyAssign,
+    DivideAssign,
 }
 
 impl fmt::Display for BinaryOp {
@@ -225,6 +269,10 @@ impl fmt::Display for BinaryOp {
             Self::And => write!(f, "and"),
             Self::Or => write!(f, "or"),
             Self::Assign => write!(f, "="),
+            Self::AddAssign => write!(f, "+="),
+            Self::SubtractAssign => write!(f, "-="),
+            Self::MultiplyAssign => write!(f, "*="),
+            Self::DivideAssign => write!(f, "/="),
         }
     }
 }
@@ -259,8 +307,18 @@ where
         Token::Char(c) => Expression::String(c.to_string()),
         Token::Ident(name) => Expression::Ident(name.to_string()),
         Token::Null => Expression::Null,
+        Token::Break => Expression::Break,
+        Token::Continue => Expression::Continue,
     }
     .map_with(|expr, extra| located(expr, extra.span()));
+
+    let return_expr = just(Token::Return)
+        .ignore_then(expr.clone().or_not())
+        .map_with(|expr, extra| located(Expression::Return(expr.map(Box::new)), extra.span()));
+
+    let raise_expr = just(Token::Raise)
+        .ignore_then(expr.clone())
+        .map_with(|expr, extra| located(Expression::Raise(Box::new(expr)), extra.span()));
 
     let array_literal = expr
         .clone()
@@ -382,10 +440,47 @@ where
         .then(expr.clone())
         .map_with(|(((init, condition), increment), body), extra| {
             located(
-                Expression::ForLoop {
-                    init: Box::new(init),
+                Expression::Loop {
+                    init: Some(Box::new(init)),
                     condition: Box::new(condition),
-                    increment: Box::new(increment),
+                    increment: Some(Box::new(increment)),
+                    body: Box::new(body),
+                },
+                extra.span(),
+            )
+        });
+
+    let while_loop = just(Token::While)
+        .ignore_then(
+            expr.clone()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(expr.clone())
+        .map_with(|(condition, body), extra| {
+            located(
+                Expression::Loop {
+                    init: None,
+                    condition: Box::new(condition),
+                    increment: None,
+                    body: Box::new(body),
+                },
+                extra.span(),
+            )
+        });
+
+    let iter_loop = just(Token::For)
+        .ignore_then(
+            select! { Token::Ident(name) => name.to_string() }
+                .then_ignore(just(Token::In))
+                .then(expr.clone())
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(expr.clone())
+        .map_with(|((item, iterable), body), extra| {
+            located(
+                Expression::IterLoop {
+                    item,
+                    iterable: Box::new(iterable),
                     body: Box::new(body),
                 },
                 extra.span(),
@@ -454,8 +549,12 @@ where
         define_fn,
         define_class,
         for_loop,
+        while_loop,
+        iter_loop,
         if_else,
         parenthesized,
+        return_expr,
+        raise_expr,
     ));
 
     let op = |c| just(c);
@@ -512,6 +611,26 @@ where
         bin_infix(Associativity::Left(6), Token::And, BinaryOp::And),
         bin_infix(Associativity::Left(5), Token::Or, BinaryOp::Or),
         bin_infix(Associativity::Right(3), Token::Assign, BinaryOp::Assign),
+        bin_infix(
+            Associativity::Right(3),
+            Token::PlusAssign,
+            BinaryOp::AddAssign,
+        ),
+        bin_infix(
+            Associativity::Right(3),
+            Token::MinusAssign,
+            BinaryOp::SubtractAssign,
+        ),
+        bin_infix(
+            Associativity::Right(3),
+            Token::StarAssign,
+            BinaryOp::MultiplyAssign,
+        ),
+        bin_infix(
+            Associativity::Right(3),
+            Token::SlashAssign,
+            BinaryOp::DivideAssign,
+        ),
         postfix(
             16,
             just(Token::Dot)
