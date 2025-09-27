@@ -1,0 +1,11 @@
+class Vec {
+    let x = 0;
+    let y = 0;
+    fn shift_left(this) this.x = this.x - 1;
+};
+
+let v = Vec.new();
+print(v);
+v.shift_left();
+Vec.shift_left(v);
+print(v.x, v.y);

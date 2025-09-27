@@ -2,8 +2,46 @@ use std::fmt;
 
 use logos::Logos;
 
+#[derive(Default, Debug, Clone, PartialEq)]
+pub enum LexingError {
+    InvalidChar(String),
+    #[default]
+    Other,
+}
+
+impl fmt::Display for LexingError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::InvalidChar(c) => write!(f, "Invalid character: {}", c),
+            Self::Other => write!(f, "Unknown lexing error"),
+        }
+    }
+}
+
+impl LexingError {
+    fn at(&self, span: core::ops::Range<usize>) -> LocatedLexingError {
+        LocatedLexingError {
+            error: self.clone(),
+            span: span,
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct LocatedLexingError {
+    pub error: LexingError,
+    pub span: core::ops::Range<usize>,
+}
+
+fn from_lexing_error<'a>(lexer: &logos::Lexer<'a, Token<'a>>) -> LocatedLexingError {
+    LocatedLexingError {
+        error: LexingError::InvalidChar(lexer.slice().to_string()),
+        span: lexer.span(),
+    }
+}
+
 #[derive(Logos, Clone, PartialEq, Debug)]
-#[logos(skip r"[ \t\r\n\f]+", skip r"//[^\n]*", skip r"/\*([^*]|\*[^/])*\*/")]
+#[logos(skip r"[ \t\r\n\f]+", skip r"//[^\n]*", skip r"/\*([^*]|\*[^/])*\*/", error(LocatedLexingError, from_lexing_error))]
 pub enum Token<'a> {
     #[token("false", |_| false)]
     #[token("true", |_| true)]
@@ -60,10 +98,25 @@ pub enum Token<'a> {
 
     #[token("let")]
     Let,
+    #[token("fn")]
+    Fn,
+    #[token("class")]
+    Class,
+
     #[token("if")]
     If,
     #[token("else")]
     Else,
+    #[token("for")]
+    For,
+    #[token("while")]
+    While,
+    #[token("return")]
+    Return,
+    #[token("break")]
+    Break,
+    #[token("continue")]
+    Continue,
 
     #[token("or")]
     Or,
@@ -75,11 +128,31 @@ pub enum Token<'a> {
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
     Ident(&'a str),
 
-    #[regex(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", |lex| lex.slice().parse::<f64>().unwrap())]
+    #[regex(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", |lex| lex.slice().parse::<f64>().map_err(|_| LexingError::InvalidChar(lex.slice().to_string()).at(lex.span())), priority = 3)]
     Number(f64),
 
-    #[regex(r"-?(?:0|[1-9]\d*)", |lex| lex.slice().parse::<i64>().unwrap(), priority = 4)]
+    #[regex(r"-?(?:0|[1-9]\d*)", |lex| lex.slice().parse::<i64>().map_err(|_| LexingError::InvalidChar(lex.slice().to_string()).at(lex.span())), priority = 4)]
     Integer(i64),
+
+    #[regex(r"'([^'\\]|\\.)*'", |lex| {
+        let slice = lex.slice();
+        let unquoted = &slice[1..slice.len() - 1];
+        match unquoted {
+            r#"\'"# => Ok('\''),
+            r#"\n"# => Ok('\n'),
+            r#"\t"# => Ok('\t'),
+            r#"\\"# => Ok('\\'),
+            _ => {
+                let chars: Vec<char> = unquoted.chars().collect();
+                if chars.len() == 1 {
+                    Ok(chars[0])
+                } else {
+                    Err(LexingError::InvalidChar(lex.slice().to_string()).at(lex.span()))
+                }
+            }
+        }
+    })]
+    Char(char),
 
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let slice = lex.slice();
@@ -117,15 +190,23 @@ impl fmt::Display for Token<'_> {
             Self::Assign => write!(f, "="),
             Self::Null => write!(f, "null"),
             Self::Let => write!(f, "let"),
+            Self::Fn => write!(f, "fn"),
+            Self::Class => write!(f, "class"),
             Self::Or => write!(f, "or"),
             Self::And => write!(f, "and"),
             Self::Not => write!(f, "not"),
             Self::If => write!(f, "if"),
             Self::Else => write!(f, "else"),
+            Self::For => write!(f, "for"),
+            Self::While => write!(f, "while"),
+            Self::Return => write!(f, "return"),
+            Self::Break => write!(f, "break"),
+            Self::Continue => write!(f, "continue"),
             Self::Ident(s) => write!(f, "Ident({})", s),
             Self::Number(n) => write!(f, "Number({})", n),
             Self::Integer(i) => write!(f, "Integer({})", i),
             Self::String(s) => write!(f, "String(\"{}\")", s),
+            Self::Char(c) => write!(f, "Char('{}')", c),
         }
     }
 }
@@ -136,7 +217,7 @@ pub struct LocatedToken<'a> {
     pub span: core::ops::Range<usize>,
 }
 
-pub fn lex(input: &str) -> Result<Vec<LocatedToken>, ()> {
+pub fn lex(input: &str) -> Result<Vec<LocatedToken>, LocatedLexingError> {
     let mut lexer = Token::lexer(input);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next() {

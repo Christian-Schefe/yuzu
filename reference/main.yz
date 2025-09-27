@@ -6,14 +6,15 @@ if (a > 3) 5 else 8;
 
 let float = 5.5;
 
-{ let a = 6; }
+{ let a = 6; };
 
 print({ let a = 6; a * 2 });
 
 "\n
 string
 ";
-
+let b = 5;
+let This_Is_A_Weird_Case = null;
 if (a == b and c != This_Is_A_Weird_Case) {
     let a = /* comment */ 6;
     //single line comment
@@ -21,4 +22,5 @@ if (a == b and c != This_Is_A_Weird_Case) {
     multi line
     comment
     */
-}
+};
+print(This_Is_A_Weird_Case);

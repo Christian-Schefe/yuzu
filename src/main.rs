@@ -1,5 +1,6 @@
 use std::io::Read;
 
+use ariadne::{Color, Label, Report, ReportKind, Source};
 use clap::Parser;
 use clio::Input;
 
@@ -30,14 +31,37 @@ fn main() {
     let input = String::from_utf8_lossy(&buf);
     println!("{}", input);
     let lexed = lexer::lex(&input);
-    println!("{:?}", lexed);
-    let Some(parsed) = parser::parse(&input, lexed.expect("Lexing failed")) else {
+    if let Err(err) = lexed {
+        Report::build(ReportKind::Error, ((), err.span.clone()))
+            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+            .with_message(err.error.to_string())
+            .with_label(
+                Label::new(((), err.span))
+                    .with_message(err.error.to_string())
+                    .with_color(Color::Red),
+            )
+            .finish()
+            .eprint(Source::from(&input))
+            .unwrap();
+        std::process::exit(1);
+    }
+    let Some(parsed) = parser::parse(&input, lexed.unwrap()) else {
         std::process::exit(1);
     };
-    println!("{}", parsed);
+    println!("{}", parsed.expr);
     let interpreted = tree_interpreter::interpret_global(&parsed);
-    if let Err(e) = interpreted {
-        eprintln!("Runtime error: {:?}", e);
+    if let Err(err) = interpreted {
+        Report::build(ReportKind::Error, ((), err.span.clone()))
+            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+            .with_message(err.error.to_string())
+            .with_label(
+                Label::new(((), err.span))
+                    .with_message(err.error.to_string())
+                    .with_color(Color::Red),
+            )
+            .finish()
+            .eprint(Source::from(&input))
+            .unwrap();
         std::process::exit(1);
     } else {
         println!("Program executed successfully");
