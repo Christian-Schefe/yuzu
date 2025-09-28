@@ -1,0 +1,52 @@
+class Iterator {
+    fn map(this, map) MapIterator.new(this, map);
+    fn collect(this) {
+        let res = [];
+        let cur = this.next();
+        while (cur != null) {
+            res.push(cur.value);
+            cur = this.next();
+        }
+        res
+    }
+}
+
+class IndexIterator : Iterator {
+    constructor fn new(this, target) {
+        this.target = target;
+        this.current = -1;
+    }
+    fn next(this) {
+        this.current += 1;
+        if (this.current >= this.target.length()) null
+        else {value: this.target[this.current]}
+    }
+}
+
+class MapIterator : Iterator {
+    constructor fn new(this, iterator, map_fn) {
+        this.iterator = iterator;
+        this.map_fn = map_fn;
+    }
+    fn next(this) {
+        let next = this.iterator.next();
+        if (next == null) return null;
+        next.value = (this.map_fn)(next.value);
+        next
+    }
+}
+
+class Array : Array {
+    fn iter(this) IndexIterator.new(this);
+}
+
+class String : String {
+    fn iter(this) IndexIterator.new(this);
+}
+
+return {
+    String,
+    Array,
+    IndexIterator,
+    MapIterator,
+};

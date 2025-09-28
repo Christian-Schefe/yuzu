@@ -1,0 +1,8 @@
+let arr = [1, 32, 45, 25];
+
+for (i in arr) {
+    print (i);
+}
+
+let iter = arr.iter().map((i) => i * 2);
+print(iter.collect());

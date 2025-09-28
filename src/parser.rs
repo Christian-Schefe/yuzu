@@ -10,222 +10,23 @@ use chumsky::{
 
 use crate::lexer::{LocatedToken, Token};
 
-#[derive(Debug, Clone)]
-pub enum Expression {
-    Number(f64),
-    Integer(i64),
-    Bool(bool),
-    String(String),
-    ArrayLiteral(Vec<LocatedExpression>),
-    FunctionLiteral {
-        parameters: Vec<String>,
-        body: Box<LocatedExpression>,
-    },
-    PrototypeLiteral {
-        properties: Vec<(String, LocatedExpression)>,
-    },
-    ObjectLiteral(Vec<(String, LocatedExpression)>),
-    Null,
+mod expression;
 
-    BinaryOp {
-        op: BinaryOp,
-        left: Box<LocatedExpression>,
-        right: Box<LocatedExpression>,
-    },
-    UnaryOp {
-        op: UnaryOp,
-        expr: Box<LocatedExpression>,
-    },
+pub use expression::*;
 
-    Define(String, Box<LocatedExpression>),
-    Block(Vec<LocatedExpression>, Option<Box<LocatedExpression>>),
-    If {
-        condition: Box<LocatedExpression>,
-        then_branch: Box<LocatedExpression>,
-        else_branch: Option<Box<LocatedExpression>>,
-    },
-    Loop {
-        init: Option<Box<LocatedExpression>>,
-        condition: Box<LocatedExpression>,
-        increment: Option<Box<LocatedExpression>>,
-        body: Box<LocatedExpression>,
-    },
-    IterLoop {
-        item: String,
-        iterable: Box<LocatedExpression>,
-        body: Box<LocatedExpression>,
-    },
-    Ident(String),
-    ArrayIndex {
-        array: Box<LocatedExpression>,
-        index: Box<LocatedExpression>,
-    },
-    FieldAccess {
-        object: Box<LocatedExpression>,
-        field: String,
-    },
-    FunctionCall {
-        function: Box<LocatedExpression>,
-        arguments: Vec<LocatedExpression>,
-    },
-    PropertyFunctionCall {
-        object: Box<LocatedExpression>,
-        function: String,
-        arguments: Vec<LocatedExpression>,
-    },
-    Break,
-    Continue,
-    Return(Option<Box<LocatedExpression>>),
-    Raise(Box<LocatedExpression>),
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClassMemberType {
+    Field,
+    Method,
+    Constructor,
 }
 
-impl fmt::Display for Expression {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Number(n) => write!(f, "Number({})", n),
-            Self::Integer(i) => write!(f, "Integer({})", i),
-            Self::Bool(b) => write!(f, "Bool({})", b),
-            Self::String(s) => write!(f, "String({:?})", s),
-            Self::ArrayLiteral(elements) => {
-                write!(f, "ArrayLiteral([")?;
-                for elem in elements {
-                    write!(f, "{}, ", elem.expr)?;
-                }
-                write!(f, "])")
-            }
-            Self::ObjectLiteral(fields) => {
-                write!(f, "ObjectLiteral({{")?;
-                for (key, value) in fields {
-                    write!(f, "{}: {}, ", key, value.expr)?;
-                }
-                write!(f, "}})")
-            }
-            Self::FunctionLiteral { parameters, body } => {
-                write!(f, "FunctionLiteral(")?;
-                write!(f, "params: [")?;
-                for param in parameters {
-                    write!(f, "{}, ", param)?;
-                }
-                write!(f, "], body: {})", body.expr)
-            }
-            Self::PrototypeLiteral { properties } => {
-                write!(f, "PrototypeLiteral(properties: [")?;
-                for property in properties {
-                    write!(f, "{}: {}, ", property.0, property.1.expr)?;
-                }
-                write!(f, "])")
-            }
-            Self::Null => write!(f, "Null"),
-            Self::BinaryOp { op, left, right } => {
-                write!(f, "BinaryOp({}, {}, {})", op, left.expr, right.expr)
-            }
-            Self::UnaryOp { op, expr } => write!(f, "UnaryOp({}, {})", op, expr.expr),
-            Self::Define(name, value) => write!(f, "Define({}, {})", name, value.expr),
-            Self::Block(exprs, ret) => {
-                write!(f, "Block(")?;
-                for expr in exprs {
-                    write!(f, "{};", expr.expr)?;
-                }
-                if let Some(ret) = ret {
-                    write!(f, "{}", ret.expr)?;
-                }
-                write!(f, ")")
-            }
-            Self::If {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                write!(f, "If({}, {}, ", condition.expr, then_branch.expr)?;
-                if let Some(else_branch) = else_branch {
-                    write!(f, "{})", else_branch.expr)
-                } else {
-                    write!(f, "None)")
-                }
-            }
-            Self::Loop {
-                init,
-                condition,
-                increment,
-                body,
-            } => {
-                write!(f, "Loop(")?;
-                if let Some(init) = init {
-                    write!(f, "init: {}, ", init.expr)?;
-                } else {
-                    write!(f, "init: None, ")?;
-                }
-                write!(f, "condition: {}, ", condition.expr)?;
-                if let Some(increment) = increment {
-                    write!(f, "increment: {}, ", increment.expr)?;
-                } else {
-                    write!(f, "increment: None, ")?;
-                }
-                write!(f, "body: {})", body.expr)
-            }
-            Self::IterLoop {
-                item,
-                iterable,
-                body,
-            } => {
-                write!(
-                    f,
-                    "IterLoop(item: {}, iterable: {}, body: {})",
-                    item, iterable.expr, body.expr
-                )
-            }
-            Self::Ident(name) => write!(f, "Ident({})", name),
-            Self::ArrayIndex { array, index } => {
-                write!(f, "ArrayIndex({}, {})", array.expr, index.expr)
-            }
-            Self::FieldAccess { object, field } => {
-                write!(f, "FieldAccess({}, {})", object.expr, field)
-            }
-            Self::FunctionCall {
-                function,
-                arguments,
-            } => {
-                write!(f, "FunctionCall({}, [", function.expr)?;
-                for arg in arguments {
-                    write!(f, "{}, ", arg.expr)?;
-                }
-                write!(f, "])")
-            }
-            Self::PropertyFunctionCall {
-                object,
-                function,
-                arguments,
-            } => {
-                write!(f, "PropertyFunctionCall({}, {}, [", object.expr, function)?;
-                for arg in arguments {
-                    write!(f, "{}, ", arg.expr)?;
-                }
-                write!(f, "])")
-            }
-            Self::Break => write!(f, "Break"),
-            Self::Continue => write!(f, "Continue"),
-            Self::Return(expr) => {
-                if let Some(expr) = expr {
-                    write!(f, "Return({})", expr.expr)
-                } else {
-                    write!(f, "Return(None)")
-                }
-            }
-            Self::Raise(expr) => write!(f, "Raise({})", expr.expr),
-        }
-    }
-}
+pub type LocatedExpression = Extra<core::ops::Range<usize>>;
 
-#[derive(Debug, Clone)]
-pub struct LocatedExpression {
-    pub expr: Expression,
-    pub span: core::ops::Range<usize>,
-}
-
-fn located(expr: Expression, span: SimpleSpan) -> LocatedExpression {
+fn located(expr: Expression<core::ops::Range<usize>>, span: SimpleSpan) -> LocatedExpression {
     LocatedExpression {
         expr,
-        span: span.into_range(),
+        extra: span.into_range(),
     }
 }
 
@@ -334,17 +135,39 @@ where
         .map_with(|expr, extra| located(expr, extra.span()));
 
     let object_literal = select! { Token::Ident(name) => name.to_string() }
-        .then_ignore(just(Token::Colon))
-        .then(expr.clone())
+        .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
         .separated_by(just(Token::Comma))
         .collect::<Vec<_>>()
+        .then_ignore(just(Token::Comma).or_not())
         .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        .map(Expression::ObjectLiteral)
-        .map_with(|expr, extra| located(expr, extra.span()));
+        .map_with(|expr, extra| {
+            located(
+                Expression::ObjectLiteral(
+                    expr.into_iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                v.unwrap_or(located(Expression::Ident(k), extra.span())),
+                            )
+                        })
+                        .collect(),
+                ),
+                extra.span(),
+            )
+        });
 
     let block = expr
         .clone()
-        .then_ignore(just(Token::Semicolon))
+        .then(just(Token::Semicolon).or_not())
+        .try_map_with(|(expr, semicolon), extra| {
+            if needs_semi(&expr.expr) && semicolon.is_none() {
+                return Err(chumsky::error::Rich::custom(
+                    extra.span(),
+                    "Expected ';' after expression in block",
+                ));
+            };
+            Ok(expr)
+        })
         .repeated()
         .collect::<Vec<_>>()
         .then(expr.clone().or_not())
@@ -369,7 +192,29 @@ where
             .map_with(|expr, extra| located(expr, extra.span())),
         ));
 
-    let define = just(Token::Let)
+    let lambda_literal = select! { Token::Ident(name) => name.to_string() }
+        .separated_by(just(Token::Comma))
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .then_ignore(just(Token::DoubleArrow))
+        .then(expr.clone())
+        .try_map_with(|(params, body), extra| {
+            if !is_unique(&params) {
+                return Err(chumsky::error::Rich::custom(
+                    extra.span(),
+                    "Function parameters must be unique",
+                ));
+            }
+            Ok(located(
+                Expression::FunctionLiteral {
+                    parameters: params,
+                    body: Box::new(body),
+                },
+                extra.span(),
+            ))
+        });
+
+    let define_let = just(Token::Let)
         .ignore_then(select! { Token::Ident(name) => name.to_string() })
         .then_ignore(just(Token::Assign))
         .then(expr.clone())
@@ -386,12 +231,7 @@ where
         )
         .then(expr.clone())
         .try_map_with(|((name, params), body), extra| {
-            if params
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                != params.len()
-            {
+            if !is_unique(&params) {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
                     "Function parameters must be unique",
@@ -489,41 +329,49 @@ where
 
     let define_class = just(Token::Class)
         .ignore_then(select! { Token::Ident(name) => name.to_string() })
+        .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
         .then(
             choice((
-                define_fn
-                    .clone()
-                    .then_ignore(just(Token::Semicolon))
+                define_fn.clone().map(|lf| {
+                    if let Expression::Define(name, expr) = lf.expr {
+                        (name, ClassMemberType::Method, *expr)
+                    } else {
+                        panic!("Expected function definition in class body")
+                    }
+                }),
+                just(Token::Constructor)
+                    .ignore_then(define_fn.clone())
                     .map(|lf| {
                         if let Expression::Define(name, expr) = lf.expr {
-                            (name, *expr)
+                            (name, ClassMemberType::Constructor, *expr)
                         } else {
-                            panic!("Expected function definition in class body")
+                            panic!("Expected constructor definition in class body")
                         }
                     }),
-                define
-                    .clone()
-                    .then_ignore(just(Token::Semicolon))
-                    .map(|lf| {
-                        if let Expression::Define(name, expr) = lf.expr {
-                            (name, *expr)
-                        } else {
-                            panic!("Expected field definition in class body")
-                        }
-                    }),
+                define_let.clone().map(|lf| {
+                    if let Expression::Define(name, expr) = lf.expr {
+                        (name, ClassMemberType::Field, *expr)
+                    } else {
+                        panic!("Expected field definition in class body")
+                    }
+                }),
             ))
+            .then(just(Token::Semicolon).or_not())
+            .try_map_with(|(data, semicolon), extra| {
+                if needs_semi(&data.2.expr) && semicolon.is_none() {
+                    return Err(chumsky::error::Rich::custom(
+                        extra.span(),
+                        "Expected ';' after expression in block",
+                    ));
+                };
+                Ok(data)
+            })
             .repeated()
-            .collect::<Vec<(String, LocatedExpression)>>()
+            .collect::<Vec<(String, ClassMemberType, LocatedExpression)>>()
             .delimited_by(just(Token::LBrace), just(Token::RBrace)),
         )
-        .try_map_with(|(name, body), extra| {
-            if body
-                .iter()
-                .map(|(n, _)| n)
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                != body.len()
-            {
+        .try_map_with(|((name, superclass), body), extra| {
+            if !is_unique_iter(body.iter().map(|(n, _, _)| n)) {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
                     "Duplicate field or method names in class definition",
@@ -533,7 +381,10 @@ where
                 Expression::Define(
                     name,
                     Box::new(located(
-                        Expression::PrototypeLiteral { properties: body },
+                        Expression::PrototypeLiteral {
+                            properties: body,
+                            superclass: superclass.map(Box::new),
+                        },
                         extra.span(),
                     )),
                 ),
@@ -545,13 +396,14 @@ where
         atom,
         array_literal,
         brace_start,
-        define,
+        define_let,
         define_fn,
         define_class,
         for_loop,
         while_loop,
         iter_loop,
         if_else,
+        lambda_literal, //must come before parenthesized
         parenthesized,
         return_expr,
         raise_expr,
@@ -708,7 +560,16 @@ where
 
     expr.define(operators);
 
-    expr.then_ignore(just(Token::Semicolon))
+    expr.then(just(Token::Semicolon).or_not())
+        .try_map_with(|(data, semicolon), extra| {
+            if needs_semi(&data.expr) && semicolon.is_none() {
+                return Err(chumsky::error::Rich::custom(
+                    extra.span(),
+                    "Expected ';' after expression in block",
+                ));
+            };
+            Ok(data)
+        })
         .repeated()
         .collect::<Vec<_>>()
         .map_with(|exprs, extra| located(Expression::Block(exprs, None), extra.span()))
@@ -737,4 +598,36 @@ pub fn parse(source: &str, tokens: Vec<LocatedToken>) -> Option<LocatedExpressio
             None
         }
     }
+}
+
+fn needs_semi<T>(expr: &Expression<T>) -> bool {
+    match expr {
+        Expression::Block { .. } => false,
+        Expression::Define(_, expr) => needs_semi(&expr.expr),
+        Expression::If {
+            then_branch,
+            else_branch,
+            ..
+        } => needs_semi(&else_branch.as_ref().unwrap_or(then_branch).expr),
+        Expression::FunctionLiteral { body, .. } => needs_semi(&body.expr),
+        Expression::Loop { body, .. } => needs_semi(&body.expr),
+        Expression::IterLoop { body, .. } => needs_semi(&body.expr),
+        Expression::PrototypeLiteral { .. } => false,
+        _ => true,
+    }
+}
+
+fn is_unique<T: Eq + std::hash::Hash>(items: &[T]) -> bool {
+    let set: std::collections::HashSet<_> = items.iter().collect();
+    set.len() == items.len()
+}
+
+fn is_unique_iter<T: Eq + std::hash::Hash, I: Iterator<Item = T>>(items: I) -> bool {
+    let mut set = std::collections::HashSet::new();
+    for item in items {
+        if !set.insert(item) {
+            return false;
+        }
+    }
+    true
 }

@@ -1,11 +1,19 @@
-use std::{cell::RefCell, collections::HashMap, fmt, rc::Rc};
-
-use crate::{
-    parser::{BinaryOp, Expression, LocatedExpression, UnaryOp},
-    tree_interpreter::standard::{define_globals, instantiate_prototype},
+use std::{
+    cell::{OnceCell, RefCell},
+    collections::{HashMap, HashSet},
+    fmt::{self},
+    io::Read,
+    path::PathBuf,
+    rc::Rc,
 };
 
-mod standard;
+use crate::{
+    parse_string,
+    parser::{BinaryOp, ClassMemberType, Expression, Extra, UnaryOp},
+    tree_interpreter::standard::define_globals,
+};
+
+pub mod standard;
 
 #[derive(Clone)]
 pub enum Value {
@@ -17,14 +25,48 @@ pub enum Value {
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<HashMap<String, Value>>>),
     Function(Rc<FunctionValue>),
-    BuiltinFunction(
-        Rc<dyn Fn(Vec<Value>, &LocatedExpression) -> Result<Value, LocatedControlFlow>>,
-    ),
-    Prototype(Rc<PrototypeValue>),
+    BuiltinFunction(BuiltinFunctionType),
+    Prototype(Rc<RefCell<PrototypeValue>>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Integer(a), Value::Number(b)) => (*a as f64) == *b,
+            (Value::Number(a), Value::Integer(b)) => *a == (*b as f64),
+
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Null, Value::Null) => true,
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+            (Value::BuiltinFunction(a), Value::BuiltinFunction(b)) => Rc::ptr_eq(a, b),
+            (Value::Prototype(a), Value::Prototype(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 type BuiltinFunctionType =
-    Rc<dyn Fn(Vec<Value>, &LocatedExpression) -> Result<Value, LocatedControlFlow>>;
+    Rc<dyn Fn(Vec<Value>, &Location, Rc<Environment>) -> Result<Value, LocatedControlFlow>>;
+
+#[derive(Clone)]
+pub struct Location {
+    pub span: core::ops::Range<usize>,
+    pub module: String,
+}
+
+impl Location {
+    pub fn new(range: core::ops::Range<usize>, module: String) -> Self {
+        Self {
+            span: range,
+            module,
+        }
+    }
+}
 
 pub struct FunctionValue {
     parameters: Vec<String>,
@@ -34,6 +76,7 @@ pub struct FunctionValue {
 
 pub struct PrototypeValue {
     properties: HashMap<String, Value>,
+    static_properties: HashSet<String>,
 }
 
 impl Value {
@@ -57,13 +100,23 @@ impl Value {
 pub struct Environment {
     values: Rc<RefCell<HashMap<String, Value>>>,
     parent: Option<Rc<Environment>>,
+    module_path: String,
 }
 
 impl Environment {
-    pub fn new(parent: Option<Rc<Environment>>) -> Self {
+    pub fn new_global(module_path: String) -> Self {
         Self {
             values: Rc::new(RefCell::new(HashMap::new())),
-            parent,
+            parent: None,
+            module_path,
+        }
+    }
+
+    pub fn new(parent: Rc<Environment>) -> Self {
+        Self {
+            values: Rc::new(RefCell::new(HashMap::new())),
+            module_path: parent.module_path.clone(),
+            parent: Some(parent),
         }
     }
 
@@ -105,8 +158,13 @@ pub enum RuntimeError {
     ArrayIndexOutOfBounds(i64),
     FunctionArgumentError(String),
     DuplicateVariableDefinition(String),
+    ImportError(String),
     Custom(Value),
     UnhandledControlFlow,
+}
+
+fn type_error<T>(msg: &str, expr: &LocatedExpression) -> Result<T, LocatedControlFlow> {
+    Err(RuntimeError::TypeError(msg.to_string()).at(expr))
 }
 
 pub enum ControlFlow {
@@ -120,20 +178,29 @@ pub type LocatedControlFlow = Located<ControlFlow>;
 
 pub struct Located<T> {
     pub data: T,
-    pub span: core::ops::Range<usize>,
+    pub location: Location,
 }
 
 impl RuntimeError {
     pub fn at(self, expr: &LocatedExpression) -> LocatedControlFlow {
         LocatedControlFlow {
             data: ControlFlow::Error(self),
-            span: expr.span.clone(),
+            location: expr.extra.clone(),
+        }
+    }
+    pub fn span(self, location: &Location) -> LocatedControlFlow {
+        LocatedControlFlow {
+            data: ControlFlow::Error(self),
+            location: location.clone(),
         }
     }
     pub fn from_to(self, from: &LocatedExpression, to: &LocatedExpression) -> LocatedControlFlow {
         LocatedControlFlow {
             data: ControlFlow::Error(self),
-            span: from.span.start..to.span.end,
+            location: Location {
+                span: from.extra.span.start..to.extra.span.end,
+                module: from.extra.module.clone(),
+            },
         }
     }
 }
@@ -158,6 +225,7 @@ impl fmt::Display for RuntimeError {
                 )
             }
             Self::Custom(val) => write!(f, "Error: {}", variable_to_string(val)),
+            Self::ImportError(msg) => write!(f, "ImportError: {}", msg),
         }
     }
 }
@@ -193,16 +261,49 @@ fn variable_to_string(var: &Value) -> String {
     }
 }
 
-pub fn interpret_global(expr: &LocatedExpression) -> Result<Value, Located<RuntimeError>> {
-    let global_env = Rc::new(Environment::new(None));
-    define_globals(&*global_env);
+thread_local! {
+    pub static GLOBAL_STATE: OnceCell<RefCell<GlobalState>> = OnceCell::new();
+}
+
+pub struct GlobalState {
+    modules: HashMap<String, Option<Value>>,
+    pwd: PathBuf,
+}
+
+pub fn init_global_state(pwd: PathBuf) {
+    GLOBAL_STATE.with(|state| {
+        state.get_or_init(|| {
+            RefCell::new(GlobalState {
+                modules: HashMap::new(),
+                pwd,
+            })
+        });
+    });
+}
+
+type LocatedExpression = Extra<Location>;
+
+pub fn interpret_global(
+    expr: &LocatedExpression,
+    module_path: String,
+    with_std: bool,
+) -> Result<Value, Located<RuntimeError>> {
+    let global_env = Rc::new(Environment::new_global(module_path));
+    define_globals(&*global_env, with_std);
     match interpret(expr, global_env) {
         Ok(v) => Ok(v),
-        Err(LocatedControlFlow { data, span }) => match data {
-            ControlFlow::Error(e) => Err(Located { data: e, span }),
+        Err(LocatedControlFlow {
+            data,
+            location: span,
+        }) => match data {
+            ControlFlow::Error(e) => Err(Located {
+                data: e,
+                location: span,
+            }),
+            ControlFlow::Return(v) => Ok(v),
             _ => Err(Located {
                 data: RuntimeError::UnhandledControlFlow,
-                span,
+                location: span,
             }),
         },
     }
@@ -238,37 +339,62 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 env,
             })))
         }
-        Expression::PrototypeLiteral { properties } => {
+        Expression::PrototypeLiteral {
+            properties,
+            superclass,
+        } => {
             let mut map = HashMap::new();
-            for (name, property) in properties {
-                let val = interpret(property, env.clone())?;
-                map.insert(name.clone(), val);
+            let mut static_properties = HashSet::new();
+
+            if let Some(superclass) = superclass {
+                let super_val = interpret(superclass, env.clone())?;
+                let Value::Prototype(p) = super_val else {
+                    return type_error("Superclass must be a prototype", superclass);
+                };
+                let p = p.borrow();
+                map = p.properties.clone();
+                static_properties = p.static_properties.clone();
             }
-            let constructor = match map.remove("new") {
-                Some(Value::Function(f)) => Some(f),
-                None => None,
-                Some(_) => {
-                    return Err(RuntimeError::TypeError(
-                        "Constructor 'new' must be a function".to_string(),
-                    )
-                    .at(expr));
+
+            let mut constructors = Vec::new();
+            for (name, member_type, property) in properties {
+                let val = interpret(property, env.clone())?;
+                if let ClassMemberType::Constructor = member_type {
+                    let Value::Function(f) = val else {
+                        return type_error("Constructor must be a function", property);
+                    };
+                    constructors.push((name, f));
+                } else {
+                    map.insert(name.clone(), val);
                 }
-            };
-            map.insert(
-                "new".to_string(),
-                Value::BuiltinFunction(instantiate_prototype(map.clone(), constructor)),
-            );
-            Ok(Value::Prototype(Rc::new(PrototypeValue {
+            }
+            let mut no_statics_map = map.clone();
+            for static_property in static_properties.iter() {
+                no_statics_map.remove(static_property);
+            }
+            for (name, constructor) in constructors {
+                map.insert(
+                    name.to_string(),
+                    Value::BuiltinFunction(instantiate_prototype(
+                        no_statics_map.clone(),
+                        constructor,
+                    )),
+                );
+                static_properties.insert(name.to_string());
+            }
+            let prototype = Rc::new(RefCell::new(PrototypeValue {
                 properties: map,
-            })))
+                static_properties,
+            }));
+            Ok(Value::Prototype(prototype))
         }
         Expression::Break => Err(LocatedControlFlow {
             data: ControlFlow::Break,
-            span: expr.span.clone(),
+            location: expr.extra.clone(),
         }),
         Expression::Continue => Err(LocatedControlFlow {
             data: ControlFlow::Continue,
-            span: expr.span.clone(),
+            location: expr.extra.clone(),
         }),
         Expression::Return(ret_expr) => {
             let val = if let Some(expr) = ret_expr {
@@ -278,7 +404,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             };
             Err(LocatedControlFlow {
                 data: ControlFlow::Return(val),
-                span: expr.span.clone(),
+                location: expr.extra.clone(),
             })
         }
         Expression::Raise(err_expr) => {
@@ -301,7 +427,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             }
         }
         Expression::Block(exprs, ret) => {
-            let inner_env = Rc::new(Environment::new(Some(env)));
+            let inner_env = Rc::new(Environment::new(env));
             for e in exprs {
                 interpret(e, inner_env.clone())?;
             }
@@ -356,63 +482,49 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             iterable,
             body,
         } => {
-            let iterable_val = interpret(iterable, env.clone())?;
-            match &iterable_val {
-                Value::Object(properties) => {
-                    let Some(iter_fn) = properties.borrow().get("iter").cloned() else {
-                        return Err(
-                            RuntimeError::TypeError("Object is not iterable".to_string())
-                                .at(&iterable),
-                        );
-                    };
-                    let iter = do_function_call(iter_fn, &iterable, vec![iterable_val.clone()])?;
-                    let Value::Object(iter_map) = &iter else {
-                        return Err(RuntimeError::TypeError(
-                            "Iterator is not an object".to_string(),
-                        )
-                        .at(&iterable));
-                    };
-                    let Some(next_fn) = iter_map.borrow().get("next").cloned() else {
-                        return Err(RuntimeError::TypeError(
-                            "Iterator does not have next method".to_string(),
-                        )
-                        .at(&iterable));
-                    };
-                    loop {
-                        let next = match do_function_call(
-                            next_fn.clone(),
-                            &iterable,
-                            vec![iter.clone()],
-                        ) {
-                            Err(Located {
-                                data: ControlFlow::Error(RuntimeError::Custom(Value::String(s))),
-                                ..
-                            }) if s.iter().collect::<String>() == "IterStop" => { // TODO: better way to signal end of iteration
-                                break;
-                            }
-                            other => other?,
-                        };
-                        let loop_env = Rc::new(Environment::new(Some(env.clone())));
-                        loop_env.define(item, next);
-                        if let Err(LocatedControlFlow { data, span }) =
-                            interpret(body, loop_env.clone())
-                        {
-                            match data {
-                                ControlFlow::Break => break,
-                                ControlFlow::Continue => continue,
-                                other => {
-                                    return Err(LocatedControlFlow { data: other, span });
-                                }
-                            }
+            let iter_val = interpret(iterable, env.clone())?;
+            let iter = do_property_function_call(
+                &env,
+                &iter_val,
+                &iterable.extra,
+                &"iter".to_string(),
+                &vec![],
+            )?;
+            loop {
+                let next = do_property_function_call(
+                    &env,
+                    &iter,
+                    &iterable.extra,
+                    &"next".to_string(),
+                    &vec![],
+                )?;
+                let next_item = match next {
+                    Value::Object(next_map) => next_map.borrow().get("value").cloned(),
+                    _ => None,
+                };
+                let Some(next_item) = next_item else {
+                    break;
+                };
+                let loop_env = Rc::new(Environment::new(env.clone()));
+                loop_env.define(item, next_item);
+                if let Err(LocatedControlFlow {
+                    data,
+                    location: span,
+                }) = interpret(body, loop_env.clone())
+                {
+                    match data {
+                        ControlFlow::Break => break,
+                        ControlFlow::Continue => continue,
+                        other => {
+                            return Err(LocatedControlFlow {
+                                data: other,
+                                location: span,
+                            });
                         }
                     }
-                    Ok(Value::Null)
                 }
-                _ => Err(
-                    RuntimeError::TypeError("Can only iterate over arrays".to_string())
-                        .at(&iterable),
-                ),
             }
+            Ok(Value::Null)
         }
         Expression::BinaryOp { op, left, right } => interpret_binary_op(&env, op, left, right),
         Expression::FunctionCall {
@@ -421,63 +533,20 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
         } => {
             let func_val = interpret(function, env.clone())?;
             let arg_vals = interpret_args(arguments, env.clone())?;
-            do_function_call(func_val, &function, arg_vals)
+            do_function_call(func_val, &function.extra, arg_vals, env.clone())
         }
         Expression::PropertyFunctionCall {
             object,
             function,
             arguments,
-        } => {
-            let obj_val = interpret(object, env.clone())?;
-            let arg_vals = interpret_args(arguments, env.clone())?;
-            match &obj_val {
-                Value::Object(object_map) => {
-                    let function = object_map.borrow().get(function).cloned();
-                    if let Some(f) = function {
-                        return do_target_function_call(Some(&obj_val), &object, f, arg_vals);
-                    }
-                }
-                Value::Prototype(p) => {
-                    let function = p.properties.get(function).cloned();
-                    if let Some(f) = function {
-                        return do_target_function_call(None, &object, f, arg_vals);
-                    }
-                }
-                _ => {}
-            };
-            let prototype = obj_val.get_prototype_name();
-            if let Some(Value::Prototype(p)) = env.get(prototype) {
-                if let Some(val) = p.properties.get(function).cloned() {
-                    do_target_function_call(Some(&obj_val), &object, val, arg_vals)
-                } else {
-                    Err(RuntimeError::FieldAccessError(function.clone()).at(&object))
-                }
-            } else {
-                Err(RuntimeError::FieldAccessError(function.clone()).at(&object))
-            }
-        }
-        Expression::FieldAccess { object, field } => {
-            let obj_val = interpret(object, env.clone())?;
-            let res = match &obj_val {
-                Value::Object(object_map) => object_map.borrow().get(field).cloned(),
-                Value::Prototype(p) => p.properties.get(field).cloned(),
-                _ => None,
-            };
-            if let Some(v) = res {
-                Ok(v)
-            } else {
-                let prototype = obj_val.get_prototype_name();
-                if let Some(Value::Prototype(p)) = env.get(prototype) {
-                    if let Some(val) = p.properties.get(field) {
-                        Ok(val.clone())
-                    } else {
-                        Err(RuntimeError::FieldAccessError(field.clone()).at(&object))
-                    }
-                } else {
-                    Err(RuntimeError::FieldAccessError(field.clone()).at(&object))
-                }
-            }
-        }
+        } => do_property_function_call(
+            &env,
+            &interpret(object, env.clone())?,
+            &object.extra,
+            function,
+            arguments,
+        ),
+        Expression::FieldAccess { object, field } => do_property_access(env, object, field),
         Expression::ArrayIndex { array, index } => {
             let arr_val = interpret(array, env.clone())?;
             let idx_val = interpret(index, env.clone())?;
@@ -539,6 +608,68 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
     }
 }
 
+fn do_property_function_call(
+    env: &Rc<Environment>,
+    obj_val: &Value,
+    span: &Location,
+    function: &str,
+    arguments: &Vec<LocatedExpression>,
+) -> Result<Value, Located<ControlFlow>> {
+    let arg_vals = interpret_args(arguments, env.clone())?;
+    match &obj_val {
+        Value::Object(object_map) => {
+            let function = object_map.borrow().get(function).cloned();
+            if let Some(f) = function {
+                return do_target_function_call(Some(&obj_val), &span, f, arg_vals, env.clone());
+            }
+        }
+        Value::Prototype(p) => {
+            let function = p.borrow().properties.get(function).cloned();
+            if let Some(f) = function {
+                return do_target_function_call(None, &span, f, arg_vals, env.clone());
+            }
+        }
+        _ => {}
+    };
+    let prototype = obj_val.get_prototype_name();
+    if let Some(Value::Prototype(p)) = env.get(prototype) {
+        if let Some(val) = p.borrow().properties.get(function).cloned() {
+            do_target_function_call(Some(&obj_val), &span, val, arg_vals, env.clone())
+        } else {
+            Err(RuntimeError::FieldAccessError(function.to_string()).span(&span))
+        }
+    } else {
+        Err(RuntimeError::FieldAccessError(function.to_string()).span(&span))
+    }
+}
+
+fn do_property_access(
+    env: Rc<Environment>,
+    object: &Box<LocatedExpression>,
+    field: &String,
+) -> Result<Value, Located<ControlFlow>> {
+    let obj_val = interpret(object, env.clone())?;
+    let res = match &obj_val {
+        Value::Object(object_map) => object_map.borrow().get(field).cloned(),
+        Value::Prototype(p) => p.borrow().properties.get(field).cloned(),
+        _ => None,
+    };
+    if let Some(v) = res {
+        Ok(v)
+    } else {
+        let prototype = obj_val.get_prototype_name();
+        if let Some(Value::Prototype(p)) = env.get(prototype) {
+            if let Some(val) = p.borrow().properties.get(field) {
+                Ok(val.clone())
+            } else {
+                Err(RuntimeError::FieldAccessError(field.clone()).at(&object))
+            }
+        } else {
+            Err(RuntimeError::FieldAccessError(field.clone()).at(&object))
+        }
+    }
+}
+
 fn interpret_for_loop(
     env: Rc<Environment>,
     init: &Option<Box<LocatedExpression>>,
@@ -546,17 +677,23 @@ fn interpret_for_loop(
     increment: &Option<Box<LocatedExpression>>,
     body: &Box<LocatedExpression>,
 ) -> Result<Value, Located<ControlFlow>> {
-    let loop_env = Rc::new(Environment::new(Some(env)));
+    let loop_env = Rc::new(Environment::new(env));
     if let Some(init) = init {
         interpret(init, loop_env.clone())?;
     }
     loop {
         let cond = match interpret(condition, loop_env.clone()) {
-            Err(LocatedControlFlow { data, span }) => match data {
+            Err(LocatedControlFlow {
+                data,
+                location: span,
+            }) => match data {
                 ControlFlow::Break => break,
                 ControlFlow::Continue => continue,
                 other => {
-                    return Err(LocatedControlFlow { data: other, span });
+                    return Err(LocatedControlFlow {
+                        data: other,
+                        location: span,
+                    });
                 }
             },
             Ok(v) => v,
@@ -571,22 +708,36 @@ fn interpret_for_loop(
             break;
         }
 
-        if let Err(LocatedControlFlow { data, span }) = interpret(body, loop_env.clone()) {
+        if let Err(LocatedControlFlow {
+            data,
+            location: span,
+        }) = interpret(body, loop_env.clone())
+        {
             match data {
                 ControlFlow::Break => break,
                 ControlFlow::Continue => continue,
                 other => {
-                    return Err(LocatedControlFlow { data: other, span });
+                    return Err(LocatedControlFlow {
+                        data: other,
+                        location: span,
+                    });
                 }
             }
         }
         if let Some(increment) = increment {
-            if let Err(LocatedControlFlow { data, span }) = interpret(increment, loop_env.clone()) {
+            if let Err(LocatedControlFlow {
+                data,
+                location: span,
+            }) = interpret(increment, loop_env.clone())
+            {
                 match data {
                     ControlFlow::Break => break,
                     ControlFlow::Continue => continue,
                     other => {
-                        return Err(LocatedControlFlow { data: other, span });
+                        return Err(LocatedControlFlow {
+                            data: other,
+                            location: span,
+                        });
                     }
                 }
             }
@@ -766,8 +917,8 @@ fn interpret_simple_binary_op(
         (BinaryOp::And, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l && r)),
         (BinaryOp::Or, Value::Bool(l), Value::Bool(r)) => Ok(Value::Bool(l || r)),
 
-        (BinaryOp::Equal, l, r) => Ok(Value::Bool(is_value_equal(&l, &r))),
-        (BinaryOp::NotEqual, l, r) => Ok(Value::Bool(!is_value_equal(&l, &r))),
+        (BinaryOp::Equal, l, r) => Ok(Value::Bool(l == r)),
+        (BinaryOp::NotEqual, l, r) => Ok(Value::Bool(l != r)),
 
         (BinaryOp::Less, Value::Number(l), Value::Number(r)) => Ok(Value::Bool(l < r)),
         (BinaryOp::Less, Value::Integer(l), Value::Integer(r)) => Ok(Value::Bool(l < r)),
@@ -786,25 +937,11 @@ fn interpret_simple_binary_op(
     }
 }
 
-fn is_value_equal(l: &Value, r: &Value) -> bool {
-    match (l, r) {
-        (Value::Number(l), Value::Number(r)) => l == r,
-        (Value::Integer(l), Value::Integer(r)) => l == r,
-        (Value::Bool(l), Value::Bool(r)) => l == r,
-        (Value::Null, Value::Null) => true,
-        (Value::Object(l), Value::Object(r)) => Rc::ptr_eq(l, r),
-        (Value::Array(l), Value::Array(r)) => Rc::ptr_eq(l, r),
-        (Value::String(l), Value::String(r)) => l == r,
-        (Value::Function(l), Value::Function(r)) => Rc::ptr_eq(l, r),
-        (Value::BuiltinFunction(l), Value::BuiltinFunction(r)) => Rc::ptr_eq(l, r),
-        _ => false,
-    }
-}
-
 fn do_function_call(
     function_val: Value,
-    function: &LocatedExpression,
+    span: &Location,
     arguments: Vec<Value>,
+    env: Rc<Environment>,
 ) -> Result<Value, LocatedControlFlow> {
     match function_val {
         Value::Function(f) => {
@@ -819,31 +956,30 @@ fn do_function_call(
                     parameters.len(),
                     arguments.len()
                 ))
-                .at(&function));
+                .span(span));
             }
-            let call_env = Rc::new(Environment::new(Some(func_env.clone())));
+            let call_env = Rc::new(Environment::new(func_env.clone()));
             for (param, arg) in parameters.iter().zip(arguments.into_iter()) {
                 if !call_env.define(param, arg) {
                     unreachable!("Parameter name should not be duplicated: {}", param);
                 }
             }
-            handle_return_control_flow(interpret(&body, call_env), &body)
+            handle_return_control_flow(interpret(&body, call_env))
         }
-        Value::BuiltinFunction(func) => {
-            handle_return_control_flow(func(arguments, &function), &function)
-        }
+        Value::BuiltinFunction(func) => handle_return_control_flow(func(arguments, span, env)),
         _ => Err(
             RuntimeError::TypeError("Attempted to call a non-function value".to_string())
-                .at(&function),
+                .span(span),
         ),
     }
 }
 
 fn do_target_function_call(
     target_val: Option<&Value>,
-    target: &LocatedExpression,
+    target: &Location,
     function_val: Value,
     arguments: Vec<Value>,
+    env: Rc<Environment>,
 ) -> Result<Value, LocatedControlFlow> {
     match function_val {
         Value::Function(f) => {
@@ -859,18 +995,16 @@ fn do_target_function_call(
                     parameters.len(),
                     arg_count
                 ))
-                .at(&target));
+                .span(target));
             }
-            let call_env = Rc::new(Environment::new(Some(func_env.clone())));
-            if let Some(target_val) = target_val {
-                call_env.define(&parameters[0], target_val.clone());
-            }
-            for (param, arg) in parameters.iter().skip(1).zip(arguments.into_iter()) {
+            let call_env = Rc::new(Environment::new(func_env.clone()));
+            let args_iter = target_val.cloned().into_iter().chain(arguments.into_iter());
+            for (param, arg) in parameters.iter().zip(args_iter) {
                 if !call_env.define(param, arg) {
                     unreachable!("Parameter name should not be duplicated: {}", param);
                 }
             }
-            handle_return_control_flow(interpret(&body, call_env), &body)
+            handle_return_control_flow(interpret(&body, call_env))
         }
         Value::BuiltinFunction(func) => {
             let arg_vals = target_val
@@ -878,31 +1012,30 @@ fn do_target_function_call(
                 .into_iter()
                 .chain(arguments.into_iter())
                 .collect::<Vec<_>>();
-            handle_return_control_flow(func(arg_vals, &target), &target)
+            handle_return_control_flow(func(arg_vals, target, env))
         }
         _ => Err(
             RuntimeError::TypeError("Attempted to call a non-function value".to_string())
-                .at(&target),
+                .span(target),
         ),
     }
 }
 
 fn handle_return_control_flow(
     res: Result<Value, LocatedControlFlow>,
-    expr: &LocatedExpression,
 ) -> Result<Value, LocatedControlFlow> {
     match res {
         Ok(v) => Ok(v),
-        Err(LocatedControlFlow { data, span }) => match data {
+        Err(LocatedControlFlow {
+            data,
+            location: span,
+        }) => match data {
             ControlFlow::Error(e) => Err(Located {
                 data: ControlFlow::Error(e),
-                span,
+                location: span,
             }),
             ControlFlow::Return(v) => Ok(v),
-            _ => Err(Located {
-                data: ControlFlow::Error(RuntimeError::UnhandledControlFlow),
-                span: expr.span.clone(),
-            }),
+            _ => Err(RuntimeError::UnhandledControlFlow.span(&span)),
         },
     }
 }
@@ -917,4 +1050,124 @@ fn interpret_args(
         arg_vals.push(val);
     }
     Ok(arg_vals)
+}
+
+fn instantiate_prototype(
+    p: HashMap<String, Value>,
+    constructor: Rc<FunctionValue>,
+) -> BuiltinFunctionType {
+    Rc::new(move |args, span, _| {
+        let property_map = p.clone();
+        let this = Value::Object(Rc::new(RefCell::new(property_map)));
+        let FunctionValue {
+            parameters,
+            body,
+            env: func_env,
+        } = &*constructor;
+        let arg_count = args.len() + 1;
+        if parameters.len() != arg_count {
+            return Err(RuntimeError::FunctionArgumentError(format!(
+                "Expected {} arguments, got {}",
+                parameters.len(),
+                arg_count
+            ))
+            .span(&span));
+        }
+        let args_iter = std::iter::once(this.clone()).chain(args.into_iter());
+        let call_env = Rc::new(Environment::new(func_env.clone()));
+        for (param, arg_val) in parameters.iter().zip(args_iter) {
+            if !call_env.define(param, arg_val) {
+                unreachable!("Parameter name should not be duplicated: {}", param);
+            }
+        }
+        interpret(&body, call_env)?;
+        Ok(this)
+    })
+}
+
+fn import_module(
+    module_relative_path: &str,
+    span: &Location,
+    env: Rc<Environment>,
+) -> Result<Value, LocatedControlFlow> {
+    let parts = module_relative_path.split('/').collect::<Vec<_>>();
+    let mut module_path = env
+        .module_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    module_path.pop();
+    for part in parts.into_iter() {
+        match part {
+            "." => continue,
+            ".." => {
+                module_path.pop();
+                continue;
+            }
+            "" => continue,
+            _ => module_path.push(part),
+        }
+    }
+    let module_path = module_path.join("/");
+
+    let prev_val = GLOBAL_STATE.with(|state| {
+        let mut state = state.get().unwrap().borrow_mut();
+        let prev = state.modules.get(&module_path).cloned();
+        match prev {
+            Some(Some(v)) => return Ok(Some(v)),
+            Some(None) => {
+                return Err(RuntimeError::ImportError(format!(
+                    "Cyclic import detected for module '{}'",
+                    module_path
+                ))
+                .span(&span));
+            }
+            None => {}
+        }
+        state.modules.insert(module_path.clone(), None);
+        Ok(None)
+    })?;
+    if let Some(v) = prev_val {
+        return Ok(v);
+    }
+
+    let pwd = GLOBAL_STATE.with(|state| state.get().unwrap().borrow().pwd.clone());
+    let path = pwd.join(format!("{}.yuzu", module_path));
+    let mut file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(RuntimeError::ImportError(format!(
+                "Failed to open file {}: {}",
+                path.display(),
+                e
+            ))
+            .span(&span));
+        }
+    };
+    let mut buf = String::new();
+    if let Err(e) = file.read_to_string(&mut buf) {
+        eprintln!("Error reading file {}: {}", path.display(), e);
+        return Err(RuntimeError::ImportError("Failed to read file".to_string()).span(&span));
+    }
+
+    let val = interpret_string(&buf, span, module_path.clone(), true)?;
+    GLOBAL_STATE.with(|state| {
+        let mut state = state.get().unwrap().borrow_mut();
+        state.modules.insert(module_path, Some(val.clone()));
+    });
+    Ok(val)
+}
+
+fn interpret_string(
+    input: &str,
+    span: &Location,
+    module_path: String,
+    with_std: bool,
+) -> Result<Value, LocatedControlFlow> {
+    let parsed = parse_string(input)
+        .map_err(|_| RuntimeError::ImportError("Failed to parse input".to_string()).span(&span))?;
+    let add_file_info = |extra| Location::new(extra, module_path.clone());
+    let parsed = parsed.map_extra(&add_file_info);
+    let interpreted = interpret_global(&parsed, module_path, with_std);
+    interpreted.map_err(|e| e.data.span(&e.location))
 }

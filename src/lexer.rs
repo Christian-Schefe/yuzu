@@ -102,6 +102,9 @@ pub enum Token<'a> {
     #[token("=")]
     Assign,
 
+    #[token("=>")]
+    DoubleArrow,
+
     #[token("null")]
     Null,
 
@@ -111,6 +114,8 @@ pub enum Token<'a> {
     Fn,
     #[token("class")]
     Class,
+    #[token("constructor")]
+    Constructor,
 
     #[token("if")]
     If,
@@ -205,6 +210,7 @@ impl fmt::Display for Token<'_> {
             Self::Greater => write!(f, ">"),
             Self::GreaterEqual => write!(f, ">="),
             Self::Assign => write!(f, "="),
+            Self::DoubleArrow => write!(f, "=>"),
             Self::Null => write!(f, "null"),
             Self::Let => write!(f, "let"),
             Self::Fn => write!(f, "fn"),
@@ -221,6 +227,7 @@ impl fmt::Display for Token<'_> {
             Self::Continue => write!(f, "continue"),
             Self::Raise => write!(f, "raise"),
             Self::In => write!(f, "in"),
+            Self::Constructor => write!(f, "constructor"),
             Self::Ident(s) => write!(f, "Ident({})", s),
             Self::Number(n) => write!(f, "Number({})", n),
             Self::Integer(i) => write!(f, "Integer({})", i),
