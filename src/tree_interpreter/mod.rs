@@ -1,6 +1,6 @@
 use std::{
     cell::{OnceCell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::{self},
     io::Read,
     path::PathBuf,
@@ -10,48 +10,13 @@ use std::{
 use crate::{
     parse_string,
     parser::{BinaryOp, ClassMemberType, Expression, Extra, UnaryOp},
-    tree_interpreter::standard::define_globals,
+    tree_interpreter::standard::{define_globals, root_prototypes},
 };
 
 pub mod standard;
+mod value;
 
-#[derive(Clone)]
-pub enum Value {
-    Number(f64),
-    Integer(i64),
-    Bool(bool),
-    String(Vec<char>),
-    Null,
-    Array(Rc<RefCell<Vec<Value>>>),
-    Object(Rc<RefCell<HashMap<String, Value>>>),
-    Function(Rc<FunctionValue>),
-    BuiltinFunction(BuiltinFunctionType),
-    Prototype(Rc<RefCell<PrototypeValue>>),
-}
-
-impl PartialEq for Value {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Integer(a), Value::Number(b)) => (*a as f64) == *b,
-            (Value::Number(a), Value::Integer(b)) => *a == (*b as f64),
-
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Null, Value::Null) => true,
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
-            (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
-            (Value::BuiltinFunction(a), Value::BuiltinFunction(b)) => Rc::ptr_eq(a, b),
-            (Value::Prototype(a), Value::Prototype(b)) => Rc::ptr_eq(a, b),
-            _ => false,
-        }
-    }
-}
-
-type BuiltinFunctionType =
-    Rc<dyn Fn(Vec<Value>, &Location, Rc<Environment>) -> Result<Value, LocatedControlFlow>>;
+pub use value::*;
 
 #[derive(Clone)]
 pub struct Location {
@@ -64,34 +29,6 @@ impl Location {
         Self {
             span: range,
             module,
-        }
-    }
-}
-
-pub struct FunctionValue {
-    parameters: Vec<String>,
-    body: LocatedExpression,
-    env: Rc<Environment>,
-}
-
-pub struct PrototypeValue {
-    properties: HashMap<String, Value>,
-    static_properties: HashSet<String>,
-}
-
-impl Value {
-    fn get_prototype_name(&self) -> &'static str {
-        match self {
-            Value::Number(_) => "Number",
-            Value::Integer(_) => "Integer",
-            Value::Bool(_) => "Bool",
-            Value::String(_) => "String",
-            Value::Null => "Null",
-            Value::Array(_) => "Array",
-            Value::Object(_) => "Object",
-            Value::Function { .. } => "Function",
-            Value::BuiltinFunction { .. } => "BuiltinFunction",
-            Value::Prototype { .. } => "Prototype",
         }
     }
 }
@@ -240,6 +177,7 @@ fn variable_to_string(var: &Value) -> String {
         Value::Object(entries) => {
             let entries = entries
                 .borrow()
+                .properties
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
                 .collect::<Vec<_>>()
@@ -257,7 +195,24 @@ fn variable_to_string(var: &Value) -> String {
         }
         Value::BuiltinFunction { .. } => "<builtin function>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
-        Value::Prototype { .. } => "<prototype>".to_string(),
+        Value::Prototype(p) => {
+            let entries = p
+                .borrow()
+                .properties
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let parent = if let Some(parent) = &p.borrow().parent {
+                format!(
+                    " extends {}",
+                    variable_to_string(&Value::Prototype(parent.clone()))
+                )
+            } else {
+                "".to_string()
+            };
+            format!("<prototype {{{}}}{}>", entries, parent)
+        }
     }
 }
 
@@ -267,7 +222,21 @@ thread_local! {
 
 pub struct GlobalState {
     modules: HashMap<String, Option<Value>>,
+    root_prototypes: RootPrototypes,
     pwd: PathBuf,
+}
+
+pub struct RootPrototypes {
+    pub number: Rc<RefCell<PrototypeValue>>,
+    pub string: Rc<RefCell<PrototypeValue>>,
+    pub array: Rc<RefCell<PrototypeValue>>,
+    pub object: Rc<RefCell<PrototypeValue>>,
+    pub function: Rc<RefCell<PrototypeValue>>,
+    pub builtin_function: Rc<RefCell<PrototypeValue>>,
+    pub integer: Rc<RefCell<PrototypeValue>>,
+    pub bool: Rc<RefCell<PrototypeValue>>,
+    pub null: Rc<RefCell<PrototypeValue>>,
+    pub prototype: Rc<RefCell<PrototypeValue>>,
 }
 
 pub fn init_global_state(pwd: PathBuf) {
@@ -275,6 +244,7 @@ pub fn init_global_state(pwd: PathBuf) {
         state.get_or_init(|| {
             RefCell::new(GlobalState {
                 modules: HashMap::new(),
+                root_prototypes: root_prototypes(),
                 pwd,
             })
         });
@@ -330,62 +300,59 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 let value = interpret(value_expr, env.clone())?;
                 map.insert(key.clone(), value);
             }
-            Ok(Value::Object(Rc::new(RefCell::new(map))))
+            Ok(Value::Object(Rc::new(RefCell::new(ObjectValue {
+                properties: map,
+                prototype: GLOBAL_STATE
+                    .with(|state| state.get().unwrap().borrow().root_prototypes.object.clone()),
+            }))))
         }
-        Expression::FunctionLiteral { parameters, body } => {
-            Ok(Value::Function(Rc::new(FunctionValue {
-                parameters: parameters.clone(),
-                body: *body.clone(),
-                env,
-            })))
-        }
+        Expression::FunctionLiteral {
+            parameters,
+            body,
+            is_static,
+        } => Ok(Value::Function(Rc::new(FunctionValue {
+            parameters: parameters.clone(),
+            body: *body.clone(),
+            is_static: *is_static,
+            env,
+        }))),
         Expression::PrototypeLiteral {
             properties,
             superclass,
         } => {
-            let mut map = HashMap::new();
-            let mut static_properties = HashSet::new();
-
-            if let Some(superclass) = superclass {
+            let parent = if let Some(superclass) = superclass {
                 let super_val = interpret(superclass, env.clone())?;
                 let Value::Prototype(p) = super_val else {
                     return type_error("Superclass must be a prototype", superclass);
                 };
-                let p = p.borrow();
-                map = p.properties.clone();
-                static_properties = p.static_properties.clone();
-            }
+                Some(p)
+            } else {
+                None
+            };
 
-            let mut constructors = Vec::new();
+            let prototype = Rc::new(RefCell::new(PrototypeValue {
+                properties: HashMap::new(),
+                parent,
+            }));
+            let mut prototype_map = prototype.borrow_mut();
             for (name, member_type, property) in properties {
                 let val = interpret(property, env.clone())?;
                 if let ClassMemberType::Constructor = member_type {
                     let Value::Function(f) = val else {
                         return type_error("Constructor must be a function", property);
                     };
-                    constructors.push((name, f));
+                    prototype_map.properties.insert(
+                        name.to_string(),
+                        Value::BuiltinFunction(Rc::new(instantiate_prototype(
+                            prototype.clone(),
+                            f,
+                        ))),
+                    );
                 } else {
-                    map.insert(name.clone(), val);
+                    prototype_map.properties.insert(name.clone(), val);
                 }
             }
-            let mut no_statics_map = map.clone();
-            for static_property in static_properties.iter() {
-                no_statics_map.remove(static_property);
-            }
-            for (name, constructor) in constructors {
-                map.insert(
-                    name.to_string(),
-                    Value::BuiltinFunction(instantiate_prototype(
-                        no_statics_map.clone(),
-                        constructor,
-                    )),
-                );
-                static_properties.insert(name.to_string());
-            }
-            let prototype = Rc::new(RefCell::new(PrototypeValue {
-                properties: map,
-                static_properties,
-            }));
+            drop(prototype_map);
             Ok(Value::Prototype(prototype))
         }
         Expression::Break => Err(LocatedControlFlow {
@@ -498,10 +465,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                     &"next".to_string(),
                     &vec![],
                 )?;
-                let next_item = match next {
-                    Value::Object(next_map) => next_map.borrow().get("value").cloned(),
-                    _ => None,
-                };
+                let next_item = do_property_access(next, "value");
                 let Some(next_item) = next_item else {
                     break;
                 };
@@ -533,7 +497,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
         } => {
             let func_val = interpret(function, env.clone())?;
             let arg_vals = interpret_args(arguments, env.clone())?;
-            do_function_call(func_val, &function.extra, arg_vals, env.clone())
+            do_function_call(func_val, &function.extra, arg_vals, env.clone(), None)
         }
         Expression::PropertyFunctionCall {
             object,
@@ -542,11 +506,15 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
         } => do_property_function_call(
             &env,
             &interpret(object, env.clone())?,
-            &object.extra,
+            &expr.extra,
             function,
             arguments,
         ),
-        Expression::FieldAccess { object, field } => do_property_access(env, object, field),
+        Expression::FieldAccess { object, field } => {
+            do_property_access(interpret(object, env.clone())?, field).ok_or_else(|| {
+                RuntimeError::FieldAccessError(field.to_string()).span(&object.extra)
+            })
+        }
         Expression::ArrayIndex { array, index } => {
             let arr_val = interpret(array, env.clone())?;
             let idx_val = interpret(index, env.clone())?;
@@ -591,7 +559,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                     };
                     let key: String = key_chars.iter().collect();
                     let map = object_map.borrow();
-                    if let Some(val) = map.get(&key) {
+                    if let Some(val) = map.properties.get(&key) {
                         Ok(val.clone())
                     } else {
                         Err(RuntimeError::FieldAccessError(key).at(&index))
@@ -616,58 +584,60 @@ fn do_property_function_call(
     arguments: &Vec<LocatedExpression>,
 ) -> Result<Value, Located<ControlFlow>> {
     let arg_vals = interpret_args(arguments, env.clone())?;
-    match &obj_val {
-        Value::Object(object_map) => {
-            let function = object_map.borrow().get(function).cloned();
-            if let Some(f) = function {
-                return do_target_function_call(Some(&obj_val), &span, f, arg_vals, env.clone());
-            }
-        }
-        Value::Prototype(p) => {
-            let function = p.borrow().properties.get(function).cloned();
-            if let Some(f) = function {
-                return do_target_function_call(None, &span, f, arg_vals, env.clone());
-            }
-        }
-        _ => {}
+    let Some(property_val) = do_property_access(obj_val.clone(), function) else {
+        return Err(RuntimeError::FieldAccessError(function.to_string()).span(span));
     };
-    let prototype = obj_val.get_prototype_name();
-    if let Some(Value::Prototype(p)) = env.get(prototype) {
-        if let Some(val) = p.borrow().properties.get(function).cloned() {
-            do_target_function_call(Some(&obj_val), &span, val, arg_vals, env.clone())
-        } else {
-            Err(RuntimeError::FieldAccessError(function.to_string()).span(&span))
-        }
+    let target = if let Value::Prototype(_) = obj_val {
+        None
     } else {
-        Err(RuntimeError::FieldAccessError(function.to_string()).span(&span))
-    }
+        Some(obj_val.clone())
+    };
+    do_function_call(property_val, &span, arg_vals, env.clone(), target)
 }
 
-fn do_property_access(
-    env: Rc<Environment>,
-    object: &Box<LocatedExpression>,
-    field: &String,
-) -> Result<Value, Located<ControlFlow>> {
-    let obj_val = interpret(object, env.clone())?;
-    let res = match &obj_val {
-        Value::Object(object_map) => object_map.borrow().get(field).cloned(),
-        Value::Prototype(p) => p.borrow().properties.get(field).cloned(),
+fn do_property_access(object: Value, field: &str) -> Option<Value> {
+    let proto = match &object {
+        Value::Object(object_map) => {
+            let object_ref = object_map.borrow();
+            if let Some(val) = object_ref.properties.get(field).cloned() {
+                return Some(val);
+            }
+            Some(object_ref.prototype.clone())
+        }
+        Value::Prototype(p) => Some(p.clone()),
         _ => None,
     };
-    if let Some(v) = res {
-        Ok(v)
-    } else {
-        let prototype = obj_val.get_prototype_name();
-        if let Some(Value::Prototype(p)) = env.get(prototype) {
-            if let Some(val) = p.borrow().properties.get(field) {
-                Ok(val.clone())
+    if let Some(mut cur) = proto {
+        loop {
+            let cur_ref = cur.borrow();
+            if let Some(val) = cur_ref.properties.get(field).cloned() {
+                return Some(val);
+            } else if let Some(parent) = &cur_ref.parent {
+                let parent = parent.clone();
+                drop(cur_ref);
+                cur = parent;
             } else {
-                Err(RuntimeError::FieldAccessError(field.clone()).at(&object))
+                break;
             }
-        } else {
-            Err(RuntimeError::FieldAccessError(field.clone()).at(&object))
         }
     }
+    GLOBAL_STATE.with(|state| {
+        let root = &state.get().unwrap().borrow().root_prototypes;
+        let root = match object {
+            Value::Number(_) => &root.number,
+            Value::Integer(_) => &root.integer,
+            Value::Bool(_) => &root.bool,
+            Value::String(_) => &root.string,
+            Value::Null => &root.null,
+            Value::Function { .. } => &root.function,
+            Value::BuiltinFunction { .. } => &root.builtin_function,
+            Value::Array { .. } => &root.array,
+            Value::Object { .. } => &root.object,
+            Value::Prototype { .. } => &root.prototype,
+        };
+        let root_ref = root.borrow();
+        root_ref.properties.get(field).cloned()
+    })
 }
 
 fn interpret_for_loop(
@@ -808,7 +778,8 @@ fn interpret_binary_op(
                             op,
                             || {
                                 let map = object_map.borrow();
-                                map.get(field)
+                                map.properties
+                                    .get(field)
                                     .cloned()
                                     .ok_or_else(|| RuntimeError::FieldAccessError(field.clone()))
                             },
@@ -816,7 +787,7 @@ fn interpret_binary_op(
                         )
                         .map_err(|e| e.at(left))?;
                         let mut map = object_map.borrow_mut();
-                        map.insert(field.clone(), result.clone());
+                        map.properties.insert(field.clone(), result.clone());
                         Ok(result)
                     }
                     _ => Err(RuntimeError::TypeError(
@@ -942,6 +913,7 @@ fn do_function_call(
     span: &Location,
     arguments: Vec<Value>,
     env: Rc<Environment>,
+    target: Option<Value>,
 ) -> Result<Value, LocatedControlFlow> {
     match function_val {
         Value::Function(f) => {
@@ -949,56 +921,30 @@ fn do_function_call(
                 parameters,
                 body,
                 env: func_env,
+                is_static,
             } = &*f;
-            if parameters.len() != arguments.len() {
+            if *is_static
+                && target
+                    .as_ref()
+                    .is_some_and(|t| !matches!(t, Value::Prototype(_)))
+            {
+                return Err(RuntimeError::TypeError(
+                    "Attempted to call a static function with a target".to_string(),
+                )
+                .span(span));
+            }
+            let target = if *is_static { None } else { target };
+            let args_len = arguments.len() + if target.is_some() { 1 } else { 0 };
+            if parameters.len() != args_len {
                 return Err(RuntimeError::FunctionArgumentError(format!(
                     "Expected {} arguments, got {}",
                     parameters.len(),
-                    arguments.len()
+                    args_len
                 ))
                 .span(span));
             }
             let call_env = Rc::new(Environment::new(func_env.clone()));
-            for (param, arg) in parameters.iter().zip(arguments.into_iter()) {
-                if !call_env.define(param, arg) {
-                    unreachable!("Parameter name should not be duplicated: {}", param);
-                }
-            }
-            handle_return_control_flow(interpret(&body, call_env))
-        }
-        Value::BuiltinFunction(func) => handle_return_control_flow(func(arguments, span, env)),
-        _ => Err(
-            RuntimeError::TypeError("Attempted to call a non-function value".to_string())
-                .span(span),
-        ),
-    }
-}
-
-fn do_target_function_call(
-    target_val: Option<&Value>,
-    target: &Location,
-    function_val: Value,
-    arguments: Vec<Value>,
-    env: Rc<Environment>,
-) -> Result<Value, LocatedControlFlow> {
-    match function_val {
-        Value::Function(f) => {
-            let FunctionValue {
-                parameters,
-                body,
-                env: func_env,
-            } = &*f;
-            let arg_count = arguments.len() + if target_val.is_some() { 1 } else { 0 };
-            if parameters.len() != arg_count {
-                return Err(RuntimeError::FunctionArgumentError(format!(
-                    "Expected {} arguments, got {}",
-                    parameters.len(),
-                    arg_count
-                ))
-                .span(target));
-            }
-            let call_env = Rc::new(Environment::new(func_env.clone()));
-            let args_iter = target_val.cloned().into_iter().chain(arguments.into_iter());
+            let args_iter = target.into_iter().chain(arguments.into_iter());
             for (param, arg) in parameters.iter().zip(args_iter) {
                 if !call_env.define(param, arg) {
                     unreachable!("Parameter name should not be duplicated: {}", param);
@@ -1006,17 +952,28 @@ fn do_target_function_call(
             }
             handle_return_control_flow(interpret(&body, call_env))
         }
-        Value::BuiltinFunction(func) => {
-            let arg_vals = target_val
-                .cloned()
+        Value::BuiltinFunction(f) => {
+            let BuiltinFunctionValue { func, is_static } = &*f;
+            if *is_static
+                && target
+                    .as_ref()
+                    .is_some_and(|t| !matches!(t, Value::Prototype(_)))
+            {
+                return Err(RuntimeError::TypeError(
+                    "Attempted to call a static function with a target".to_string(),
+                )
+                .span(span));
+            }
+            let target = if *is_static { None } else { target };
+            let args = target
                 .into_iter()
                 .chain(arguments.into_iter())
                 .collect::<Vec<_>>();
-            handle_return_control_flow(func(arg_vals, target, env))
+            handle_return_control_flow(func(args, span, env))
         }
         _ => Err(
             RuntimeError::TypeError("Attempted to call a non-function value".to_string())
-                .span(target),
+                .span(span),
         ),
     }
 }
@@ -1053,36 +1010,49 @@ fn interpret_args(
 }
 
 fn instantiate_prototype(
-    p: HashMap<String, Value>,
+    p: Rc<RefCell<PrototypeValue>>,
     constructor: Rc<FunctionValue>,
-) -> BuiltinFunctionType {
-    Rc::new(move |args, span, _| {
-        let property_map = p.clone();
-        let this = Value::Object(Rc::new(RefCell::new(property_map)));
-        let FunctionValue {
-            parameters,
-            body,
-            env: func_env,
-        } = &*constructor;
-        let arg_count = args.len() + 1;
-        if parameters.len() != arg_count {
-            return Err(RuntimeError::FunctionArgumentError(format!(
-                "Expected {} arguments, got {}",
-                parameters.len(),
-                arg_count
-            ))
-            .span(&span));
-        }
-        let args_iter = std::iter::once(this.clone()).chain(args.into_iter());
-        let call_env = Rc::new(Environment::new(func_env.clone()));
-        for (param, arg_val) in parameters.iter().zip(args_iter) {
-            if !call_env.define(param, arg_val) {
-                unreachable!("Parameter name should not be duplicated: {}", param);
+) -> BuiltinFunctionValue {
+    BuiltinFunctionValue {
+        func: Box::new(move |mut args, span, _| {
+            let object_value = ObjectValue {
+                properties: HashMap::new(),
+                prototype: p.clone(),
+            };
+            let this = Value::Object(Rc::new(RefCell::new(object_value)));
+            let FunctionValue {
+                parameters,
+                body,
+                env: func_env,
+                is_static: _,
+            } = &*constructor;
+            let param_count = parameters.len();
+            if param_count == 0 {
+                return Err(RuntimeError::FunctionArgumentError(
+                    "Constructor must have at least one parameter for 'this'".to_string(),
+                )
+                .span(&span));
             }
-        }
-        interpret(&body, call_env)?;
-        Ok(this)
-    })
+            if param_count - 1 != args.len() {
+                return Err(RuntimeError::FunctionArgumentError(format!(
+                    "Expected {} arguments, got {}",
+                    param_count - 1,
+                    args.len()
+                ))
+                .span(&span));
+            }
+            let args = std::iter::once(this.clone()).chain(args.drain(..));
+            let call_env = Rc::new(Environment::new(func_env.clone()));
+            for (param, arg_val) in parameters.iter().zip(args) {
+                if !call_env.define(param, arg_val) {
+                    unreachable!("Parameter name should not be duplicated: {}", param);
+                }
+            }
+            interpret(&body, call_env)?;
+            Ok(this)
+        }),
+        is_static: true,
+    }
 }
 
 fn import_module(

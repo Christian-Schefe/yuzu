@@ -1,6 +1,6 @@
 class Iterator {
-    fn map(this, map) MapIterator.new(this, map);
-    fn collect(this) {
+    fn map(map) MapIterator.new(this, map);
+    fn collect() {
         let res = [];
         let cur = this.next();
         while (cur != null) {
@@ -12,11 +12,11 @@ class Iterator {
 }
 
 class IndexIterator : Iterator {
-    constructor fn new(this, target) {
+    constructor fn new(target) {
         this.target = target;
         this.current = -1;
     }
-    fn next(this) {
+    fn next() {
         this.current += 1;
         if (this.current >= this.target.length()) null
         else {value: this.target[this.current]}
@@ -24,11 +24,11 @@ class IndexIterator : Iterator {
 }
 
 class MapIterator : Iterator {
-    constructor fn new(this, iterator, map_fn) {
+    constructor fn new(iterator, map_fn) {
         this.iterator = iterator;
         this.map_fn = map_fn;
     }
-    fn next(this) {
+    fn next() {
         let next = this.iterator.next();
         if (next == null) return null;
         next.value = (this.map_fn)(next.value);
@@ -36,17 +36,17 @@ class MapIterator : Iterator {
     }
 }
 
-class Array : Array {
-    fn iter(this) IndexIterator.new(this);
+class Array {
+    fn iter() IndexIterator.new(this);
 }
 
-class String : String {
-    fn iter(this) IndexIterator.new(this);
+class String {
+    fn iter() IndexIterator.new(this);
 }
 
 return {
-    String,
     Array,
+    String,
     IndexIterator,
     MapIterator,
 };

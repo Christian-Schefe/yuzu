@@ -135,6 +135,8 @@ pub enum Token<'a> {
     Continue,
     #[token("raise")]
     Raise,
+    #[token("static")]
+    Static,
 
     #[token("or")]
     Or,
@@ -226,6 +228,7 @@ impl fmt::Display for Token<'_> {
             Self::Break => write!(f, "break"),
             Self::Continue => write!(f, "continue"),
             Self::Raise => write!(f, "raise"),
+            Self::Static => write!(f, "static"),
             Self::In => write!(f, "in"),
             Self::Constructor => write!(f, "constructor"),
             Self::Ident(s) => write!(f, "Ident({})", s),

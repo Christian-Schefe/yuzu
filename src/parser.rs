@@ -18,6 +18,7 @@ pub use expression::*;
 pub enum ClassMemberType {
     Field,
     Method,
+    StaticMethod,
     Constructor,
 }
 
@@ -209,6 +210,7 @@ where
                 Expression::FunctionLiteral {
                     parameters: params,
                     body: Box::new(body),
+                    is_static: false,
                 },
                 extra.span(),
             ))
@@ -244,6 +246,7 @@ where
                         Expression::FunctionLiteral {
                             parameters: params,
                             body: Box::new(body),
+                            is_static: false,
                         },
                         extra.span(),
                     )),
@@ -333,16 +336,39 @@ where
         .then(
             choice((
                 define_fn.clone().map(|lf| {
-                    if let Expression::Define(name, expr) = lf.expr {
+                    if let Expression::Define(name, mut expr) = lf.expr {
+                        let Expression::FunctionLiteral { parameters, .. } = &mut expr.expr else {
+                            panic!("Expected function definition in class body")
+                        };
+                        parameters.insert(0, "this".to_string());
                         (name, ClassMemberType::Method, *expr)
                     } else {
                         panic!("Expected function definition in class body")
                     }
                 }),
+                just(Token::Static)
+                    .ignore_then(define_fn.clone())
+                    .map(|lf| {
+                        if let Expression::Define(name, mut expr) = lf.expr {
+                            let Expression::FunctionLiteral { is_static, .. } = &mut expr.expr
+                            else {
+                                panic!("Expected function definition in class body")
+                            };
+                            *is_static = true;
+                            (name, ClassMemberType::StaticMethod, *expr)
+                        } else {
+                            panic!("Expected static method definition in class body")
+                        }
+                    }),
                 just(Token::Constructor)
                     .ignore_then(define_fn.clone())
                     .map(|lf| {
-                        if let Expression::Define(name, expr) = lf.expr {
+                        if let Expression::Define(name, mut expr) = lf.expr {
+                            let Expression::FunctionLiteral { parameters, .. } = &mut expr.expr
+                            else {
+                                panic!("Expected function definition in class body")
+                            };
+                            parameters.insert(0, "this".to_string());
                             (name, ClassMemberType::Constructor, *expr)
                         } else {
                             panic!("Expected constructor definition in class body")
@@ -495,15 +521,16 @@ where
                         .or_not()
                         .map(|v| v.unwrap_or_default()),
                 )
-                .then_ignore(just(Token::RParen)),
-            |lhs, (name, op), extra| {
+                .then_ignore(just(Token::RParen))
+                .map_with(|expr, extra| (expr, extra.span())),
+            |lhs, ((name, op), span): ((String, Vec<_>), SimpleSpan), _| {
                 located(
                     Expression::PropertyFunctionCall {
                         object: Box::new(lhs),
                         function: name,
                         arguments: op,
                     },
-                    extra.span(),
+                    span,
                 )
             },
         ),

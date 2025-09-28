@@ -1,18 +1,30 @@
 use std::{
     cell::{OnceCell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     rc::Rc,
 };
 
 use crate::tree_interpreter::{
-    Environment, LocatedControlFlow, Location, PrototypeValue, RuntimeError, Value, import_module,
-    interpret_string, variable_to_string,
+    BuiltinFunctionValue, Environment, GLOBAL_STATE, LocatedControlFlow, Location, PrototypeValue,
+    RootPrototypes, RuntimeError, Value, import_module, interpret_string, variable_to_string,
 };
 
 fn make_builtin_function(
     func: impl Fn(Vec<Value>, &Location, Rc<Environment>) -> Result<Value, LocatedControlFlow> + 'static,
 ) -> Value {
-    Value::BuiltinFunction(Rc::new(func))
+    Value::BuiltinFunction(Rc::new(BuiltinFunctionValue {
+        func: Box::new(func),
+        is_static: false,
+    }))
+}
+
+fn make_static_builtin_function(
+    func: impl Fn(Vec<Value>, &Location, Rc<Environment>) -> Result<Value, LocatedControlFlow> + 'static,
+) -> Value {
+    Value::BuiltinFunction(Rc::new(BuiltinFunctionValue {
+        func: Box::new(func),
+        is_static: true,
+    }))
 }
 
 pub fn define_globals(env: &Environment, with_std: bool) {
@@ -75,9 +87,29 @@ pub fn define_globals(env: &Environment, with_std: bool) {
             Ok(Value::String(type_str.chars().collect()))
         }),
     );
-    env.define("Integer", integer_prototype());
-    env.define("String", string_prototype());
-    env.define("Array", array_prototype());
+
+    GLOBAL_STATE.with(|state| {
+        let root_prototypes = &state.get().unwrap().borrow().root_prototypes;
+        env.define("Integer", Value::Prototype(root_prototypes.integer.clone()));
+        env.define("String", Value::Prototype(root_prototypes.string.clone()));
+        env.define("Array", Value::Prototype(root_prototypes.array.clone()));
+        env.define("Object", Value::Prototype(root_prototypes.object.clone()));
+        env.define("Bool", Value::Prototype(root_prototypes.bool.clone()));
+        env.define("Number", Value::Prototype(root_prototypes.number.clone()));
+        env.define("Null", Value::Prototype(root_prototypes.null.clone()));
+        env.define(
+            "Function",
+            Value::Prototype(root_prototypes.function.clone()),
+        );
+        env.define(
+            "BuiltinFunction",
+            Value::Prototype(root_prototypes.builtin_function.clone()),
+        );
+        env.define(
+            "Prototype",
+            Value::Prototype(root_prototypes.prototype.clone()),
+        );
+    });
 
     if !with_std {
         return;
@@ -99,14 +131,115 @@ pub fn define_globals(env: &Environment, with_std: bool) {
         panic!("Failed to interpret standard library");
     };
 
-    for (key, value) in std.borrow().iter() {
+    for (key, value) in std.borrow().properties.iter() {
         if !env.define(key, value.clone()) {
-            env.set(key, value.clone());
+            let prev = env.get(key).unwrap();
+            let Value::Prototype(real_p) = prev else {
+                panic!("Global {} in std is not a prototype, cannot merge", key);
+            };
+            let Value::Prototype(new_p) = value else {
+                panic!("Global {} in std is not a prototype, cannot merge", key);
+            };
+            let mut real_p = real_p.borrow_mut();
+            let new_p = new_p.borrow();
+            for (k, v) in new_p.properties.iter() {
+                real_p.properties.insert(k.clone(), v.clone());
+            }
         }
     }
 }
 
-fn integer_prototype() -> Value {
+pub fn root_prototypes() -> RootPrototypes {
+    RootPrototypes {
+        integer: integer_prototype(),
+        string: string_prototype(),
+        array: array_prototype(),
+        object: object_prototype(),
+        bool: Rc::new(RefCell::new(PrototypeValue {
+            properties: HashMap::new(),
+            parent: None,
+        })),
+        number: Rc::new(RefCell::new(PrototypeValue {
+            properties: HashMap::new(),
+            parent: None,
+        })),
+        null: Rc::new(RefCell::new(PrototypeValue {
+            properties: HashMap::new(),
+            parent: None,
+        })),
+        function: Rc::new(RefCell::new(PrototypeValue {
+            properties: HashMap::new(),
+            parent: None,
+        })),
+        builtin_function: Rc::new(RefCell::new(PrototypeValue {
+            properties: HashMap::new(),
+            parent: None,
+        })),
+        prototype: prototype_prototype(),
+    }
+}
+
+fn object_prototype() -> Rc<RefCell<PrototypeValue>> {
+    let mut map = HashMap::new();
+    map.insert(
+        "prototype".to_string(),
+        make_builtin_function(|args, expr, _| {
+            if args.len() != 1 {
+                return Err(RuntimeError::FunctionArgumentError(format!(
+                    "Expected 1 argument, got {}",
+                    args.len()
+                ))
+                .span(expr));
+            }
+            match &args[0] {
+                Value::Object(obj) => {
+                    let proto = obj.borrow().prototype.clone();
+                    Ok(Value::Prototype(proto))
+                }
+                _ => Err(RuntimeError::TypeError(
+                    "prototype can only be called on Object".to_string(),
+                )
+                .span(expr)),
+            }
+        }),
+    );
+    Rc::new(RefCell::new(PrototypeValue {
+        properties: map,
+        parent: None,
+    }))
+}
+
+fn prototype_prototype() -> Rc<RefCell<PrototypeValue>> {
+    let mut map = HashMap::new();
+    map.insert(
+        "super".to_string(),
+        make_static_builtin_function(|args, expr, _| {
+            if args.len() != 1 {
+                return Err(RuntimeError::FunctionArgumentError(format!(
+                    "Expected 1 argument, got {}",
+                    args.len()
+                ))
+                .span(expr));
+            }
+            match &args[0] {
+                Value::Prototype(obj) => {
+                    let proto = obj.borrow().parent.clone();
+                    Ok(proto.map_or(Value::Null, Value::Prototype))
+                }
+                _ => Err(
+                    RuntimeError::TypeError("super can only be called on Object".to_string())
+                        .span(expr),
+                ),
+            }
+        }),
+    );
+    Rc::new(RefCell::new(PrototypeValue {
+        properties: map,
+        parent: None,
+    }))
+}
+
+fn integer_prototype() -> Rc<RefCell<PrototypeValue>> {
     let mut map = HashMap::new();
     map.insert(
         "to_string".to_string(),
@@ -140,13 +273,13 @@ fn integer_prototype() -> Value {
             Ok(Value::Integer(0))
         }),
     );
-    Value::Prototype(Rc::new(RefCell::new(PrototypeValue {
+    Rc::new(RefCell::new(PrototypeValue {
         properties: map,
-        static_properties: HashSet::new(),
-    })))
+        parent: None,
+    }))
 }
 
-fn string_prototype() -> Value {
+fn string_prototype() -> Rc<RefCell<PrototypeValue>> {
     let mut map = HashMap::new();
     map.insert(
         "length".to_string(),
@@ -191,13 +324,13 @@ fn string_prototype() -> Value {
             Ok(Value::String(strings.concat().chars().collect()))
         }),
     );
-    Value::Prototype(Rc::new(RefCell::new(PrototypeValue {
+    Rc::new(RefCell::new(PrototypeValue {
         properties: map,
-        static_properties: HashSet::new(),
-    })))
+        parent: None,
+    }))
 }
 
-fn array_prototype() -> Value {
+fn array_prototype() -> Rc<RefCell<PrototypeValue>> {
     let mut map = HashMap::new();
     map.insert(
         "length".to_string(),
@@ -243,10 +376,10 @@ fn array_prototype() -> Value {
             }
         }),
     );
-    Value::Prototype(Rc::new(RefCell::new(PrototypeValue {
+    Rc::new(RefCell::new(PrototypeValue {
         properties: map,
-        static_properties: HashSet::new(),
-    })))
+        parent: None,
+    }))
 }
 
 pub const STD: &str = include_str!("../../reference/std.yuzu");

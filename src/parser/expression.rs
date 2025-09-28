@@ -12,6 +12,7 @@ pub enum Expression<T> {
     FunctionLiteral {
         parameters: Vec<String>,
         body: Box<Extra<T>>,
+        is_static: bool,
     },
     PrototypeLiteral {
         superclass: Option<Box<Extra<T>>>,
@@ -89,9 +90,14 @@ impl<T> Extra<T> {
                         .map(|(k, v)| (k, v.map_extra(f)))
                         .collect(),
                 ),
-                Expression::FunctionLiteral { parameters, body } => Expression::FunctionLiteral {
+                Expression::FunctionLiteral {
+                    parameters,
+                    body,
+                    is_static,
+                } => Expression::FunctionLiteral {
                     parameters,
                     body: Box::new(body.map_extra(f)),
+                    is_static,
                 },
                 Expression::PrototypeLiteral {
                     superclass,
@@ -185,11 +191,14 @@ impl<T> Extra<T> {
         }
     }
 }
+
 #[derive(Debug, Clone)]
-pub struct Extra<T> {
-    pub expr: Expression<T>,
+pub struct ExtraVal<T, K> {
+    pub expr: K,
     pub extra: T,
 }
+
+pub type Extra<T> = ExtraVal<T, Expression<T>>;
 
 impl<T> fmt::Display for Expression<Extra<T>>
 where
@@ -215,13 +224,17 @@ where
                 }
                 write!(f, "}})")
             }
-            Self::FunctionLiteral { parameters, body } => {
+            Self::FunctionLiteral {
+                parameters,
+                body,
+                is_static,
+            } => {
                 write!(f, "FunctionLiteral(")?;
                 write!(f, "params: [")?;
                 for param in parameters {
                     write!(f, "{}, ", param)?;
                 }
-                write!(f, "], body: {})", body.expr)
+                write!(f, "], body: {}, is_static: {})", body.expr, is_static)
             }
             Self::PrototypeLiteral {
                 properties,

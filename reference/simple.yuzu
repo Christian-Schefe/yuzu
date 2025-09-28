@@ -1,8 +1,45 @@
 let arr = [1, 32, 45, 25];
 
+print(arr);
 for (i in arr) {
-    print (i);
+    print(i);
 }
 
 let iter = arr.iter().map((i) => i * 2);
 print(iter.collect());
+
+class BaseClass {
+    let x = 5;
+    constructor fn new(a) {
+        this.x = a;
+    }
+    fn test() {
+        print("test", this);
+    }
+    static fn static_test() {
+        print("static test");
+    }
+}
+
+class SubClass : BaseClass {
+    let x = 7;
+    constructor fn new() {
+        print(this.prototype(), "hi");
+
+        print(Prototype.super(SubClass));
+
+        let a = BaseClass.new(10);
+        BaseClass.static_test();
+        BaseClass.test(a);
+        a.test();
+
+        print(Prototype.super(this.prototype()).new(35));
+
+        let p = Object.prototype(this);
+        print(p);
+    }
+}
+
+
+print(BaseClass.new(33).x);
+print(SubClass.new().x);
