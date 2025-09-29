@@ -4,11 +4,9 @@ use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
 use clio::Input;
 
-use crate::{
-    parser::LocatedExpression,
-    tree_interpreter::{Location, Value},
-};
+use crate::{parser::LocatedExpression, tree_interpreter::Location};
 
+mod gc_interpreter;
 mod lexer;
 mod parser;
 mod tree_interpreter;
@@ -35,7 +33,6 @@ fn main() {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    tree_interpreter::init_global_state(path);
 
     let mut buf = Vec::new();
     let res = args.input.read_to_end(&mut buf);
@@ -52,19 +49,9 @@ fn main() {
     let add_file_info = |extra| Location::new(extra, file_location_str.clone());
 
     let parsed = parsed.map_extra(&add_file_info);
-    let interpreted = tree_interpreter::interpret_global(&parsed, "root".to_string(), true);
+    let interpreted = gc_interpreter::interpret_global(parsed, "root".to_string(), path);
     if let Err(err) = interpreted {
-        let err_message = match &err.data {
-            Value::Object(obj) => {
-                let obj = obj.borrow();
-                if let Some(Value::String(msg)) = obj.properties.get("message") {
-                    msg.iter().collect()
-                } else {
-                    "Uncaught exception".to_string()
-                }
-            }
-            _ => "Uncaught exception".to_string(),
-        };
+        let err_message = err.data;
         Report::build(
             ReportKind::Error,
             (err.location.module.clone(), err.location.span.clone()),

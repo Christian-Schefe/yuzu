@@ -18,7 +18,7 @@ mod value;
 
 pub use value::*;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Location {
     pub span: core::ops::Range<usize>,
     pub module: String,
@@ -232,6 +232,7 @@ pub enum ControlFlow {
 
 pub type LocatedControlFlow = Located<ControlFlow>;
 
+#[derive(Clone, Debug)]
 pub struct Located<T> {
     pub data: T,
     pub location: Location,

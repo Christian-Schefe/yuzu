@@ -1,0 +1,86 @@
+class Iterator {
+    fn map(map) new MapIterator.make(this, map);
+    fn collect() {
+        let res = [];
+        let cur = this.next();
+        while (cur != null) {
+            res.push(cur.value);
+            cur = this.next();
+        }
+        res
+    }
+}
+
+class IndexIterator : Iterator {
+    constructor make(target) {
+        this.target = target;
+        this.current = -1;
+    }
+    fn next() {
+        this.current += 1;
+        if (this.current >= this.target.length()) null
+        else {value: this.target[this.current]}
+    }
+}
+
+class MapIterator : Iterator {
+    constructor make(iterator, map_fn) {
+        this.iterator = iterator;
+        this.map_fn = map_fn;
+    }
+    fn next() {
+        let next = this.iterator.next();
+        if (next == null) return null;
+        next.value = (this.map_fn)(next.value);
+        next
+    }
+}
+
+class Array {
+    fn iter() new IndexIterator.make(this);
+}
+
+class String {
+    fn iter() new IndexIterator.make(this);
+}
+
+class Exception {
+    constructor(message) {
+        this.message = message;
+    }
+}
+
+class File : File {
+    constructor(path) {
+        this.file = File.open(path);
+    }
+    fn close() {
+        if (this.file == null) return;
+        this.file.close();
+        this.file = null;
+    }
+    fn read(n) {
+        if (this.file == null) raise new Exception("File is closed");
+        let bytes = this.file.read(n);
+        bytes.to_string()
+    }
+    fn read_to_end() {
+        if (this.file == null) raise new Exception("File is closed");
+        let str = "";
+        while (true) {
+            let bytes = this.file.read(8192);
+            if (bytes.length() == 0) break;
+            str = str.concat(bytes.to_string());
+        }
+        str
+    }
+}
+
+return {
+    Array,
+    String,
+    IndexIterator,
+    MapIterator,
+    Exception,
+    File,
+};
