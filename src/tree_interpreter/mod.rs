@@ -1,7 +1,6 @@
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
-    fmt::{self},
     io::Read,
     path::PathBuf,
     rc::Rc,
@@ -9,10 +8,11 @@ use std::{
 
 use crate::{
     parse_string,
-    parser::{BinaryOp, ClassMemberType, Expression, Extra, UnaryOp},
+    parser::{BinaryOp, Expression, Extra, MemberKind, UnaryOp},
     tree_interpreter::standard::{define_globals, root_prototypes},
 };
 
+pub mod resource;
 pub mod standard;
 mod value;
 
@@ -47,6 +47,14 @@ impl Environment {
             parent: None,
             module_path,
         }
+    }
+
+    pub fn root(&self) -> &Environment {
+        let mut cur = self;
+        while let Some(parent) = &cur.parent {
+            cur = parent;
+        }
+        cur
     }
 
     pub fn new(parent: Rc<Environment>) -> Self {
@@ -88,27 +96,138 @@ impl Environment {
     }
 }
 
-pub enum RuntimeError {
-    TypeError(String),
-    UndefinedVariable(String),
-    FieldAccessError(String),
-    ArrayIndexOutOfBounds(i64),
-    FunctionArgumentError(String),
-    DuplicateVariableDefinition(String),
-    ImportError(String),
-    Custom(Value),
-    UnhandledControlFlow,
+fn make_exception(msg: &str, variant: &str, env: &Environment) -> Value {
+    let p = if let Some(Value::Prototype(p)) = env.root().get(variant) {
+        p
+    } else {
+        GLOBAL_STATE.with(|state| {
+            state
+                .get()
+                .unwrap()
+                .borrow()
+                .root_prototypes
+                .exception
+                .clone()
+        })
+    };
+
+    let mut map = HashMap::new();
+    map.insert("message".to_string(), Value::String(msg.chars().collect()));
+    Value::Object(Rc::new(RefCell::new(ObjectValue {
+        properties: map,
+        prototype: p,
+    })))
 }
 
-fn type_error<T>(msg: &str, expr: &LocatedExpression) -> Result<T, LocatedControlFlow> {
-    Err(RuntimeError::TypeError(msg.to_string()).at(expr))
+pub fn runtime_error<T>(
+    msg: &str,
+    variant: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    let exception = make_exception(msg, variant, env);
+    Err(Located {
+        data: ControlFlow::Error(exception),
+        location: expr.location().clone(),
+    })
+}
+
+pub fn type_error<T>(
+    msg: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(msg, "TypeError", env, expr)
+}
+
+pub fn array_index_out_of_bounds<T>(
+    index: i64,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(
+        &format!("Array index out of bounds: {}", index),
+        "ArrayIndexOutOfBounds",
+        env,
+        expr,
+    )
+}
+
+pub fn function_argument_error<T>(
+    msg: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(msg, "FunctionArgumentError", env, expr)
+}
+
+pub fn io_error<T>(
+    msg: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(msg, "IOError", env, expr)
+}
+
+pub fn unhandled_control_flow<T>(
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error("Unhandled control flow", "RuntimeError", env, expr)
+}
+
+pub fn field_access_error<T>(
+    field: String,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(
+        &format!("Field access error: {}", field),
+        "FieldAccessError",
+        env,
+        expr,
+    )
+}
+
+pub fn undefined_variable<T>(
+    name: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(
+        &format!("Undefined variable: {}", name),
+        "UndefinedVariable",
+        env,
+        expr,
+    )
+}
+
+pub fn duplicate_variable_definition<T>(
+    name: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(
+        &format!("Duplicate variable definition: {}", name),
+        "DuplicateVariableDefinition",
+        env,
+        expr,
+    )
+}
+
+pub fn import_error<T>(
+    msg: &str,
+    env: &Environment,
+    expr: impl HasLocation,
+) -> Result<T, LocatedControlFlow> {
+    runtime_error(msg, "ImportError", env, expr)
 }
 
 pub enum ControlFlow {
     Return(Value),
     Break,
     Continue,
-    Error(RuntimeError),
+    Error(Value),
 }
 
 pub type LocatedControlFlow = Located<ControlFlow>;
@@ -118,52 +237,43 @@ pub struct Located<T> {
     pub location: Location,
 }
 
-impl RuntimeError {
-    pub fn at(self, expr: &LocatedExpression) -> LocatedControlFlow {
-        LocatedControlFlow {
-            data: ControlFlow::Error(self),
-            location: expr.extra.clone(),
-        }
-    }
-    pub fn span(self, location: &Location) -> LocatedControlFlow {
-        LocatedControlFlow {
-            data: ControlFlow::Error(self),
-            location: location.clone(),
-        }
-    }
-    pub fn from_to(self, from: &LocatedExpression, to: &LocatedExpression) -> LocatedControlFlow {
-        LocatedControlFlow {
-            data: ControlFlow::Error(self),
-            location: Location {
-                span: from.extra.span.start..to.extra.span.end,
-                module: from.extra.module.clone(),
-            },
-        }
+pub trait HasLocation {
+    fn location(&self) -> &Location;
+}
+
+impl<T> HasLocation for Located<T> {
+    fn location(&self) -> &Location {
+        &self.location
     }
 }
 
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::TypeError(msg) => write!(f, "TypeError: {}", msg),
-            Self::UndefinedVariable(name) => write!(f, "Undefined variable: {}", name),
-            Self::FieldAccessError(msg) => write!(f, "Field does not exist: {}", msg),
-            Self::ArrayIndexOutOfBounds(index) => {
-                write!(f, "Array index out of bounds: {}", index)
-            }
-            Self::FunctionArgumentError(msg) => write!(f, "Function argument error: {}", msg),
-            Self::DuplicateVariableDefinition(name) => {
-                write!(f, "Variable already defined in this scope: {}", name)
-            }
-            Self::UnhandledControlFlow => {
-                write!(
-                    f,
-                    "Unhandled control flow (return, break, continue) outside of function or loop"
-                )
-            }
-            Self::Custom(val) => write!(f, "Error: {}", variable_to_string(val)),
-            Self::ImportError(msg) => write!(f, "ImportError: {}", msg),
-        }
+impl HasLocation for Location {
+    fn location(&self) -> &Location {
+        self
+    }
+}
+
+impl<T> HasLocation for &T
+where
+    T: HasLocation,
+{
+    fn location(&self) -> &Location {
+        (*self).location()
+    }
+}
+
+impl HasLocation for Extra<Location> {
+    fn location(&self) -> &Location {
+        &self.extra
+    }
+}
+
+impl<T> HasLocation for Box<T>
+where
+    T: HasLocation,
+{
+    fn location(&self) -> &Location {
+        self.as_ref().location()
     }
 }
 
@@ -174,6 +284,7 @@ fn variable_to_string(var: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::String(s) => s.iter().collect(),
         Value::Null => "null".to_string(),
+        Value::Resource(_) => "<resource>".to_string(),
         Value::Object(entries) => {
             let entries = entries
                 .borrow()
@@ -200,7 +311,7 @@ fn variable_to_string(var: &Value) -> String {
                 .borrow()
                 .properties
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v.0)))
                 .collect::<Vec<_>>()
                 .join(", ");
             let parent = if let Some(parent) = &p.borrow().parent {
@@ -212,6 +323,24 @@ fn variable_to_string(var: &Value) -> String {
                 "".to_string()
             };
             format!("<prototype {{{}}}{}>", entries, parent)
+        }
+        Value::Buffer(buf) => {
+            let buf = buf.borrow();
+            let display = if buf.len() > 10 {
+                let mut s = buf[..10]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                s.push_str(" ...");
+                s
+            } else {
+                buf.iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            format!("<buffer [{}]>", display)
         }
     }
 }
@@ -237,6 +366,9 @@ pub struct RootPrototypes {
     pub bool: Rc<RefCell<PrototypeValue>>,
     pub null: Rc<RefCell<PrototypeValue>>,
     pub prototype: Rc<RefCell<PrototypeValue>>,
+    pub exception: Rc<RefCell<PrototypeValue>>,
+    pub resource: Rc<RefCell<PrototypeValue>>,
+    pub buffer: Rc<RefCell<PrototypeValue>>,
 }
 
 pub fn init_global_state(pwd: PathBuf) {
@@ -257,10 +389,10 @@ pub fn interpret_global(
     expr: &LocatedExpression,
     module_path: String,
     with_std: bool,
-) -> Result<Value, Located<RuntimeError>> {
+) -> Result<Value, Located<Value>> {
     let global_env = Rc::new(Environment::new_global(module_path));
     define_globals(&*global_env, with_std);
-    match interpret(expr, global_env) {
+    match interpret(expr, global_env.clone()) {
         Ok(v) => Ok(v),
         Err(LocatedControlFlow {
             data,
@@ -272,7 +404,7 @@ pub fn interpret_global(
             }),
             ControlFlow::Return(v) => Ok(v),
             _ => Err(Located {
-                data: RuntimeError::UnhandledControlFlow,
+                data: make_exception("Unhandled control flow", "RuntimeError", &global_env),
                 location: span,
             }),
         },
@@ -306,16 +438,13 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                     .with(|state| state.get().unwrap().borrow().root_prototypes.object.clone()),
             }))))
         }
-        Expression::FunctionLiteral {
-            parameters,
-            body,
-            is_static,
-        } => Ok(Value::Function(Rc::new(FunctionValue {
-            parameters: parameters.clone(),
-            body: *body.clone(),
-            is_static: *is_static,
-            env,
-        }))),
+        Expression::FunctionLiteral { parameters, body } => {
+            Ok(Value::Function(Rc::new(FunctionValue {
+                parameters: parameters.clone(),
+                body: *body.clone(),
+                env,
+            })))
+        }
         Expression::PrototypeLiteral {
             properties,
             superclass,
@@ -323,7 +452,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             let parent = if let Some(superclass) = superclass {
                 let super_val = interpret(superclass, env.clone())?;
                 let Value::Prototype(p) = super_val else {
-                    return type_error("Superclass must be a prototype", superclass);
+                    return type_error("Superclass must be a prototype", &env, superclass);
                 };
                 Some(p)
             } else {
@@ -335,25 +464,59 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 parent,
             }));
             let mut prototype_map = prototype.borrow_mut();
-            for (name, member_type, property) in properties {
+            for (name, kind, property) in properties {
                 let val = interpret(property, env.clone())?;
-                if let ClassMemberType::Constructor = member_type {
-                    let Value::Function(f) = val else {
-                        return type_error("Constructor must be a function", property);
-                    };
-                    prototype_map.properties.insert(
-                        name.to_string(),
-                        Value::BuiltinFunction(Rc::new(instantiate_prototype(
-                            prototype.clone(),
-                            f,
-                        ))),
-                    );
-                } else {
-                    prototype_map.properties.insert(name.clone(), val);
-                }
+                let kind = match kind {
+                    MemberKind::Field => PropertyKind::Field,
+                    MemberKind::Method => PropertyKind::Method,
+                    MemberKind::Constructor => PropertyKind::Constructor(prototype.clone()),
+                    MemberKind::StaticMethod => PropertyKind::StaticMethod,
+                };
+                prototype_map.properties.insert(name.clone(), (val, kind));
             }
             drop(prototype_map);
             Ok(Value::Prototype(prototype))
+        }
+        Expression::New(expr) => {
+            let (obj_expr, field_name, args) = if let Expression::PropertyFunctionCall {
+                object,
+                function,
+                arguments,
+            } = &expr.expr
+            {
+                (object, function.as_str(), arguments)
+            } else if let Expression::FunctionCall {
+                function,
+                arguments,
+            } = &expr.expr
+            {
+                (function, "$constructor", arguments)
+            } else {
+                return type_error("Invalid constructor call", &env, expr);
+            };
+
+            let obj_val = interpret(obj_expr, env.clone())?;
+            let Some((val, kind)) = do_property_access(obj_val.clone(), field_name) else {
+                return field_access_error(
+                    match field_name {
+                        "$constructor" => "Default constructor".to_string(),
+                        other => other.to_string(),
+                    },
+                    &env,
+                    expr,
+                );
+            };
+            let PropertyKind::Constructor(p) = kind else {
+                return type_error("Constructor must be a constructor property", &env, expr);
+            };
+            let object_value = ObjectValue {
+                properties: HashMap::new(),
+                prototype: p.clone(),
+            };
+            let instance = Value::Object(Rc::new(RefCell::new(object_value)));
+            let args = interpret_args(args, env.clone())?;
+            do_function_call(val, &expr.extra, args, env, Some(instance.clone()))?;
+            Ok(instance)
         }
         Expression::Break => Err(LocatedControlFlow {
             data: ControlFlow::Break,
@@ -376,13 +539,16 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
         }
         Expression::Raise(err_expr) => {
             let val = interpret(err_expr, env.clone())?;
-            Err(RuntimeError::Custom(val).at(expr))
+            Err(LocatedControlFlow {
+                data: ControlFlow::Error(val),
+                location: expr.extra.clone(),
+            })
         }
         Expression::Ident(name) => {
             if let Some(val) = env.get(name) {
                 Ok(val)
             } else {
-                Err(RuntimeError::UndefinedVariable(name.clone()).at(expr))
+                undefined_variable(name, &env, expr)
             }
         }
         Expression::Define(name, value) => {
@@ -390,7 +556,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             if env.define(name, val) {
                 Ok(Value::Null)
             } else {
-                Err(RuntimeError::DuplicateVariableDefinition(name.to_string()).at(expr))
+                duplicate_variable_definition(name, &env, expr)
             }
         }
         Expression::Block(exprs, ret) => {
@@ -419,12 +585,54 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                         Ok(Value::Null)
                     }
                 }
-                _ => Err(
-                    RuntimeError::TypeError("Condition of if must be a boolean".to_string())
-                        .at(&condition),
-                ),
+                _ => type_error("Condition of if must be a boolean", &env, condition),
             }
         }
+        Expression::TryCatch {
+            try_block,
+            exception_prototype,
+            exception_var,
+            catch_block,
+        } => match interpret(try_block, env.clone()) {
+            Ok(v) => Ok(v),
+            Err(LocatedControlFlow {
+                data: ControlFlow::Error(e),
+                location,
+            }) => {
+                let catch_env = Rc::new(Environment::new(env.clone()));
+                let matching = if let Some(proto) = exception_prototype {
+                    let proto_val = interpret(proto, env.clone())?;
+                    let Value::Prototype(target) = proto_val else {
+                        return type_error("Exception prototype must be a prototype", &env, proto);
+                    };
+                    let mut current = get_prototype(&e);
+                    loop {
+                        if Rc::ptr_eq(&current, &target) {
+                            break true;
+                        }
+                        let cur_ref = current.borrow();
+                        if let Some(parent_ref) = &cur_ref.parent {
+                            let parent = parent_ref.clone();
+                            drop(cur_ref);
+                            current = parent;
+                        } else {
+                            break false;
+                        }
+                    }
+                } else {
+                    true
+                };
+                if !matching {
+                    return Err(LocatedControlFlow {
+                        data: ControlFlow::Error(e),
+                        location,
+                    });
+                }
+                catch_env.define(exception_var, e);
+                interpret(catch_block, catch_env)
+            }
+            Err(other) => Err(other),
+        },
         Expression::Loop {
             init,
             condition,
@@ -437,11 +645,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                 (UnaryOp::Negate, Value::Number(n)) => Ok(Value::Number(-n)),
                 (UnaryOp::Negate, Value::Integer(i)) => Ok(Value::Integer(-i)),
                 (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                _ => Err(RuntimeError::TypeError(format!(
-                    "Invalid operand type for unary operator {:?}",
-                    op
-                ))
-                .at(expr)),
+                _ => type_error("Invalid operand type for unary operator", &env, expr),
             }
         }
         Expression::IterLoop {
@@ -466,7 +670,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                     &vec![],
                 )?;
                 let next_item = do_property_access(next, "value");
-                let Some(next_item) = next_item else {
+                let Some((next_item, _)) = next_item else {
                     break;
                 };
                 let loop_env = Rc::new(Environment::new(env.clone()));
@@ -511,9 +715,9 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             arguments,
         ),
         Expression::FieldAccess { object, field } => {
-            do_property_access(interpret(object, env.clone())?, field).ok_or_else(|| {
-                RuntimeError::FieldAccessError(field.to_string()).span(&object.extra)
-            })
+            do_property_access(interpret(object, env.clone())?, field)
+                .ok_or_else(|| field_access_error::<()>(field.to_string(), &env, expr).unwrap_err())
+                .map(|(val, _)| val)
         }
         Expression::ArrayIndex { array, index } => {
             let arr_val = interpret(array, env.clone())?;
@@ -521,10 +725,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             match arr_val {
                 Value::Array(elements) => {
                     let Value::Integer(i) = idx_val else {
-                        return Err(RuntimeError::TypeError(
-                            "Array index must be an integer".to_string(),
-                        )
-                        .at(&index));
+                        return type_error("Array index must be an integer", &env, index);
                     };
                     let elements = elements.borrow();
                     if let Ok(i) = TryInto::<usize>::try_into(i)
@@ -532,45 +733,31 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
                     {
                         Ok(elements[i].clone())
                     } else {
-                        Err(RuntimeError::ArrayIndexOutOfBounds(i).at(&index))
+                        array_index_out_of_bounds(i, &env, index)
                     }
                 }
                 Value::String(string) => {
                     let Value::Integer(i) = idx_val else {
-                        return Err(RuntimeError::TypeError(
-                            "Array index must be an integer".to_string(),
-                        )
-                        .at(&index));
+                        return type_error("String index must be an integer", &env, index);
                     };
                     if let Ok(i) = TryInto::<usize>::try_into(i)
                         && i < string.len()
                     {
                         Ok(Value::String(vec![string[i]]))
                     } else {
-                        Err(RuntimeError::ArrayIndexOutOfBounds(i).at(&index))
+                        array_index_out_of_bounds(i, &env, index)
                     }
                 }
-                Value::Object(object_map) => {
+                Value::Object(_) | Value::Prototype(_) => {
                     let Value::String(key_chars) = idx_val else {
-                        return Err(RuntimeError::TypeError(
-                            "Object index must be a string".to_string(),
-                        )
-                        .at(&index));
+                        return type_error("Object index must be a string", &env, index);
                     };
-                    let key: String = key_chars.iter().collect();
-                    let map = object_map.borrow();
-                    if let Some(val) = map.properties.get(&key) {
-                        Ok(val.clone())
-                    } else {
-                        Err(RuntimeError::FieldAccessError(key).at(&index))
-                    }
+                    let key = key_chars.iter().collect::<String>();
+                    do_property_access(arr_val, key.as_str())
+                        .ok_or_else(|| field_access_error::<()>(key, &env, expr).unwrap_err())
+                        .map(|(val, _)| val)
                 }
-                _ => {
-                    return Err(RuntimeError::TypeError(
-                        "Attempted to index a non-array value".to_string(),
-                    )
-                    .at(&array));
-                }
+                _ => type_error("Cannot index into this value", &env, array),
             }
         }
     }
@@ -584,23 +771,25 @@ fn do_property_function_call(
     arguments: &Vec<LocatedExpression>,
 ) -> Result<Value, Located<ControlFlow>> {
     let arg_vals = interpret_args(arguments, env.clone())?;
-    let Some(property_val) = do_property_access(obj_val.clone(), function) else {
-        return Err(RuntimeError::FieldAccessError(function.to_string()).span(span));
+    let Some((property_val, kind)) = do_property_access(obj_val.clone(), function) else {
+        return field_access_error(function.to_string(), env, span);
     };
     let target = if let Value::Prototype(_) = obj_val {
         None
+    } else if let PropertyKind::StaticMethod = kind {
+        return type_error("Cannot call instance method on static", env, span);
     } else {
         Some(obj_val.clone())
     };
     do_function_call(property_val, &span, arg_vals, env.clone(), target)
 }
 
-fn do_property_access(object: Value, field: &str) -> Option<Value> {
+fn do_property_access(object: Value, field: &str) -> Option<(Value, PropertyKind)> {
     let proto = match &object {
         Value::Object(object_map) => {
             let object_ref = object_map.borrow();
             if let Some(val) = object_ref.properties.get(field).cloned() {
-                return Some(val);
+                return Some((val, PropertyKind::Field));
             }
             Some(object_ref.prototype.clone())
         }
@@ -623,7 +812,7 @@ fn do_property_access(object: Value, field: &str) -> Option<Value> {
     }
     GLOBAL_STATE.with(|state| {
         let root = &state.get().unwrap().borrow().root_prototypes;
-        let root = match object {
+        let root_prot = match object {
             Value::Number(_) => &root.number,
             Value::Integer(_) => &root.integer,
             Value::Bool(_) => &root.bool,
@@ -634,9 +823,36 @@ fn do_property_access(object: Value, field: &str) -> Option<Value> {
             Value::Array { .. } => &root.array,
             Value::Object { .. } => &root.object,
             Value::Prototype { .. } => &root.prototype,
+            Value::Resource(_) => &root.resource,
+            Value::Buffer(_) => &root.buffer,
         };
-        let root_ref = root.borrow();
+        let root_ref = root_prot.borrow();
         root_ref.properties.get(field).cloned()
+    })
+}
+
+fn get_prototype(object: &Value) -> Rc<RefCell<PrototypeValue>> {
+    match &object {
+        Value::Object(object_map) => return object_map.borrow().prototype.clone(),
+        _ => {}
+    };
+    GLOBAL_STATE.with(|state| {
+        let root = &state.get().unwrap().borrow().root_prototypes;
+        let prot = match object {
+            Value::Number(_) => &root.number,
+            Value::Integer(_) => &root.integer,
+            Value::Bool(_) => &root.bool,
+            Value::String(_) => &root.string,
+            Value::Null => &root.null,
+            Value::Function { .. } => &root.function,
+            Value::BuiltinFunction { .. } => &root.builtin_function,
+            Value::Array { .. } => &root.array,
+            Value::Object { .. } => &root.object,
+            Value::Prototype { .. } => &root.prototype,
+            Value::Resource(_) => &root.resource,
+            Value::Buffer(_) => &root.buffer,
+        };
+        prot.clone()
     })
 }
 
@@ -669,10 +885,11 @@ fn interpret_for_loop(
             Ok(v) => v,
         };
         let Value::Bool(cond) = cond else {
-            return Err(RuntimeError::TypeError(
-                "Condition of for loop must be a boolean".to_string(),
-            )
-            .at(&condition));
+            return type_error(
+                "Condition of for loop must be a boolean",
+                &loop_env,
+                condition,
+            );
         };
         if !cond {
             break;
@@ -730,9 +947,11 @@ fn interpret_binary_op(
     {
         fn compute_result(
             op: &BinaryOp,
-            left: impl FnOnce() -> Result<Value, RuntimeError>,
+            left: impl FnOnce() -> Result<Value, LocatedControlFlow>,
             right: Value,
-        ) -> Result<Value, RuntimeError> {
+            env: &Rc<Environment>,
+            location: &Location,
+        ) -> Result<Value, LocatedControlFlow> {
             match op {
                 BinaryOp::Assign => Ok(right),
                 BinaryOp::AddAssign
@@ -746,7 +965,8 @@ fn interpret_binary_op(
                         BinaryOp::DivideAssign => BinaryOp::Divide,
                         _ => unreachable!(),
                     };
-                    interpret_simple_binary_op(&actual_op, left()?, right)
+                    let left = left()?;
+                    interpret_simple_binary_op(&actual_op, left, right, location, env)
                 }
                 _ => unreachable!(),
             }
@@ -758,15 +978,16 @@ fn interpret_binary_op(
                     op,
                     || {
                         env.get(name)
-                            .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()))
+                            .ok_or_else(|| undefined_variable::<()>(name, env, left).unwrap_err())
                     },
                     val,
-                )
-                .map_err(|e| e.at(left))?;
+                    env,
+                    left.location(),
+                )?;
                 if env.set(name, result.clone()) {
                     Ok(result)
                 } else {
-                    Err(RuntimeError::UndefinedVariable(name.clone()).at(left))
+                    undefined_variable(name, env, left)
                 }
             }
             Expression::FieldAccess { object, field } => {
@@ -778,38 +999,29 @@ fn interpret_binary_op(
                             op,
                             || {
                                 let map = object_map.borrow();
-                                map.properties
-                                    .get(field)
-                                    .cloned()
-                                    .ok_or_else(|| RuntimeError::FieldAccessError(field.clone()))
+                                map.properties.get(field).cloned().ok_or_else(|| {
+                                    field_access_error::<()>(field.clone(), env, left).unwrap_err()
+                                })
                             },
                             val,
-                        )
-                        .map_err(|e| e.at(left))?;
+                            env,
+                            left.location(),
+                        )?;
                         let mut map = object_map.borrow_mut();
                         map.properties.insert(field.clone(), result.clone());
                         Ok(result)
                     }
-                    _ => Err(RuntimeError::TypeError(
-                        "Field access must be on an object".to_string(),
-                    )
-                    .at(object)),
+                    _ => type_error("Left side of assignment must be an object", env, object),
                 }
             }
             Expression::ArrayIndex { array, index } => {
                 let arr_val = interpret(array, env.clone())?;
                 let idx_val = interpret(index, env.clone())?;
                 let Value::Array(elements) = arr_val else {
-                    return Err(RuntimeError::TypeError(
-                        "Attempted to index a non-array value".to_string(),
-                    )
-                    .at(&array));
+                    return type_error("Attempted to index a non-array value", env, array);
                 };
                 let Value::Integer(i) = idx_val else {
-                    return Err(RuntimeError::TypeError(
-                        "Array index must be an integer".to_string(),
-                    )
-                    .at(&index));
+                    return type_error("Array index must be an integer", env, index);
                 };
                 if let Ok(i) = TryInto::<usize>::try_into(i) {
                     let val = interpret(right, env.clone())?;
@@ -818,24 +1030,26 @@ fn interpret_binary_op(
                         || {
                             let elements = elements.borrow();
                             if i >= elements.len() {
-                                return Err(RuntimeError::ArrayIndexOutOfBounds(i as i64));
+                                return array_index_out_of_bounds(i as i64, env, left);
                             }
                             Ok(elements[i].clone())
                         },
                         val,
-                    )
-                    .map_err(|e| e.at(left))?;
+                        env,
+                        left.location(),
+                    )?;
                     let mut elements = elements.borrow_mut();
                     elements[i] = result.clone();
                     Ok(result)
                 } else {
-                    Err(RuntimeError::ArrayIndexOutOfBounds(i).at(&index))
+                    array_index_out_of_bounds(i, env, index)
                 }
             }
-            _ => Err(RuntimeError::TypeError(
-                "Left side of assignment must be assignable".to_string(),
-            )
-            .at(left)),
+            _ => type_error(
+                "Left side of assignment must be a variable, field, or array index",
+                env,
+                left,
+            ),
         }
     } else {
         let left_val = interpret(left, env.clone())?;
@@ -844,8 +1058,7 @@ fn interpret_binary_op(
             (BinaryOp::Or, Value::Bool(true)) => Ok(Value::Bool(true)),
             _ => {
                 let right_val = interpret(right, env.clone())?;
-                interpret_simple_binary_op(op, left_val, right_val)
-                    .map_err(|e| e.from_to(&left, &right))
+                interpret_simple_binary_op(op, left_val, right_val, &left.location(), env)
             }
         }
     }
@@ -855,7 +1068,9 @@ fn interpret_simple_binary_op(
     op: &BinaryOp,
     left: Value,
     right: Value,
-) -> Result<Value, RuntimeError> {
+    location: &Location,
+    env: &Environment,
+) -> Result<Value, LocatedControlFlow> {
     match (op, left, right) {
         (BinaryOp::Add, Value::Number(l), Value::Number(r)) => Ok(Value::Number(l + r)),
         (BinaryOp::Add, Value::Integer(l), Value::Integer(r)) => Ok(Value::Integer(l + r)),
@@ -891,6 +1106,11 @@ fn interpret_simple_binary_op(
         (BinaryOp::Equal, l, r) => Ok(Value::Bool(l == r)),
         (BinaryOp::NotEqual, l, r) => Ok(Value::Bool(l != r)),
 
+        (BinaryOp::NullCoalesce, l, r) => match l {
+            Value::Null => Ok(r),
+            _ => Ok(l),
+        },
+
         (BinaryOp::Less, Value::Number(l), Value::Number(r)) => Ok(Value::Bool(l < r)),
         (BinaryOp::Less, Value::Integer(l), Value::Integer(r)) => Ok(Value::Bool(l < r)),
         (BinaryOp::LessEqual, Value::Number(l), Value::Number(r)) => Ok(Value::Bool(l <= r)),
@@ -901,10 +1121,11 @@ fn interpret_simple_binary_op(
         (BinaryOp::GreaterEqual, Value::Number(l), Value::Number(r)) => Ok(Value::Bool(l >= r)),
         (BinaryOp::GreaterEqual, Value::Integer(l), Value::Integer(r)) => Ok(Value::Bool(l >= r)),
 
-        _ => Err(RuntimeError::TypeError(format!(
-            "Invalid operand types for binary operator {:?}",
-            op
-        ))),
+        _ => type_error(
+            &format!("Invalid operand types for binary operator {:?}", op),
+            env,
+            location,
+        ),
     }
 }
 
@@ -921,27 +1142,15 @@ fn do_function_call(
                 parameters,
                 body,
                 env: func_env,
-                is_static,
             } = &*f;
-            if *is_static
-                && target
-                    .as_ref()
-                    .is_some_and(|t| !matches!(t, Value::Prototype(_)))
-            {
-                return Err(RuntimeError::TypeError(
-                    "Attempted to call a static function with a target".to_string(),
-                )
-                .span(span));
-            }
-            let target = if *is_static { None } else { target };
+
             let args_len = arguments.len() + if target.is_some() { 1 } else { 0 };
             if parameters.len() != args_len {
-                return Err(RuntimeError::FunctionArgumentError(format!(
-                    "Expected {} arguments, got {}",
-                    parameters.len(),
-                    args_len
-                ))
-                .span(span));
+                return function_argument_error(
+                    &format!("Expected {} arguments, got {}", parameters.len(), args_len),
+                    &env,
+                    span,
+                );
             }
             let call_env = Rc::new(Environment::new(func_env.clone()));
             let args_iter = target.into_iter().chain(arguments.into_iter());
@@ -950,36 +1159,25 @@ fn do_function_call(
                     unreachable!("Parameter name should not be duplicated: {}", param);
                 }
             }
-            handle_return_control_flow(interpret(&body, call_env))
+            let result = interpret(&body, call_env);
+            handle_return_control_flow(result, &env)
         }
         Value::BuiltinFunction(f) => {
-            let BuiltinFunctionValue { func, is_static } = &*f;
-            if *is_static
-                && target
-                    .as_ref()
-                    .is_some_and(|t| !matches!(t, Value::Prototype(_)))
-            {
-                return Err(RuntimeError::TypeError(
-                    "Attempted to call a static function with a target".to_string(),
-                )
-                .span(span));
-            }
-            let target = if *is_static { None } else { target };
+            let BuiltinFunctionValue { func } = &*f;
             let args = target
                 .into_iter()
                 .chain(arguments.into_iter())
                 .collect::<Vec<_>>();
-            handle_return_control_flow(func(args, span, env))
+            let result = func(args, span, env.clone());
+            handle_return_control_flow(result, &env)
         }
-        _ => Err(
-            RuntimeError::TypeError("Attempted to call a non-function value".to_string())
-                .span(span),
-        ),
+        _ => type_error("Attempted to call a non-function value", &env, span),
     }
 }
 
 fn handle_return_control_flow(
     res: Result<Value, LocatedControlFlow>,
+    env: &Environment,
 ) -> Result<Value, LocatedControlFlow> {
     match res {
         Ok(v) => Ok(v),
@@ -992,7 +1190,7 @@ fn handle_return_control_flow(
                 location: span,
             }),
             ControlFlow::Return(v) => Ok(v),
-            _ => Err(RuntimeError::UnhandledControlFlow.span(&span)),
+            _ => unhandled_control_flow(&env, span),
         },
     }
 }
@@ -1007,52 +1205,6 @@ fn interpret_args(
         arg_vals.push(val);
     }
     Ok(arg_vals)
-}
-
-fn instantiate_prototype(
-    p: Rc<RefCell<PrototypeValue>>,
-    constructor: Rc<FunctionValue>,
-) -> BuiltinFunctionValue {
-    BuiltinFunctionValue {
-        func: Box::new(move |mut args, span, _| {
-            let object_value = ObjectValue {
-                properties: HashMap::new(),
-                prototype: p.clone(),
-            };
-            let this = Value::Object(Rc::new(RefCell::new(object_value)));
-            let FunctionValue {
-                parameters,
-                body,
-                env: func_env,
-                is_static: _,
-            } = &*constructor;
-            let param_count = parameters.len();
-            if param_count == 0 {
-                return Err(RuntimeError::FunctionArgumentError(
-                    "Constructor must have at least one parameter for 'this'".to_string(),
-                )
-                .span(&span));
-            }
-            if param_count - 1 != args.len() {
-                return Err(RuntimeError::FunctionArgumentError(format!(
-                    "Expected {} arguments, got {}",
-                    param_count - 1,
-                    args.len()
-                ))
-                .span(&span));
-            }
-            let args = std::iter::once(this.clone()).chain(args.drain(..));
-            let call_env = Rc::new(Environment::new(func_env.clone()));
-            for (param, arg_val) in parameters.iter().zip(args) {
-                if !call_env.define(param, arg_val) {
-                    unreachable!("Parameter name should not be duplicated: {}", param);
-                }
-            }
-            interpret(&body, call_env)?;
-            Ok(this)
-        }),
-        is_static: true,
-    }
 }
 
 fn import_module(
@@ -1086,11 +1238,11 @@ fn import_module(
         match prev {
             Some(Some(v)) => return Ok(Some(v)),
             Some(None) => {
-                return Err(RuntimeError::ImportError(format!(
-                    "Cyclic import detected for module '{}'",
-                    module_path
-                ))
-                .span(&span));
+                return import_error(
+                    &format!("Cyclic import detected for module '{}'", module_path),
+                    &env,
+                    span,
+                );
             }
             None => {}
         }
@@ -1106,21 +1258,27 @@ fn import_module(
     let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
-            return Err(RuntimeError::ImportError(format!(
-                "Failed to open file {}: {}",
-                path.display(),
-                e
-            ))
-            .span(&span));
+            return import_error(
+                &format!("Failed to open file {}: {}", path.display(), e),
+                &env,
+                span,
+            );
         }
     };
     let mut buf = String::new();
     if let Err(e) = file.read_to_string(&mut buf) {
-        eprintln!("Error reading file {}: {}", path.display(), e);
-        return Err(RuntimeError::ImportError("Failed to read file".to_string()).span(&span));
+        return import_error(&format!("Failed to read file: {}", e), &env, span);
     }
+    let file_path = path.to_string_lossy().to_string();
 
-    let val = interpret_string(&buf, span, module_path.clone(), true)?;
+    let val = interpret_string(
+        &buf,
+        span,
+        module_path.clone(),
+        true,
+        Some(&file_path),
+        env.clone(),
+    )?;
     GLOBAL_STATE.with(|state| {
         let mut state = state.get().unwrap().borrow_mut();
         state.modules.insert(module_path, Some(val.clone()));
@@ -1133,11 +1291,16 @@ fn interpret_string(
     span: &Location,
     module_path: String,
     with_std: bool,
+    file_path: Option<&str>,
+    env: Rc<Environment>,
 ) -> Result<Value, LocatedControlFlow> {
-    let parsed = parse_string(input)
-        .map_err(|_| RuntimeError::ImportError("Failed to parse input".to_string()).span(&span))?;
+    let parsed = parse_string(input, file_path)
+        .map_err(|_| import_error::<()>("Failed to parse input", &env, span).unwrap_err())?;
     let add_file_info = |extra| Location::new(extra, module_path.clone());
     let parsed = parsed.map_extra(&add_file_info);
     let interpreted = interpret_global(&parsed, module_path, with_std);
-    interpreted.map_err(|e| e.data.span(&e.location))
+    interpreted.map_err(|e| Located {
+        data: ControlFlow::Error(e.data),
+        location: span.clone(),
+    })
 }

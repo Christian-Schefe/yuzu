@@ -1,5 +1,5 @@
 class Iterator {
-    fn map(map) MapIterator.new(this, map);
+    fn map(map) new MapIterator.make(this, map);
     fn collect() {
         let res = [];
         let cur = this.next();
@@ -12,7 +12,7 @@ class Iterator {
 }
 
 class IndexIterator : Iterator {
-    constructor fn new(target) {
+    constructor make(target) {
         this.target = target;
         this.current = -1;
     }
@@ -24,7 +24,7 @@ class IndexIterator : Iterator {
 }
 
 class MapIterator : Iterator {
-    constructor fn new(iterator, map_fn) {
+    constructor make(iterator, map_fn) {
         this.iterator = iterator;
         this.map_fn = map_fn;
     }
@@ -37,11 +37,43 @@ class MapIterator : Iterator {
 }
 
 class Array {
-    fn iter() IndexIterator.new(this);
+    fn iter() new IndexIterator.make(this);
 }
 
 class String {
-    fn iter() IndexIterator.new(this);
+    fn iter() new IndexIterator.make(this);
+}
+
+class Exception {
+    constructor(message) {
+        this.message = message;
+    }
+}
+
+class File : File {
+    constructor(path) {
+        this.file = File.open(path);
+    }
+    fn close() {
+        if (this.file == null) return;
+        this.file.close();
+        this.file = null;
+    }
+    fn read(n) {
+        if (this.file == null) raise new Exception("File is closed");
+        let bytes = this.file.read(n);
+        bytes.to_string()
+    }
+    fn read_to_end() {
+        if (this.file == null) raise new Exception("File is closed");
+        let str = "";
+        while (true) {
+            let bytes = this.file.read(8192);
+            if (bytes.length() == 0) break;
+            str = str.concat(bytes.to_string());
+        }
+        str
+    }
 }
 
 return {
@@ -49,4 +81,6 @@ return {
     String,
     IndexIterator,
     MapIterator,
+    Exception,
+    File,
 };

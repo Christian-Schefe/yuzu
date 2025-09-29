@@ -14,6 +14,8 @@ pub enum Value {
     Function(Rc<FunctionValue>),
     BuiltinFunction(Rc<BuiltinFunctionValue>),
     Prototype(Rc<RefCell<PrototypeValue>>),
+    Resource(Rc<RefCell<dyn Resource>>),
+    Buffer(Rc<RefCell<Vec<u8>>>),
 }
 
 impl PartialEq for Value {
@@ -32,9 +34,17 @@ impl PartialEq for Value {
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::BuiltinFunction(a), Value::BuiltinFunction(b)) => Rc::ptr_eq(a, b),
             (Value::Prototype(a), Value::Prototype(b)) => Rc::ptr_eq(a, b),
+            (Value::Buffer(a), Value::Buffer(b)) => Rc::ptr_eq(a, b),
+            (Value::Resource(a), Value::Resource(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
+}
+
+pub trait Resource {
+    fn close(&mut self) -> Result<(), String>;
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, String>;
+    fn write(&mut self, buf: &[u8]) -> Result<usize, String>;
 }
 
 pub struct ObjectValue {
@@ -45,17 +55,23 @@ pub struct ObjectValue {
 pub struct BuiltinFunctionValue {
     pub func:
         Box<dyn Fn(Vec<Value>, &Location, Rc<Environment>) -> Result<Value, LocatedControlFlow>>,
-    pub is_static: bool,
 }
 
 pub struct FunctionValue {
     pub parameters: Vec<String>,
-    pub is_static: bool,
     pub body: LocatedExpression,
     pub env: Rc<Environment>,
 }
 
 pub struct PrototypeValue {
-    pub properties: HashMap<String, Value>,
+    pub properties: HashMap<String, (Value, PropertyKind)>,
     pub parent: Option<Rc<RefCell<PrototypeValue>>>,
+}
+
+#[derive(Clone)]
+pub enum PropertyKind {
+    Field,
+    Method,
+    StaticMethod,
+    Constructor(Rc<RefCell<PrototypeValue>>),
 }

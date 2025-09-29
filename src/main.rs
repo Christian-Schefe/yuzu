@@ -1,10 +1,13 @@
 use std::io::Read;
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
+use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
 use clio::Input;
 
-use crate::{parser::LocatedExpression, tree_interpreter::Location};
+use crate::{
+    parser::LocatedExpression,
+    tree_interpreter::{Location, Value},
+};
 
 mod lexer;
 mod parser;
@@ -41,26 +44,36 @@ fn main() {
         std::process::exit(1);
     }
     let input = String::from_utf8_lossy(&buf);
-    let Ok(parsed) = parse_string(&input) else {
+    let file_location_str = args.input.path().to_string_lossy().to_string();
+    let Ok(parsed) = parse_string(&input, Some(&file_location_str)) else {
         std::process::exit(1);
     };
-
-    let file_location_str = args.input.path().to_string_lossy().to_string();
 
     let add_file_info = |extra| Location::new(extra, file_location_str.clone());
 
     let parsed = parsed.map_extra(&add_file_info);
     let interpreted = tree_interpreter::interpret_global(&parsed, "root".to_string(), true);
     if let Err(err) = interpreted {
+        let err_message = match &err.data {
+            Value::Object(obj) => {
+                let obj = obj.borrow();
+                if let Some(Value::String(msg)) = obj.properties.get("message") {
+                    msg.iter().collect()
+                } else {
+                    "Uncaught exception".to_string()
+                }
+            }
+            _ => "Uncaught exception".to_string(),
+        };
         Report::build(
             ReportKind::Error,
             (err.location.module.clone(), err.location.span.clone()),
         )
         .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-        .with_message(err.data.to_string())
+        .with_message(err_message.clone())
         .with_label(
             Label::new((err.location.module, err.location.span))
-                .with_message(err.data.to_string())
+                .with_message(err_message)
                 .with_color(Color::Red),
         )
         .finish()
@@ -73,24 +86,43 @@ fn main() {
     }
 }
 
-fn parse_string(input: &str) -> Result<LocatedExpression, ()> {
+fn parse_string(input: &str, location: Option<&str>) -> Result<LocatedExpression, ()> {
     let lexed = lexer::lex(input);
+    let location = location.unwrap_or("<input>").to_string();
     if let Err(err) = lexed {
-        Report::build(ReportKind::Error, ((), err.span.clone()))
+        Report::build(ReportKind::Error, (location.clone(), err.span.clone()))
             .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
             .with_message(err.error.to_string())
             .with_label(
-                Label::new(((), err.span))
+                Label::new((location.clone(), err.span))
                     .with_message(err.error.to_string())
                     .with_color(Color::Red),
             )
             .finish()
-            .eprint(Source::from(input))
+            .eprint(ariadne::sources(vec![(location.clone(), input)]))
             .unwrap();
         return Err(());
     }
-    let Some(parsed) = parser::parse(input, lexed.unwrap()) else {
-        return Err(());
-    };
-    Ok(parsed)
+    match parser::parse(input, lexed.unwrap()) {
+        Err(errs) => {
+            for err in errs {
+                Report::build(
+                    ReportKind::Error,
+                    (location.clone(), err.span().into_range()),
+                )
+                .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+                .with_message(err.to_string())
+                .with_label(
+                    Label::new((location.clone(), err.span().into_range()))
+                        .with_message(err.reason().to_string())
+                        .with_color(Color::Red),
+                )
+                .finish()
+                .eprint(ariadne::sources(vec![(location.clone(), input)]))
+                .unwrap();
+            }
+            Err(())
+        }
+        Ok(parsed) => Ok(parsed),
+    }
 }

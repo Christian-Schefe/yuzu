@@ -1,6 +1,6 @@
 let arr = [1, 32, 45, 25];
 
-print(arr);
+print(arr.iter());
 for (i in arr) {
     print(i);
 }
@@ -10,7 +10,7 @@ print(iter.collect());
 
 class BaseClass {
     let x = 5;
-    constructor fn new(a) {
+    constructor(a) {
         this.x = a;
     }
     fn test() {
@@ -23,17 +23,21 @@ class BaseClass {
 
 class SubClass : BaseClass {
     let x = 7;
-    constructor fn new() {
+    constructor() {
         print(this.prototype(), "hi");
+        print(this);
 
         print(Prototype.super(SubClass));
 
-        let a = BaseClass.new(10);
+        BaseClass["$constructor"](this, 10);
         BaseClass.static_test();
-        BaseClass.test(a);
-        a.test();
+        BaseClass.test(this);
+        print(this);
+        this.test();
 
-        print(Prototype.super(this.prototype()).new(35));
+        print((Prototype.super(this.prototype())["$constructor"])(this, 35));
+
+        print("??", 25 ?? 30, 0 ?? 3, null ?? 5, null ?? 3 ?? 7);
 
         let p = Object.prototype(this);
         print(p);
@@ -41,5 +45,28 @@ class SubClass : BaseClass {
 }
 
 
-print(BaseClass.new(33).x);
-print(SubClass.new().x);
+print((new BaseClass(33)).x);
+print((new SubClass()).x);
+print(SubClass.static_test());
+
+class MyException : Exception {
+    let aadg = "hi";
+    constructor(message) {
+        this.message = message;
+    }
+}
+
+try {
+    let ex = new MyException("an exception");
+    print(ex.prototype(), "\n", Prototype.super(ex.prototype()), Prototype.super(Exception));
+    raise ex;
+} catch Exception as e {
+    print("caught", e);
+    print(e.aadg);
+};
+
+print(File);
+let f = new File("reference/simple.yuzu");
+//let f = File.open("reference/simple.yuzu");
+print(f.read_to_end());
+f.close();

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::parser::{BinaryOp, ClassMemberType, UnaryOp};
+use crate::parser::{BinaryOp, UnaryOp};
 
 #[derive(Debug, Clone)]
 pub enum Expression<T> {
@@ -12,11 +12,10 @@ pub enum Expression<T> {
     FunctionLiteral {
         parameters: Vec<String>,
         body: Box<Extra<T>>,
-        is_static: bool,
     },
     PrototypeLiteral {
         superclass: Option<Box<Extra<T>>>,
-        properties: Vec<(String, ClassMemberType, Extra<T>)>,
+        properties: Vec<(String, MemberKind, Extra<T>)>,
     },
     ObjectLiteral(Vec<(String, Extra<T>)>),
     Null,
@@ -37,6 +36,12 @@ pub enum Expression<T> {
         condition: Box<Extra<T>>,
         then_branch: Box<Extra<T>>,
         else_branch: Option<Box<Extra<T>>>,
+    },
+    TryCatch {
+        try_block: Box<Extra<T>>,
+        exception_prototype: Option<Box<Extra<T>>>,
+        exception_var: String,
+        catch_block: Box<Extra<T>>,
     },
     Loop {
         init: Option<Box<Extra<T>>>,
@@ -71,6 +76,15 @@ pub enum Expression<T> {
     Continue,
     Return(Option<Box<Extra<T>>>),
     Raise(Box<Extra<T>>),
+    New(Box<Extra<T>>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemberKind {
+    Field,
+    Method,
+    StaticMethod,
+    Constructor,
 }
 
 impl<T> Extra<T> {
@@ -90,14 +104,9 @@ impl<T> Extra<T> {
                         .map(|(k, v)| (k, v.map_extra(f)))
                         .collect(),
                 ),
-                Expression::FunctionLiteral {
-                    parameters,
-                    body,
-                    is_static,
-                } => Expression::FunctionLiteral {
+                Expression::FunctionLiteral { parameters, body } => Expression::FunctionLiteral {
                     parameters,
                     body: Box::new(body.map_extra(f)),
-                    is_static,
                 },
                 Expression::PrototypeLiteral {
                     superclass,
@@ -106,7 +115,7 @@ impl<T> Extra<T> {
                     superclass: superclass.map(|sc| Box::new(sc.map_extra(f))),
                     properties: properties
                         .into_iter()
-                        .map(|(name, member_type, expr)| (name, member_type, expr.map_extra(f)))
+                        .map(|(name, member_kind, expr)| (name, member_kind, expr.map_extra(f)))
                         .collect(),
                 },
                 Expression::Null => Expression::Null,
@@ -134,6 +143,17 @@ impl<T> Extra<T> {
                     condition: Box::new(condition.map_extra(f)),
                     then_branch: Box::new(then_branch.map_extra(f)),
                     else_branch: else_branch.map(|eb| Box::new(eb.map_extra(f))),
+                },
+                Expression::TryCatch {
+                    try_block,
+                    exception_prototype,
+                    exception_var,
+                    catch_block,
+                } => Expression::TryCatch {
+                    try_block: Box::new(try_block.map_extra(f)),
+                    exception_prototype: exception_prototype.map(|ep| Box::new(ep.map_extra(f))),
+                    exception_var,
+                    catch_block: Box::new(catch_block.map_extra(f)),
                 },
                 Expression::Loop {
                     init,
@@ -186,6 +206,7 @@ impl<T> Extra<T> {
                     Expression::Return(expr.map(|e| Box::new(e.map_extra(f))))
                 }
                 Expression::Raise(expr) => Expression::Raise(Box::new(expr.map_extra(f))),
+                Expression::New(expr) => Expression::New(Box::new(expr.map_extra(f))),
             },
             extra: f(self.extra),
         }
@@ -224,17 +245,13 @@ where
                 }
                 write!(f, "}})")
             }
-            Self::FunctionLiteral {
-                parameters,
-                body,
-                is_static,
-            } => {
+            Self::FunctionLiteral { parameters, body } => {
                 write!(f, "FunctionLiteral(")?;
                 write!(f, "params: [")?;
                 for param in parameters {
                     write!(f, "{}, ", param)?;
                 }
-                write!(f, "], body: {}, is_static: {})", body.expr, is_static)
+                write!(f, "], body: {})", body.expr)
             }
             Self::PrototypeLiteral {
                 properties,
@@ -281,6 +298,21 @@ where
                 } else {
                     write!(f, "None)")
                 }
+            }
+            Self::TryCatch {
+                try_block,
+                exception_prototype,
+                exception_var,
+                catch_block,
+            } => {
+                write!(
+                    f,
+                    "TryCatch(try: {}, exception_prototype: {:?}, exception_var: {}, catch: {})",
+                    try_block.expr,
+                    exception_prototype.as_ref().map(|ep| &ep.expr),
+                    exception_var,
+                    catch_block.expr
+                )
             }
             Self::Loop {
                 init,
@@ -351,6 +383,7 @@ where
                 }
             }
             Self::Raise(expr) => write!(f, "Raise({})", expr.expr),
+            Self::New(expr) => write!(f, "New({})", expr.expr),
         }
     }
 }

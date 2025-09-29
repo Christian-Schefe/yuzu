@@ -1,6 +1,5 @@
 use std::fmt;
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::{
     Parser,
     input::{Stream, ValueInput},
@@ -13,14 +12,6 @@ use crate::lexer::{LocatedToken, Token};
 mod expression;
 
 pub use expression::*;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClassMemberType {
-    Field,
-    Method,
-    StaticMethod,
-    Constructor,
-}
 
 pub type LocatedExpression = Extra<core::ops::Range<usize>>;
 
@@ -53,6 +44,8 @@ pub enum BinaryOp {
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
+
+    NullCoalesce,
 }
 
 impl fmt::Display for BinaryOp {
@@ -75,6 +68,7 @@ impl fmt::Display for BinaryOp {
             Self::SubtractAssign => write!(f, "-="),
             Self::MultiplyAssign => write!(f, "*="),
             Self::DivideAssign => write!(f, "/="),
+            Self::NullCoalesce => write!(f, "??"),
         }
     }
 }
@@ -210,7 +204,6 @@ where
                 Expression::FunctionLiteral {
                     parameters: params,
                     body: Box::new(body),
-                    is_static: false,
                 },
                 extra.span(),
             ))
@@ -246,7 +239,37 @@ where
                         Expression::FunctionLiteral {
                             parameters: params,
                             body: Box::new(body),
-                            is_static: false,
+                        },
+                        extra.span(),
+                    )),
+                ),
+                extra.span(),
+            ))
+        });
+
+    let define_constructor_fn = just(Token::Constructor)
+        .ignore_then(select! { Token::Ident(name) => name.to_string() }.or_not())
+        .then(
+            select! { Token::Ident(name) => name.to_string() }
+                .separated_by(just(Token::Comma))
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(expr.clone())
+        .try_map_with(|((name, params), body), extra| {
+            if !is_unique(&params) {
+                return Err(chumsky::error::Rich::custom(
+                    extra.span(),
+                    "Function parameters must be unique",
+                ));
+            }
+            Ok(located(
+                Expression::Define(
+                    name.unwrap_or("$constructor".to_string()),
+                    Box::new(located(
+                        Expression::FunctionLiteral {
+                            parameters: params,
+                            body: Box::new(body),
                         },
                         extra.span(),
                     )),
@@ -341,7 +364,7 @@ where
                             panic!("Expected function definition in class body")
                         };
                         parameters.insert(0, "this".to_string());
-                        (name, ClassMemberType::Method, *expr)
+                        (name, MemberKind::Method, *expr)
                     } else {
                         panic!("Expected function definition in class body")
                     }
@@ -349,34 +372,26 @@ where
                 just(Token::Static)
                     .ignore_then(define_fn.clone())
                     .map(|lf| {
-                        if let Expression::Define(name, mut expr) = lf.expr {
-                            let Expression::FunctionLiteral { is_static, .. } = &mut expr.expr
-                            else {
-                                panic!("Expected function definition in class body")
-                            };
-                            *is_static = true;
-                            (name, ClassMemberType::StaticMethod, *expr)
+                        if let Expression::Define(name, expr) = lf.expr {
+                            (name, MemberKind::StaticMethod, *expr)
                         } else {
                             panic!("Expected static method definition in class body")
                         }
                     }),
-                just(Token::Constructor)
-                    .ignore_then(define_fn.clone())
-                    .map(|lf| {
-                        if let Expression::Define(name, mut expr) = lf.expr {
-                            let Expression::FunctionLiteral { parameters, .. } = &mut expr.expr
-                            else {
-                                panic!("Expected function definition in class body")
-                            };
-                            parameters.insert(0, "this".to_string());
-                            (name, ClassMemberType::Constructor, *expr)
-                        } else {
-                            panic!("Expected constructor definition in class body")
-                        }
-                    }),
+                define_constructor_fn.clone().map(|lf| {
+                    if let Expression::Define(name, mut expr) = lf.expr {
+                        let Expression::FunctionLiteral { parameters, .. } = &mut expr.expr else {
+                            panic!("Expected function definition in class body")
+                        };
+                        parameters.insert(0, "this".to_string());
+                        (name, MemberKind::Constructor, *expr)
+                    } else {
+                        panic!("Expected constructor definition in class body")
+                    }
+                }),
                 define_let.clone().map(|lf| {
                     if let Expression::Define(name, expr) = lf.expr {
-                        (name, ClassMemberType::Field, *expr)
+                        (name, MemberKind::Field, *expr)
                     } else {
                         panic!("Expected field definition in class body")
                     }
@@ -393,7 +408,7 @@ where
                 Ok(data)
             })
             .repeated()
-            .collect::<Vec<(String, ClassMemberType, LocatedExpression)>>()
+            .collect::<Vec<_>>()
             .delimited_by(just(Token::LBrace), just(Token::RBrace)),
         )
         .try_map_with(|((name, superclass), body), extra| {
@@ -418,6 +433,32 @@ where
             ))
         });
 
+    let new_expr = just(Token::New)
+        .ignore_then(expr.clone())
+        .map_with(|expr, extra| located(Expression::New(Box::new(expr)), extra.span()));
+
+    let try_catch = just(Token::Try)
+        .ignore_then(expr.clone())
+        .then(
+            just(Token::Catch)
+                .ignore_then(expr.clone().then_ignore(just(Token::As)).or_not())
+                .then(select! { Token::Ident(name) => name.to_string() })
+                .then(expr.clone()),
+        )
+        .map_with(
+            |(try_block, ((exception_type, exception_name), catch_block)), extra| {
+                located(
+                    Expression::TryCatch {
+                        try_block: Box::new(try_block),
+                        catch_block: Box::new(catch_block),
+                        exception_var: exception_name,
+                        exception_prototype: exception_type.map(Box::new),
+                    },
+                    extra.span(),
+                )
+            },
+        );
+
     let basic = choice((
         atom,
         array_literal,
@@ -425,6 +466,7 @@ where
         define_let,
         define_fn,
         define_class,
+        new_expr,
         for_loop,
         while_loop,
         iter_loop,
@@ -433,6 +475,7 @@ where
         parenthesized,
         return_expr,
         raise_expr,
+        try_catch,
     ));
 
     let op = |c| just(c);
@@ -488,6 +531,11 @@ where
         bin_infix(Associativity::Left(9), Token::NotEqual, BinaryOp::NotEqual),
         bin_infix(Associativity::Left(6), Token::And, BinaryOp::And),
         bin_infix(Associativity::Left(5), Token::Or, BinaryOp::Or),
+        bin_infix(
+            Associativity::Left(4),
+            Token::NullCoalesce,
+            BinaryOp::NullCoalesce,
+        ),
         bin_infix(Associativity::Right(3), Token::Assign, BinaryOp::Assign),
         bin_infix(
             Associativity::Right(3),
@@ -602,29 +650,14 @@ where
         .map_with(|exprs, extra| located(Expression::Block(exprs, None), extra.span()))
 }
 
-pub fn parse(source: &str, tokens: Vec<LocatedToken>) -> Option<LocatedExpression> {
+pub fn parse<'a>(
+    source: &str,
+    tokens: Vec<LocatedToken<'a>>,
+) -> Result<LocatedExpression, Vec<Rich<'a, Token<'a>>>> {
     let token_iter = tokens.into_iter().map(|lt| (lt.token, lt.span.into()));
     let token_stream =
         Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
-    match parser().parse(token_stream).into_result() {
-        Ok(expr) => Some(expr),
-        Err(errs) => {
-            for err in errs {
-                Report::build(ReportKind::Error, ((), err.span().into_range()))
-                    .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-                    .with_message(err.to_string())
-                    .with_label(
-                        Label::new(((), err.span().into_range()))
-                            .with_message(err.reason().to_string())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .eprint(Source::from(source))
-                    .unwrap();
-            }
-            None
-        }
-    }
+    parser().parse(token_stream).into_result()
 }
 
 fn needs_semi<T>(expr: &Expression<T>) -> bool {

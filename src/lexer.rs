@@ -99,6 +99,9 @@ pub enum Token<'a> {
     #[token(">=")]
     GreaterEqual,
 
+    #[token("??")]
+    NullCoalesce,
+
     #[token("=")]
     Assign,
 
@@ -137,6 +140,16 @@ pub enum Token<'a> {
     Raise,
     #[token("static")]
     Static,
+
+    #[token("new")]
+    New,
+
+    #[token("try")]
+    Try,
+    #[token("catch")]
+    Catch,
+    #[token("as")]
+    As,
 
     #[token("or")]
     Or,
@@ -211,6 +224,7 @@ impl fmt::Display for Token<'_> {
             Self::LessEqual => write!(f, "<="),
             Self::Greater => write!(f, ">"),
             Self::GreaterEqual => write!(f, ">="),
+            Self::NullCoalesce => write!(f, "??"),
             Self::Assign => write!(f, "="),
             Self::DoubleArrow => write!(f, "=>"),
             Self::Null => write!(f, "null"),
@@ -229,6 +243,10 @@ impl fmt::Display for Token<'_> {
             Self::Continue => write!(f, "continue"),
             Self::Raise => write!(f, "raise"),
             Self::Static => write!(f, "static"),
+            Self::New => write!(f, "new"),
+            Self::Try => write!(f, "try"),
+            Self::Catch => write!(f, "catch"),
+            Self::As => write!(f, "as"),
             Self::In => write!(f, "in"),
             Self::Constructor => write!(f, "constructor"),
             Self::Ident(s) => write!(f, "Ident({})", s),
