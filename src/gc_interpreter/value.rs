@@ -20,11 +20,34 @@ pub enum Value<'a> {
     Null,
     Array(GcRefLock<'a, Vec<Value<'a>>>),
     Object(GcRefLock<'a, ObjectValue<'a>>),
-    Function(Gc<'a, FunctionValue<'a>>),
-    BuiltinFunction(Gc<'a, BuiltinFunctionValue>),
+    Function(GcRefLock<'a, FunctionValue<'a>>),
+    BuiltinFunction(Gc<'a, BuiltinFunctionValue<'a>>),
     Prototype(GcRefLock<'a, PrototypeValue<'a>>),
     Resource(GcRefLock<'a, Box<dyn Resource>>),
     Buffer(GcRefLock<'a, Vec<u8>>),
+}
+
+impl PartialEq for Value<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Integer(a), Value::Number(b)) => (*a as f64) == *b,
+            (Value::Number(a), Value::Integer(b)) => *a == (*b as f64),
+
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Null, Value::Null) => true,
+            (Value::Array(a), Value::Array(b)) => Gc::ptr_eq(*a, *b),
+            (Value::Object(a), Value::Object(b)) => Gc::ptr_eq(*a, *b),
+            (Value::Function(a), Value::Function(b)) => Gc::ptr_eq(*a, *b),
+            (Value::BuiltinFunction(a), Value::BuiltinFunction(b)) => Gc::ptr_eq(*a, *b),
+            (Value::Prototype(a), Value::Prototype(b)) => Gc::ptr_eq(*a, *b),
+            (Value::Buffer(a), Value::Buffer(b)) => Gc::ptr_eq(*a, *b),
+            (Value::Resource(a), Value::Resource(b)) => Gc::ptr_eq(*a, *b),
+            _ => false,
+        }
+    }
 }
 
 pub trait Resource: Collect {
@@ -48,21 +71,22 @@ pub struct ObjectValue<'a> {
 
 #[derive(Collect)]
 #[collect(no_drop)]
-pub struct BuiltinFunctionValue {
+pub struct BuiltinFunctionValue<'a> {
     pub func: StaticCollect<
         Box<
-            dyn for<'a> Fn(
-                &Mutation<'a>,
-                &MyRoot<'a>,
-                Vec<Value<'a>>,
+            dyn for<'b> Fn(
+                &Mutation<'b>,
+                &MyRoot<'b>,
+                Vec<Value<'b>>,
                 &Location,
-                Gc<'a, Environment<'a>>,
-            ) -> Result<Value<'a>, LocatedControlFlow<'a>>,
+                Gc<'b, Environment<'b>>,
+            ) -> Result<Value<'b>, LocatedControlFlow<'b>>,
         >,
     >,
+    pub kind: FunctionKind<'a>,
 }
 
-impl std::fmt::Debug for BuiltinFunctionValue {
+impl std::fmt::Debug for BuiltinFunctionValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BuiltinFunctionValue").finish()
     }
@@ -74,6 +98,7 @@ pub struct FunctionValue<'a> {
     pub parameters: Vec<String>,
     pub body: Gc<'a, StaticCollect<LocatedExpression>>,
     pub env: Gc<'a, Environment<'a>>,
+    pub kind: FunctionKind<'a>,
 }
 impl std::fmt::Debug for FunctionValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -87,17 +112,26 @@ impl std::fmt::Debug for FunctionValue<'_> {
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct PrototypeValue<'a> {
-    pub properties: HashMap<String, (Value<'a>, PropertyKind<'a>)>,
+    pub properties: HashMap<String, Value<'a>>,
     pub parent: Option<GcRefLock<'a, PrototypeValue<'a>>>,
 }
 
 #[derive(Clone, Collect, Debug)]
 #[collect(no_drop)]
-pub enum PropertyKind<'a> {
-    Field,
+pub enum FunctionKind<'a> {
+    Function,
     Method,
-    StaticMethod,
     Constructor(GcRefLock<'a, PrototypeValue<'a>>),
+}
+
+impl std::fmt::Display for FunctionKind<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FunctionKind::Function => write!(f, "function"),
+            FunctionKind::Method => write!(f, "method"),
+            FunctionKind::Constructor(_) => write!(f, "constructor"),
+        }
+    }
 }
 
 #[derive(Clone, Collect)]
@@ -194,13 +228,13 @@ pub fn variable_to_string(var: &Value) -> String {
             format!("[{}]", elements)
         }
         Value::BuiltinFunction { .. } => "<builtin function>".to_string(),
-        Value::Function { .. } => "<function>".to_string(),
+        Value::Function(f) => format!("<{}>", f.borrow().kind),
         Value::Prototype(p) => {
             let entries = p
                 .borrow()
                 .properties
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v.0)))
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v)))
                 .collect::<Vec<_>>()
                 .join(", ");
             let parent = if let Some(parent) = &p.borrow().parent {
@@ -237,7 +271,6 @@ pub fn variable_to_string(var: &Value) -> String {
 #[derive(Clone, Collect, Debug)]
 #[collect(no_drop)]
 pub enum ControlFlow<'a> {
-    Return(Value<'a>),
     Break,
     Continue,
     Error(Value<'a>),

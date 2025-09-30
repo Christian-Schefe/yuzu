@@ -448,7 +448,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
         }
         Expression::PrototypeLiteral {
             properties,
-            superclass,
+            parent: superclass,
         } => {
             let parent = if let Some(superclass) = superclass {
                 let super_val = interpret(superclass, env.clone())?;

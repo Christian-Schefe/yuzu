@@ -12,7 +12,7 @@ use crate::{
         import_module, interpret_string,
         resource::{FileResource, SocketResource},
         value::{
-            BuiltinFunctionValue, Environment, LocatedControlFlow, PropertyKind, PrototypeValue,
+            BuiltinFunctionValue, Environment, FunctionKind, LocatedControlFlow, PrototypeValue,
             Value, variable_to_string,
         },
     },
@@ -30,10 +30,13 @@ fn make_builtin_function<'a>(
     ) -> Result<Value<'b>, LocatedControlFlow<'b>>
     + 'static,
 ) -> Value<'a> {
-    let val = BuiltinFunctionValue {
-        func: StaticCollect(Box::new(func)),
-    };
-    Value::BuiltinFunction(Gc::new(mc, val))
+    Value::BuiltinFunction(Gc::new(
+        mc,
+        BuiltinFunctionValue {
+            func: StaticCollect(Box::new(func)),
+            kind: FunctionKind::Function,
+        },
+    ))
 }
 
 fn make_builtin_method<'a>(
@@ -46,38 +49,14 @@ fn make_builtin_method<'a>(
         Gc<'b, Environment<'b>>,
     ) -> Result<Value<'b>, LocatedControlFlow<'b>>
     + 'static,
-) -> (Value<'a>, PropertyKind<'a>) {
-    (
-        Value::BuiltinFunction(Gc::new(
-            mc,
-            BuiltinFunctionValue {
-                func: StaticCollect(Box::new(func)),
-            },
-        )),
-        PropertyKind::Method,
-    )
-}
-
-fn make_builtin_static_method<'a>(
-    mc: &Mutation<'a>,
-    func: impl for<'b> Fn(
-        &Mutation<'b>,
-        &MyRoot<'b>,
-        Vec<Value<'b>>,
-        &Location,
-        Gc<'b, Environment<'b>>,
-    ) -> Result<Value<'b>, LocatedControlFlow<'b>>
-    + 'static,
-) -> (Value<'a>, PropertyKind<'a>) {
-    (
-        Value::BuiltinFunction(Gc::new(
-            mc,
-            BuiltinFunctionValue {
-                func: StaticCollect(Box::new(func)),
-            },
-        )),
-        PropertyKind::StaticMethod,
-    )
+) -> Value<'a> {
+    Value::BuiltinFunction(Gc::new(
+        mc,
+        BuiltinFunctionValue {
+            func: StaticCollect(Box::new(func)),
+            kind: FunctionKind::Method,
+        },
+    ))
 }
 
 pub fn define_globals<'a>(
@@ -130,7 +109,7 @@ pub fn define_globals<'a>(
                     let mut map = HashMap::new();
                     map.insert(
                         "open".to_string(),
-                        make_builtin_static_method(mc, |mc, root, args, span, env| {
+                        make_builtin_function(mc, |mc, root, args, span, env| {
                             if args.len() != 1 {
                                 return function_argument_error(
                                     mc,
@@ -182,7 +161,7 @@ pub fn define_globals<'a>(
                     let mut map = HashMap::new();
                     map.insert(
                         "connect".to_string(),
-                        make_builtin_static_method(mc, |mc, root, args, span, env| {
+                        make_builtin_function(mc, |mc, root, args, span, env| {
                             if args.len() != 2 {
                                 return function_argument_error(
                                     mc,
@@ -279,67 +258,31 @@ pub fn define_globals<'a>(
     );
 
     let root_prototypes = &root.root_prototypes;
-    env.define(
-        mc,
-        "Integer",
-        Value::Prototype(root_prototypes.integer.clone()),
-    );
-    env.define(
-        mc,
-        "String",
-        Value::Prototype(root_prototypes.string.clone()),
-    );
-    env.define(mc, "Array", Value::Prototype(root_prototypes.array.clone()));
-    env.define(
-        mc,
-        "Object",
-        Value::Prototype(root_prototypes.object.clone()),
-    );
-    env.define(mc, "Bool", Value::Prototype(root_prototypes.bool.clone()));
-    env.define(
-        mc,
-        "Number",
-        Value::Prototype(root_prototypes.number.clone()),
-    );
-    env.define(mc, "Null", Value::Prototype(root_prototypes.null.clone()));
-    env.define(
-        mc,
-        "Function",
-        Value::Prototype(root_prototypes.function.clone()),
-    );
+    env.define(mc, "Integer", Value::Prototype(root_prototypes.integer));
+    env.define(mc, "String", Value::Prototype(root_prototypes.string));
+    env.define(mc, "Array", Value::Prototype(root_prototypes.array));
+    env.define(mc, "Object", Value::Prototype(root_prototypes.object));
+    env.define(mc, "Bool", Value::Prototype(root_prototypes.bool));
+    env.define(mc, "Number", Value::Prototype(root_prototypes.number));
+    env.define(mc, "Null", Value::Prototype(root_prototypes.null));
+    env.define(mc, "Function", Value::Prototype(root_prototypes.function));
     env.define(
         mc,
         "BuiltinFunction",
-        Value::Prototype(root_prototypes.builtin_function.clone()),
+        Value::Prototype(root_prototypes.builtin_function),
     );
-    env.define(
-        mc,
-        "Prototype",
-        Value::Prototype(root_prototypes.prototype.clone()),
-    );
-    env.define(
-        mc,
-        "Exception",
-        Value::Prototype(root_prototypes.exception.clone()),
-    );
-    env.define(
-        mc,
-        "Resource",
-        Value::Prototype(root_prototypes.resource.clone()),
-    );
-    env.define(
-        mc,
-        "Buffer",
-        Value::Prototype(root_prototypes.buffer.clone()),
-    );
+    env.define(mc, "Prototype", Value::Prototype(root_prototypes.prototype));
+    env.define(mc, "Exception", Value::Prototype(root_prototypes.exception));
+    env.define(mc, "Resource", Value::Prototype(root_prototypes.resource));
+    env.define(mc, "Buffer", Value::Prototype(root_prototypes.buffer));
 
     if no_std {
         return;
     }
 
     let std_ref = root.std_prototype.borrow_mut(mc);
-    let std_val = if let Some(v) = std_ref.as_ref() {
-        v.clone()
+    let std_val = if let Some(&v) = std_ref.as_ref() {
+        v
     } else {
         let std_val = interpret_string(
             mc,
@@ -348,13 +291,16 @@ pub fn define_globals<'a>(
             &Location::new(0..STD.len(), "std".to_string()),
             "std".to_string(),
             Some("std"),
-            env.clone(),
+            env,
             true,
         )
         .expect("Failed to interpret standard library");
 
         let Value::Object(std) = std_val else {
-            panic!("Failed to interpret standard library: not an object: {:?}", std_val);
+            panic!(
+                "Failed to interpret standard library: not an object: {:?}",
+                std_val
+            );
         };
         std
     };
@@ -371,14 +317,14 @@ pub fn define_globals<'a>(
             };
             let mut real_p_ref = real_p.borrow_mut(mc);
             let new_p = new_p.borrow();
-            for (k, (v, kind)) in new_p.properties.iter() {
-                let new_kind = match kind {
-                    PropertyKind::Constructor(_) => PropertyKind::Constructor(real_p.clone()),
-                    _ => kind.clone(),
+            for (k, v) in new_p.properties.iter() {
+                if let Value::Function(f) = v {
+                    let mut f = f.borrow_mut(mc);
+                    if let FunctionKind::Constructor(_) = f.kind {
+                        f.kind = FunctionKind::Constructor(real_p);
+                    }
                 };
-                real_p_ref
-                    .properties
-                    .insert(k.clone(), (v.clone(), new_kind));
+                real_p_ref.properties.insert(k.clone(), v.clone());
             }
         }
     }
@@ -390,7 +336,7 @@ pub fn root_prototypes<'a>(mc: &Mutation<'a>) -> RootPrototypes<'a> {
         integer: integer_prototype(mc),
         string: string_prototype(mc),
         array: array_prototype(mc),
-        object: object_proto.clone(),
+        object: object_proto,
         bool: Gc::new(
             mc,
             RefLock::new(PrototypeValue {
@@ -610,7 +556,7 @@ fn object_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
             match &args[0] {
                 Value::Object(obj) => {
-                    let proto = obj.borrow().prototype.clone();
+                    let proto = obj.borrow().prototype;
                     Ok(Value::Prototype(proto))
                 }
                 _ => {
@@ -638,35 +584,32 @@ fn prototype_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a
     let mut map = HashMap::new();
     map.insert(
         "super".to_string(),
-        (
-            make_builtin_function(mc, |mc, root, args, expr, env| {
-                if args.len() != 1 {
-                    return function_argument_error(
+        make_builtin_function(mc, |mc, root, args, expr, env| {
+            if args.len() != 1 {
+                return function_argument_error(
+                    mc,
+                    root,
+                    &format!("Expected 1 argument, got {}", args.len()),
+                    &env,
+                    expr,
+                );
+            }
+            match &args[0] {
+                Value::Prototype(obj) => {
+                    let proto = obj.borrow().parent;
+                    Ok(proto.map_or(Value::Null, Value::Prototype))
+                }
+                _ => {
+                    return type_error(
                         mc,
                         root,
-                        &format!("Expected 1 argument, got {}", args.len()),
+                        "super can only be called on Prototype",
                         &env,
                         expr,
                     );
                 }
-                match &args[0] {
-                    Value::Prototype(obj) => {
-                        let proto = obj.borrow().parent.clone();
-                        Ok(proto.map_or(Value::Null, Value::Prototype))
-                    }
-                    _ => {
-                        return type_error(
-                            mc,
-                            root,
-                            "super can only be called on Prototype",
-                            &env,
-                            expr,
-                        );
-                    }
-                }
-            }),
-            PropertyKind::StaticMethod,
-        ),
+            }
+        }),
     );
     Gc::new(
         mc,

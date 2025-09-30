@@ -1,3 +1,62 @@
+fn test_fn(x, y) {
+    print("test", x, y);
+}
+
+test_fn("tesdgat", 366);
+test_fn(print("first"), print("second"));
+{print("zero", test_fn); test_fn}(print("first"), print("second"));
+{
+    first: print("first"),
+    second: print("second")
+};
+
+let obj = {
+    a: 5,
+    b: 10,
+    c: {
+        d: 15,
+        e: 20
+    }
+};
+
+print(obj.a, obj.b, obj.c.d, obj.c.e);
+
+class BaseClass {
+    let x = 5;
+    constructor base_make(a) {
+        print("base", this, a);
+        this.x = a;
+    }
+    fn base_test() {
+        print("test", this);
+    }
+    static fn base_static_test() {
+        print("static test");
+    }
+}
+
+class TestClass : BaseClass {
+    let x = 8;
+    constructor make(a) {
+        print(this, a, this.base_make);
+        print("hi 1");
+        print("base make return", this.base_make(this, a));
+        print("hi 2");
+        this.test2 = () => this.test;
+    }
+    fn test() {
+        print("test", this);
+    }
+}
+
+let instance = TestClass.make(10);
+print(instance.x, TestClass.make(10));
+
+instance.test();
+TestClass.test(instance);
+BaseClass.base_static_test();
+BaseClass.base_test(instance);
+instance.test2()(instance);
 return {
     test: "test"
 };

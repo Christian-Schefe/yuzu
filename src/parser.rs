@@ -424,7 +424,7 @@ where
                     Box::new(located(
                         Expression::PrototypeLiteral {
                             properties: body,
-                            superclass: superclass.map(Box::new),
+                            parent: superclass.map(Box::new),
                         },
                         extra.span(),
                     )),

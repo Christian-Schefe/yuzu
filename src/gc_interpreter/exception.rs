@@ -20,7 +20,7 @@ fn make_exception<'a>(
     let p = if let Some(Value::Prototype(p)) = env.root().get(variant) {
         p
     } else {
-        root.root_prototypes.exception.clone()
+        root.root_prototypes.exception
     };
 
     let mut map = HashMap::new();
