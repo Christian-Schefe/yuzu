@@ -18,7 +18,7 @@ use crate::{
         },
     },
     parse_string,
-    parser::{BinaryOp, Expression, Extra, MemberKind},
+    parser::{BinaryOp, Expression, Extra, MemberKind, UnaryOp},
     tree_interpreter::{Located, Location},
 };
 
@@ -143,6 +143,7 @@ impl<'a> Frame<'a> {
 
 pub enum Kont<'a> {
     Return,
+    Raise,
     Define(String),
     Block {
         exprs_remaining: Vec<&'a LocatedExpression>,
@@ -151,6 +152,9 @@ pub enum Kont<'a> {
     Binary {
         op: &'a BinaryOp,
         right: &'a LocatedExpression,
+    },
+    Unary {
+        op: &'a UnaryOp,
     },
     BinaryCombine {
         op: &'a BinaryOp,
@@ -165,6 +169,10 @@ pub enum Kont<'a> {
         entries_remaining: Vec<(String, &'a LocatedExpression)>,
         map: HashMap<String, Value<'a>>,
         current_key: String,
+    },
+    ArrayLiteral {
+        entries_remaining: Vec<&'a LocatedExpression>,
+        elements: Vec<Value<'a>>,
     },
     PrototypeLiteral {
         properties_remaining: Vec<((String, &'a MemberKind), &'a LocatedExpression)>,
@@ -182,10 +190,32 @@ pub enum Kont<'a> {
         function: Option<Value<'a>>,
         target: Option<Value<'a>>,
     },
+    ConstructorCall {
+        args_remaining: Vec<&'a LocatedExpression>,
+        args: Vec<Value<'a>>,
+        function: Option<Value<'a>>,
+    },
     ReturnBarrier,
     Assign(&'a LocatedExpression),
     FieldAssign(Value<'a>, String),
     Set(ExecResult<'a>),
+    IfElse {
+        then_branch: &'a LocatedExpression,
+        else_branch: Option<&'a LocatedExpression>,
+    },
+    Loop {
+        condition: &'a LocatedExpression,
+        body: &'a LocatedExpression,
+        increment: Option<&'a LocatedExpression>,
+        state: LoopState,
+    },
+}
+
+pub enum LoopState {
+    Init,
+    Condition,
+    Body,
+    Increment,
 }
 
 pub enum ExecResult<'a> {
@@ -462,6 +492,10 @@ fn interpret_frame_eval<'a>(
             ));
             stack.push(Frame::eval(left, env));
         }
+        Expression::UnaryOp { op, expr } => {
+            stack.push(Frame::kont(Kont::Unary { op }, env, location.clone()));
+            stack.push(Frame::eval(expr, env));
+        }
         Expression::FunctionCall {
             function,
             arguments,
@@ -505,7 +539,84 @@ fn interpret_frame_eval<'a>(
             ));
             stack.push(Frame::eval(object, env));
         }
-        v => unimplemented!("{:?}", v),
+        Expression::New { expr, arguments } => {
+            stack.push(Frame::kont(
+                Kont::ConstructorCall {
+                    args_remaining: arguments.iter().rev().collect(),
+                    args: vec![],
+                    function: None,
+                },
+                env,
+                location.clone(),
+            ));
+            stack.push(Frame::eval(expr, env));
+        }
+        Expression::ArrayLiteral(entries) => {
+            if entries.is_empty() {
+                *last = ExecResult::Value(Value::Array(Gc::new(mc, RefLock::new(vec![]))));
+            } else {
+                let mut entries_remaining = entries.iter().rev().collect::<Vec<_>>();
+                let first_entry = entries_remaining
+                    .pop()
+                    .expect("Entries should never be empty");
+                stack.push(Frame::kont(
+                    Kont::ArrayLiteral {
+                        entries_remaining,
+                        elements: vec![],
+                    },
+                    env,
+                    location.clone(),
+                ));
+                stack.push(Frame::eval(first_entry, env));
+            }
+        }
+        Expression::Raise(expr) => {
+            stack.push(Frame::kont(Kont::Raise, env, location.clone()));
+            stack.push(Frame::eval(expr, env));
+        }
+        Expression::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            stack.push(Frame::kont(
+                Kont::IfElse {
+                    then_branch,
+                    else_branch: else_branch.as_deref(),
+                },
+                env,
+                location.clone(),
+            ));
+            stack.push(Frame::eval(condition, env));
+        }
+        Expression::Loop {
+            init,
+            condition,
+            increment,
+            body,
+        } => {
+            let loop_env = Gc::new(mc, Environment::new(mc, env));
+            stack.push(Frame::kont(
+                Kont::Loop {
+                    state: if init.is_none() {
+                        LoopState::Condition
+                    } else {
+                        LoopState::Init
+                    },
+                    condition,
+                    increment: increment.as_deref(),
+                    body,
+                },
+                loop_env,
+                location.clone(),
+            ));
+            if let Some(init) = init {
+                stack.push(Frame::eval(init, loop_env));
+            } else {
+                stack.push(Frame::eval(condition, loop_env));
+            }
+        }
+        _ => unimplemented!("Expression not implemented: {:?}", expr.expr),
     }
 }
 
@@ -541,6 +652,12 @@ fn interpret_kont_eval<'a>(
                 return;
             };
             *last = ExecResult::Return(last_value);
+        }
+        Kont::Raise => {
+            let Some(last_value) = maybe_take_last_value(last) else {
+                return;
+            };
+            *last = ExecResult::Error(last_value, location);
         }
         Kont::ReturnBarrier => {
             let ExecResult::Return(_) = last else {
@@ -664,6 +781,29 @@ fn interpret_kont_eval<'a>(
                 *last = ExecResult::Value(Value::Prototype(prototype));
             }
         }
+        Kont::ArrayLiteral {
+            mut entries_remaining,
+            mut elements,
+        } => {
+            let Some(last_value) = maybe_take_last_value(last) else {
+                return;
+            };
+            elements.push(last_value);
+
+            if let Some(next_expr) = entries_remaining.pop() {
+                stack.push(Frame::kont(
+                    Kont::ArrayLiteral {
+                        entries_remaining,
+                        elements,
+                    },
+                    env,
+                    location,
+                ));
+                stack.push(Frame::eval(next_expr, env));
+            } else {
+                *last = ExecResult::Value(Value::Array(Gc::new(mc, RefLock::new(elements))));
+            }
+        }
         // If last expr was not a value, propagate it upwards, otherwise define variable and return null or error
         Kont::Define(name) => {
             let Some(last_value) = maybe_take_last_value(last) else {
@@ -707,6 +847,22 @@ fn interpret_kont_eval<'a>(
                 ));
             }
         }
+        Kont::Unary { op } => {
+            let Some(value) = maybe_take_last_value(last) else {
+                return;
+            };
+            if let Some(result) = interpret_simple_unary_op(op, value) {
+                *last = ExecResult::Value(result);
+            } else {
+                *last = convert_err(type_error(
+                    mc,
+                    root,
+                    &format!("Invalid operand type for unary operator {:?}", op),
+                    &env,
+                    location,
+                ));
+            }
+        }
         Kont::FunctionCall {
             mut args_remaining,
             mut args,
@@ -734,7 +890,9 @@ fn interpret_kont_eval<'a>(
                 ));
                 stack.push(Frame::eval(next_arg, env));
             } else {
-                call_function(mc, root, stack, last, &location, env, args, function, None);
+                call_function(
+                    mc, root, stack, last, &location, env, args, function, None, false,
+                );
             }
         }
         Kont::FieldAccess { field } => {
@@ -812,6 +970,68 @@ fn interpret_kont_eval<'a>(
                     args,
                     function,
                     Some(target),
+                    false,
+                );
+            }
+        }
+        Kont::ConstructorCall {
+            mut args_remaining,
+            mut args,
+            function,
+        } => {
+            let Some(last_value) = maybe_take_last_value(last) else {
+                return;
+            };
+            let function = if let Some(f) = function {
+                args.push(last_value);
+                f
+            } else {
+                last_value
+            };
+
+            if let Some(next_arg) = args_remaining.pop() {
+                stack.push(Frame::kont(
+                    Kont::ConstructorCall {
+                        args_remaining,
+                        args,
+                        function: Some(function),
+                    },
+                    env,
+                    location,
+                ));
+                stack.push(Frame::eval(next_arg, env));
+            } else {
+                let function = match function {
+                    Value::Function(_) | Value::BuiltinFunction(_) => function,
+                    Value::Prototype(_) => {
+                        let Some(
+                            default_constructor @ (Value::Function(_) | Value::BuiltinFunction(_)),
+                        ) = get_property(root, function, "$constructor")
+                        else {
+                            *last = convert_err(type_error(
+                                mc,
+                                root,
+                                "Attempted to call a prototype without a default constructor with 'new'",
+                                &env,
+                                &location,
+                            ));
+                            return;
+                        };
+                        default_constructor
+                    }
+                    _ => {
+                        *last = convert_err(type_error(
+                            mc,
+                            root,
+                            "Attempted to call a non-function value with 'new'",
+                            &env,
+                            &location,
+                        ));
+                        return;
+                    }
+                };
+                call_function(
+                    mc, root, stack, last, &location, env, args, function, None, true,
                 );
             }
         }
@@ -866,6 +1086,111 @@ fn interpret_kont_eval<'a>(
                 }
             }
         }
+        Kont::IfElse {
+            then_branch,
+            else_branch,
+        } => {
+            let Some(condition) = maybe_take_last_value(last) else {
+                return;
+            };
+            match condition {
+                Value::Bool(true) => {
+                    stack.push(Frame::eval(then_branch, env));
+                }
+                Value::Bool(false) => {
+                    if let Some(else_branch) = else_branch {
+                        stack.push(Frame::eval(else_branch, env));
+                    } else {
+                        *last = ExecResult::Value(Value::Null);
+                    }
+                }
+                _ => {
+                    *last = convert_err(type_error(
+                        mc,
+                        root,
+                        "Condition in if expression must be a boolean",
+                        &env,
+                        &location,
+                    ));
+                }
+            }
+        }
+        Kont::Loop {
+            state,
+            condition,
+            increment,
+            body,
+        } => {
+            let next_state = 'm: {
+                match last {
+                    ExecResult::Break(_) => {
+                        *last = ExecResult::Value(Value::Null);
+                        return;
+                    }
+                    ExecResult::Continue(_) => break 'm LoopState::Body,
+                    _ => {}
+                }
+                match state {
+                    LoopState::Init => {
+                        let Some(_) = maybe_take_last_value(last) else {
+                            return;
+                        };
+                        LoopState::Condition
+                    }
+                    LoopState::Condition => {
+                        let Some(condition) = maybe_take_last_value(last) else {
+                            return;
+                        };
+                        match condition {
+                            Value::Bool(true) => LoopState::Body,
+                            Value::Bool(false) => {
+                                *last = ExecResult::Value(Value::Null);
+                                return;
+                            }
+                            _ => {
+                                *last = convert_err(type_error(
+                                    mc,
+                                    root,
+                                    "Condition in loop expression must be a boolean",
+                                    &env,
+                                    &location,
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    LoopState::Body | LoopState::Increment => {
+                        let Some(_) = maybe_take_last_value(last) else {
+                            return;
+                        };
+                        if let LoopState::Body = state
+                            && let Some(_) = increment
+                        {
+                            LoopState::Increment
+                        } else {
+                            LoopState::Condition
+                        }
+                    }
+                }
+            };
+            let next_expr = match next_state {
+                LoopState::Condition => condition,
+                LoopState::Body => body,
+                LoopState::Increment => increment.unwrap(),
+                LoopState::Init => unreachable!(),
+            };
+            stack.push(Frame::kont(
+                Kont::Loop {
+                    state: next_state,
+                    condition,
+                    increment,
+                    body,
+                },
+                env,
+                location,
+            ));
+            stack.push(Frame::eval(next_expr, env));
+        }
     }
 }
 
@@ -879,46 +1204,55 @@ fn call_function<'a>(
     args: Vec<Value<'a>>,
     function: Value<'a>,
     target: Option<Value<'a>>,
+    constructor_call: bool,
 ) {
     match function {
         Value::BuiltinFunction(f) => {
+            let mut result_override = None;
+            let target =
+                adjust_function_target(mc, target, constructor_call, &f.kind, &mut result_override);
+
+            if constructor_call && result_override.is_none() {
+                *last = convert_err(type_error(
+                    mc,
+                    root,
+                    "Attempted to call a non-constructor function with 'new'",
+                    &env,
+                    location,
+                ));
+                return;
+            }
+
+            let args_iter = target.into_iter().chain(args.into_iter());
             // No call environment for builtin functions, as they won't define variables
-            *last = convert_err((f.func)(mc, root, args, location, env));
+            *last = convert_err((f.func)(mc, root, args_iter.collect(), location, env));
+            if let Some(v) = result_override {
+                *last = ExecResult::Value(v);
+            }
         }
         Value::Function(f) => {
-            let f_ref = f.borrow();
-
             let mut result_override = None;
-            let target = match f_ref.kind {
-                FunctionKind::Function => None,
-                FunctionKind::Method => {
-                    if let Some(target) = target
-                        && !matches!(target, Value::Prototype(_))
-                    {
-                        Some(target)
-                    } else {
-                        None
-                    }
-                }
-                FunctionKind::Constructor(prot) => {
-                    if matches!(target, Some(Value::Prototype(_))) {
-                        let obj = Gc::new(
-                            mc,
-                            RefLock::new(ObjectValue {
-                                properties: HashMap::new(),
-                                prototype: prot,
-                            }),
-                        );
-                        result_override = Some(Value::Object(obj));
-                        Some(Value::Object(obj))
-                    } else {
-                        None
-                    }
-                }
-            };
+            let f_ref = f.borrow();
+            let target = adjust_function_target(
+                mc,
+                target,
+                constructor_call,
+                &f_ref.kind,
+                &mut result_override,
+            );
+
+            if constructor_call && result_override.is_none() {
+                *last = convert_err(type_error(
+                    mc,
+                    root,
+                    "Attempted to call a non-constructor function with 'new'",
+                    &env,
+                    location,
+                ));
+                return;
+            }
 
             let args_len = args.len() + if target.is_some() { 1 } else { 0 };
-
             if args_len != f_ref.parameters.len() {
                 *last = convert_err(type_error(
                     mc,
@@ -963,6 +1297,47 @@ fn call_function<'a>(
             ));
         }
     }
+}
+
+fn adjust_function_target<'a>(
+    mc: &Mutation<'a>,
+    target: Option<Value<'a>>,
+    constructor_call: bool,
+    kind: &FunctionKind<'a>,
+    result_override: &mut Option<Value<'a>>,
+) -> Option<Value<'a>> {
+    let target = match kind {
+        FunctionKind::Function => None,
+        FunctionKind::Method => {
+            if let Some(target) = target
+                && !matches!(target, Value::Prototype(_))
+            {
+                Some(target)
+            } else {
+                None
+            }
+        }
+        FunctionKind::Constructor(prot) => {
+            if constructor_call {
+                let obj = Gc::new(
+                    mc,
+                    RefLock::new(ObjectValue {
+                        properties: HashMap::new(),
+                        prototype: *prot,
+                    }),
+                );
+                *result_override = Some(Value::Object(obj));
+                Some(Value::Object(obj))
+            } else if let Some(target) = target
+                && !matches!(target, Value::Prototype(_))
+            {
+                Some(target)
+            } else {
+                None
+            }
+        }
+    };
+    target
 }
 
 fn import_module<'a>(
@@ -1083,6 +1458,16 @@ fn interpret_short_circuit<'a>(
         (BinaryOp::NullCoalesce, Value::Null) => return Err(left),
         (BinaryOp::NullCoalesce, _) => ExecResult::Value(left),
         _ => return Err(left),
+    })
+}
+
+fn interpret_simple_unary_op<'a>(op: &UnaryOp, value: Value<'a>) -> Option<Value<'a>> {
+    Some(match (op, value) {
+        (UnaryOp::Negate, Value::Number(v)) => Value::Number(-v),
+        (UnaryOp::Negate, Value::Integer(v)) => Value::Integer(-v),
+        (UnaryOp::Not, Value::Integer(v)) => Value::Integer(!v),
+        (UnaryOp::Not, Value::Bool(v)) => Value::Bool(!v),
+        _ => return None,
     })
 }
 

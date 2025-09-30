@@ -478,7 +478,7 @@ fn interpret(expr: &LocatedExpression, env: Rc<Environment>) -> Result<Value, Lo
             drop(prototype_map);
             Ok(Value::Prototype(prototype))
         }
-        Expression::New(expr) => {
+        Expression::New { expr, arguments } => {
             let (obj_expr, field_name, args) = if let Expression::PropertyFunctionCall {
                 object,
                 function,

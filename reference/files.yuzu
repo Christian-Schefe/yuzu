@@ -1,0 +1,6 @@
+let file = new File("reference/test.txt");
+file.write_string("Hello, world!");
+file.close();
+
+file = new File("reference/test.txt");
+print(file.read_to_end());

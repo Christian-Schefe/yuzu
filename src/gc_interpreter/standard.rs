@@ -307,7 +307,6 @@ pub fn define_globals<'a>(
 
     for (key, value) in std_val.borrow().properties.iter() {
         if !env.define(mc, key, value.clone()) {
-            println!("Warning: Global {} in std shadows existing global", key);
             let prev = env.get(key).unwrap();
             let Value::Prototype(real_p) = prev else {
                 panic!("Global {} in std is not a prototype, cannot merge", key);
@@ -430,6 +429,64 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
         }),
     );
+    map.insert(
+        "from_string".to_string(),
+        make_builtin_function(mc, |mc, root, args, expr, env| {
+            if args.len() != 1 {
+                return function_argument_error(
+                    mc,
+                    root,
+                    &format!("Expected 1 argument, got {}", args.len()),
+                    &env,
+                    expr,
+                );
+            }
+            match &args[0] {
+                Value::String(s) => {
+                    let bytes = s.iter().map(|c| *c as u8).collect::<Vec<u8>>();
+                    Ok(Value::Buffer(Gc::new(mc, RefLock::new(bytes))))
+                }
+                _ => {
+                    return type_error(
+                        mc,
+                        root,
+                        "from_string can only be called on String",
+                        &env,
+                        expr,
+                    );
+                }
+            }
+        }),
+    );
+    map.insert(
+        "with_size".to_string(),
+        make_builtin_method(mc, |mc, root, args, expr, env| {
+            if args.len() != 1 {
+                return function_argument_error(
+                    mc,
+                    root,
+                    &format!("Expected 1 argument, got {}", args.len()),
+                    &env,
+                    expr,
+                );
+            }
+            match &args[0] {
+                Value::Integer(size) if *size >= 0 => {
+                    let buf = vec![0u8; *size as usize];
+                    Ok(Value::Buffer(Gc::new(mc, RefLock::new(buf))))
+                }
+                _ => {
+                    return type_error(
+                        mc,
+                        root,
+                        "with_size argument must be a non-negative integer",
+                        &env,
+                        expr,
+                    );
+                }
+            }
+        }),
+    );
     Gc::new(
         mc,
         RefLock::new(PrototypeValue {
@@ -475,11 +532,11 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
     map.insert(
         "read".to_string(),
         make_builtin_method(mc, |mc, root, args, span, env| {
-            if args.len() != 2 {
+            if args.len() != 4 {
                 return function_argument_error(
                     mc,
                     root,
-                    &format!("Expected 2 arguments, got {}", args.len()),
+                    &format!("Expected 4 arguments, got {}", args.len()),
                     &env,
                     span,
                 );
@@ -487,7 +544,7 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
             match &args[0] {
                 Value::Resource(res) => {
                     let mut res_ref = res.borrow_mut(mc);
-                    let buf_size = match &args[1] {
+                    let read_amount = match &args[2] {
                         Value::Integer(i) if *i > 0 => *i as usize,
                         _ => {
                             return type_error(
@@ -499,7 +556,32 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
                             );
                         }
                     };
-                    let mut buf = vec![0u8; buf_size];
+                    let read_offset = match &args[3] {
+                        Value::Integer(i) if *i >= 0 => *i as usize,
+                        _ => {
+                            return type_error(
+                                mc,
+                                root,
+                                "Read offset argument must be a non-negative integer",
+                                &env,
+                                span,
+                            );
+                        }
+                    };
+                    let mut buf = match &args[1] {
+                        Value::Buffer(b) => {
+                            &mut b.borrow_mut(mc)[read_offset..read_offset + read_amount]
+                        }
+                        _ => {
+                            return type_error(
+                                mc,
+                                root,
+                                "Read buffer argument must be a buffer",
+                                &env,
+                                span,
+                            );
+                        }
+                    };
                     let bytes_read = res_ref.read(&mut buf).map_err(|e| {
                         io_error::<()>(
                             mc,
@@ -510,10 +592,77 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
                         )
                         .unwrap_err()
                     })?;
-                    buf.truncate(bytes_read);
-                    Ok(Value::Buffer(Gc::new(mc, RefLock::new(buf))))
+                    Ok(Value::Integer(bytes_read as i64))
                 }
                 _ => return type_error(mc, root, "Read argument must be a resource", &env, span),
+            }
+        }),
+    );
+    map.insert(
+        "write".to_string(),
+        make_builtin_method(mc, |mc, root, args, span, env| {
+            if args.len() != 4 {
+                return function_argument_error(
+                    mc,
+                    root,
+                    &format!("Expected 4 arguments, got {}", args.len()),
+                    &env,
+                    span,
+                );
+            }
+            match &args[0] {
+                Value::Resource(res) => {
+                    let mut res_ref = res.borrow_mut(mc);
+                    let write_amount = match &args[2] {
+                        Value::Integer(i) if *i > 0 => *i as usize,
+                        _ => {
+                            return type_error(
+                                mc,
+                                root,
+                                "Write size argument must be a positive integer",
+                                &env,
+                                span,
+                            );
+                        }
+                    };
+                    let write_offset = match &args[3] {
+                        Value::Integer(i) if *i >= 0 => *i as usize,
+                        _ => {
+                            return type_error(
+                                mc,
+                                root,
+                                "Write offset argument must be a non-negative integer",
+                                &env,
+                                span,
+                            );
+                        }
+                    };
+                    let buf = match &args[1] {
+                        Value::Buffer(b) => &b.borrow()[write_offset..write_offset + write_amount],
+                        _ => {
+                            return type_error(
+                                mc,
+                                root,
+                                "Write buffer argument must be a buffer",
+                                &env,
+                                span,
+                            );
+                        }
+                    };
+
+                    let bytes_written = res_ref.write(&buf).map_err(|e| {
+                        io_error::<()>(
+                            mc,
+                            root,
+                            &format!("Failed to write to resource: {}", e),
+                            &env,
+                            span,
+                        )
+                        .unwrap_err()
+                    })?;
+                    Ok(Value::Integer(bytes_written as i64))
+                }
+                _ => return type_error(mc, root, "Write argument must be a resource", &env, span),
             }
         }),
     );

@@ -1,62 +1,114 @@
-fn test_fn(x, y) {
-    print("test", x, y);
-}
-
-test_fn("tesdgat", 366);
-test_fn(print("first"), print("second"));
-{print("zero", test_fn); test_fn}(print("first"), print("second"));
-{
-    first: print("first"),
-    second: print("second")
-};
-
-let obj = {
-    a: 5,
-    b: 10,
-    c: {
-        d: 15,
-        e: 20
-    }
-};
-
-print(obj.a, obj.b, obj.c.d, obj.c.e);
-
-class BaseClass {
-    let x = 5;
-    constructor base_make(a) {
-        print("base", this, a);
-        this.x = a;
-    }
-    fn base_test() {
-        print("test", this);
-    }
-    static fn base_static_test() {
-        print("static test");
+class Iterator {
+    fn map(map) new MapIterator(this, map);
+    fn collect() {
+        let res = [];
+        let cur = this.next();
+        while (cur != null) {
+            res.push(cur.value);
+            cur = this.next();
+        }
+        res
     }
 }
 
-class TestClass : BaseClass {
-    let x = 8;
-    constructor make(a) {
-        print(this, a, this.base_make);
-        print("hi 1");
-        print("base make return", this.base_make(this, a));
-        print("hi 2");
-        this.test2 = () => this.test;
+class IndexIterator : Iterator {
+    constructor(target) {
+        this.target = target;
+        this.current = -1;
     }
-    fn test() {
-        print("test", this);
+    fn next() {
+        this.current += 1;
+        if (this.current >= this.target.length()) null
+        else {value: this.target[this.current]}
     }
 }
 
-let instance = TestClass.make(10);
-print(instance.x, TestClass.make(10));
+class MapIterator : Iterator {
+    constructor(iterator, map_fn) {
+        this.iterator = iterator;
+        this.map_fn = map_fn;
+    }
+    fn next() {
+        let next = this.iterator.next();
+        if (next == null) return null;
+        next.value = (this.map_fn)(next.value);
+        next
+    }
+}
 
-instance.test();
-TestClass.test(instance);
-BaseClass.base_static_test();
-BaseClass.base_test(instance);
-instance.test2()(instance);
+class BufferSlice {
+    constructor(buffer, start, end) {
+        this.buffer = buffer;
+        this.start = start;
+        this.end = end;
+    }
+    fn length() this.end - this.start;
+    fn to_string() {
+        let str = "";
+        for (let i = this.start; i < this.end; i += 1) {
+            str = str.concat(String.from_char_code(this.buffer[i]));
+        }
+        str
+    }
+}
+
+class Array {
+    fn iter() new IndexIterator(this);
+}
+
+class String {
+    fn iter() new IndexIterator(this);
+}
+
+class Exception {
+    constructor(message) {
+        this.message = message;
+    }
+}
+
+let IntrinsicFile = File;
+class File {
+    constructor(path) {
+        this.file = IntrinsicFile.open(path);
+    }
+    fn close() {
+        if (this.file == null) return;
+        this.file.close();
+        this.file = null;
+    }
+    fn read(n) {
+        if (this.file == null) raise new Exception("File is closed");
+        let bytes = this.file.read(n);
+        bytes.to_string()
+    }
+    fn read_to_end() {
+        if (this.file == null) raise new Exception("File is closed");
+        let str = "";
+        while (true) {
+            let buffer = Buffer.with_size(8192);
+            let read = this.file.read(buffer, buffer.length(), 0);
+            if (read == 0) break;
+            str = str.concat(buffer.to_string());
+        }
+        str
+    }
+    fn write_string(string) {
+        if (this.file == null) raise new Exception("File is closed");
+        let buffer = Buffer.from_string(string);
+        let offset = 0;
+        let len = buffer.length();
+        while (offset < len) {
+            let written = this.file.write(buffer, len - offset, offset);
+            offset += written;
+        }
+    }
+}
+
 return {
-    test: "test"
+    Array,
+    String,
+    IndexIterator,
+    MapIterator,
+    Exception,
+    File,
 };

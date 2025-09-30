@@ -434,8 +434,26 @@ where
         });
 
     let new_expr = just(Token::New)
-        .ignore_then(expr.clone())
-        .map_with(|expr, extra| located(Expression::New(Box::new(expr)), extra.span()));
+        .ignore_then(choice((
+            parenthesized.clone(),
+            select! { Token::Ident(name) => Expression::Ident(name.to_string()) }
+                .map_with(|expr, extra| located(expr, extra.span())),
+        )))
+        .then(
+            expr.clone()
+                .separated_by(just(Token::Comma))
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .map_with(|(expr, args), extra| {
+            located(
+                Expression::New {
+                    expr: Box::new(expr),
+                    arguments: args,
+                },
+                extra.span(),
+            )
+        });
 
     let try_catch = just(Token::Try)
         .ignore_then(expr.clone())
@@ -492,25 +510,21 @@ where
         })
     };
 
+    let unary_prefix = |token, unary_op: UnaryOp| {
+        prefix(14, op(token), move |_, expr, extra| {
+            located(
+                Expression::UnaryOp {
+                    op: unary_op.clone(),
+                    expr: Box::new(expr),
+                },
+                extra.span(),
+            )
+        })
+    };
+
     let operators = basic.pratt((
-        prefix(14, op(Token::Minus), |_, expr, extra| {
-            located(
-                Expression::UnaryOp {
-                    op: UnaryOp::Negate,
-                    expr: Box::new(expr),
-                },
-                extra.span(),
-            )
-        }),
-        prefix(14, op(Token::Not), |_, expr, extra| {
-            located(
-                Expression::UnaryOp {
-                    op: UnaryOp::Not,
-                    expr: Box::new(expr),
-                },
-                extra.span(),
-            )
-        }),
+        unary_prefix(Token::Minus, UnaryOp::Negate),
+        unary_prefix(Token::Not, UnaryOp::Not),
         bin_infix(Associativity::Left(13), Token::Star, BinaryOp::Multiply),
         bin_infix(Associativity::Left(13), Token::Slash, BinaryOp::Divide),
         bin_infix(Associativity::Left(12), Token::Plus, BinaryOp::Add),

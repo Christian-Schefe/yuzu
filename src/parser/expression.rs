@@ -76,7 +76,10 @@ pub enum Expression<T> {
     Continue,
     Return(Option<Box<Extra<T>>>),
     Raise(Box<Extra<T>>),
-    New(Box<Extra<T>>),
+    New {
+        expr: Box<Extra<T>>,
+        arguments: Vec<Extra<T>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,7 +209,10 @@ impl<T> Extra<T> {
                     Expression::Return(expr.map(|e| Box::new(e.map_extra(f))))
                 }
                 Expression::Raise(expr) => Expression::Raise(Box::new(expr.map_extra(f))),
-                Expression::New(expr) => Expression::New(Box::new(expr.map_extra(f))),
+                Expression::New { expr, arguments } => Expression::New {
+                    expr: Box::new(expr.map_extra(f)),
+                    arguments: arguments.into_iter().map(|arg| arg.map_extra(f)).collect(),
+                },
             },
             extra: f(self.extra),
         }
@@ -383,7 +389,13 @@ where
                 }
             }
             Self::Raise(expr) => write!(f, "Raise({})", expr.expr),
-            Self::New(expr) => write!(f, "New({})", expr.expr),
+            Self::New { expr, arguments } => {
+                write!(f, "New({}, [", expr.expr)?;
+                for arg in arguments {
+                    write!(f, "{}, ", arg.expr)?;
+                }
+                write!(f, "])")
+            }
         }
     }
 }
