@@ -7,7 +7,7 @@ use gc_arena::{
 
 use crate::{
     gc_interpreter::{LocatedExpression, MyRoot},
-    tree_interpreter::{Located, Location},
+    location::{Located, Location},
 };
 
 #[derive(Clone, Collect, Debug)]
@@ -16,15 +16,209 @@ pub enum Value<'a> {
     Number(f64),
     Integer(i64),
     Bool(bool),
-    String(Vec<char>),
+    String(Gc<'a, StringVariant>),
     Null,
     Array(GcRefLock<'a, Vec<Value<'a>>>),
-    Object(GcRefLock<'a, ObjectValue<'a>>),
+    Object(GcRefLock<'a, HashMap<String, Value<'a>>>),
+    ClassInstance(GcRefLock<'a, ClassInstanceValue<'a>>),
     Function(GcRefLock<'a, FunctionValue<'a>>),
-    BuiltinFunction(Gc<'a, BuiltinFunctionValue<'a>>),
-    Prototype(GcRefLock<'a, PrototypeValue<'a>>),
+    Class(GcRefLock<'a, ClassValue<'a>>),
     Resource(GcRefLock<'a, Box<dyn Resource>>),
     Buffer(GcRefLock<'a, Vec<u8>>),
+    TypedSlice {
+        buffer: GcRefLock<'a, Vec<u8>>,
+        start: usize,
+        length: usize,
+        buffer_type: TypedBufferType,
+    },
+}
+
+#[derive(Clone, Collect, Debug)]
+#[collect(no_drop)]
+pub enum StringVariant {
+    Ascii(Vec<u8>),
+    Utf16(Vec<u16>),
+    Utf32(Vec<char>),
+}
+
+impl StringVariant {
+    pub fn to_string(&self) -> String {
+        match self {
+            StringVariant::Ascii(v) => v.iter().map(|&b| b as char).collect(),
+            StringVariant::Utf16(v) => String::from_utf16_lossy(v),
+            StringVariant::Utf32(v) => v.iter().collect(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            StringVariant::Ascii(v) => v.len(),
+            StringVariant::Utf16(v) => v.len(),
+            StringVariant::Utf32(v) => v.len(),
+        }
+    }
+    pub fn from_string(s: &str) -> Self {
+        let highest_codepoint = s.chars().map(|c| c as u32).max().unwrap_or(0);
+        if highest_codepoint <= 0x7F {
+            StringVariant::Ascii(s.bytes().collect())
+        } else if highest_codepoint <= 0xFFFF {
+            StringVariant::Utf16(s.encode_utf16().collect())
+        } else {
+            StringVariant::Utf32(s.chars().collect())
+        }
+    }
+}
+
+#[derive(Clone, Collect, Debug)]
+#[collect(no_drop)]
+pub enum TypedBufferType {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Uint8,
+    Uint16,
+    Uint32,
+    Uint64,
+    Float32,
+    Float64,
+}
+
+impl TypedBufferType {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            TypedBufferType::Int8 | TypedBufferType::Uint8 => 1,
+            TypedBufferType::Int16 | TypedBufferType::Uint16 => 2,
+            TypedBufferType::Int32 | TypedBufferType::Uint32 | TypedBufferType::Float32 => 4,
+            TypedBufferType::Int64 | TypedBufferType::Uint64 | TypedBufferType::Float64 => 8,
+        }
+    }
+    pub fn try_read_value<'a>(&self, buffer: &[u8]) -> Option<Value<'a>> {
+        match self {
+            TypedBufferType::Int8 => Some(Value::Integer(buffer[0] as i8 as i64)),
+            TypedBufferType::Int16 => {
+                if buffer.len() < 2 {
+                    return None;
+                }
+                let mut arr = [0u8; 2];
+                arr.copy_from_slice(&buffer[..2]);
+                Some(Value::Integer(i16::from_le_bytes(arr) as i64))
+            }
+            TypedBufferType::Int32 => {
+                if buffer.len() < 4 {
+                    return None;
+                }
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&buffer[..4]);
+                Some(Value::Integer(i32::from_le_bytes(arr) as i64))
+            }
+            TypedBufferType::Int64 => {
+                if buffer.len() < 8 {
+                    return None;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&buffer[..8]);
+                Some(Value::Integer(i64::from_le_bytes(arr)))
+            }
+            TypedBufferType::Uint8 => Some(Value::Integer(buffer[0] as u8 as i64)),
+            TypedBufferType::Uint16 => {
+                if buffer.len() < 2 {
+                    return None;
+                }
+                let mut arr = [0u8; 2];
+                arr.copy_from_slice(&buffer[..2]);
+                Some(Value::Integer(u16::from_le_bytes(arr) as i64))
+            }
+            TypedBufferType::Uint32 => {
+                if buffer.len() < 4 {
+                    return None;
+                }
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&buffer[..4]);
+                Some(Value::Integer(u32::from_le_bytes(arr) as i64))
+            }
+            TypedBufferType::Uint64 => {
+                if buffer.len() < 8 {
+                    return None;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&buffer[..8]);
+                Some(Value::Integer(u64::from_le_bytes(arr) as i64))
+            }
+            TypedBufferType::Float32 => {
+                if buffer.len() < 4 {
+                    return None;
+                }
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&buffer[..4]);
+                Some(Value::Number(f32::from_le_bytes(arr) as f64))
+            }
+            TypedBufferType::Float64 => {
+                if buffer.len() < 8 {
+                    return None;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&buffer[..8]);
+                Some(Value::Number(f64::from_le_bytes(arr)))
+            }
+        }
+    }
+    pub fn try_write_value<'a>(&self, buffer: &mut [u8], value: &Value<'a>) -> bool {
+        match value {
+            Value::Integer(i) => {
+                let i = *i;
+                match self {
+                    TypedBufferType::Int8 => {
+                        buffer[0] = i as u8;
+                    }
+                    TypedBufferType::Int16 => {
+                        let bytes = (i as i16).to_le_bytes();
+                        buffer[..2].copy_from_slice(&bytes);
+                    }
+                    TypedBufferType::Int32 => {
+                        let bytes = (i as i32).to_le_bytes();
+                        buffer[..4].copy_from_slice(&bytes);
+                    }
+                    TypedBufferType::Int64 => {
+                        let bytes = (i as i64).to_le_bytes();
+                        buffer[..8].copy_from_slice(&bytes);
+                    }
+                    TypedBufferType::Uint8 => {
+                        buffer[0] = i as u8;
+                    }
+                    TypedBufferType::Uint16 => {
+                        let bytes = (i as u16).to_le_bytes();
+                        buffer[..2].copy_from_slice(&bytes);
+                    }
+                    TypedBufferType::Uint32 => {
+                        let bytes = (i as u32).to_le_bytes();
+                        buffer[..4].copy_from_slice(&bytes);
+                    }
+                    TypedBufferType::Uint64 => {
+                        let bytes = (i as u64).to_le_bytes();
+                        buffer[..8].copy_from_slice(&bytes);
+                    }
+                    _ => return false,
+                };
+                return true;
+            }
+            Value::Number(f) => {
+                let f = *f;
+                match self {
+                    TypedBufferType::Float32 => {
+                        let bytes = (f as f32).to_le_bytes();
+                        buffer[..4].copy_from_slice(&bytes);
+                    }
+                    TypedBufferType::Float64 => {
+                        let bytes = (f as f64).to_le_bytes();
+                        buffer[..8].copy_from_slice(&bytes);
+                    }
+                    _ => return false,
+                };
+                return true;
+            }
+            _ => false,
+        }
+    }
 }
 
 impl PartialEq for Value<'_> {
@@ -36,13 +230,17 @@ impl PartialEq for Value<'_> {
             (Value::Number(a), Value::Integer(b)) => *a == (*b as f64),
 
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
+            (Value::String(a), Value::String(b)) => match (&**a, &**b) {
+                (StringVariant::Ascii(a), StringVariant::Ascii(b)) => a == b,
+                (StringVariant::Utf16(a), StringVariant::Utf16(b)) => a == b,
+                (StringVariant::Utf32(a), StringVariant::Utf32(b)) => a == b,
+                _ => false,
+            },
             (Value::Null, Value::Null) => true,
             (Value::Array(a), Value::Array(b)) => Gc::ptr_eq(*a, *b),
             (Value::Object(a), Value::Object(b)) => Gc::ptr_eq(*a, *b),
             (Value::Function(a), Value::Function(b)) => Gc::ptr_eq(*a, *b),
-            (Value::BuiltinFunction(a), Value::BuiltinFunction(b)) => Gc::ptr_eq(*a, *b),
-            (Value::Prototype(a), Value::Prototype(b)) => Gc::ptr_eq(*a, *b),
+            (Value::Class(a), Value::Class(b)) => Gc::ptr_eq(*a, *b),
             (Value::Buffer(a), Value::Buffer(b)) => Gc::ptr_eq(*a, *b),
             (Value::Resource(a), Value::Resource(b)) => Gc::ptr_eq(*a, *b),
             _ => false,
@@ -62,76 +260,56 @@ impl std::fmt::Debug for dyn Resource {
     }
 }
 
-#[derive(Collect, Debug)]
-#[collect(no_drop)]
-pub struct ObjectValue<'a> {
-    pub properties: HashMap<String, Value<'a>>,
-    pub prototype: GcRefLock<'a, PrototypeValue<'a>>,
-}
-
 #[derive(Collect)]
 #[collect(no_drop)]
-pub struct BuiltinFunctionValue<'a> {
-    pub func: StaticCollect<
-        Box<
-            dyn for<'b> Fn(
-                &Mutation<'b>,
-                &MyRoot<'b>,
-                Vec<Value<'b>>,
-                &Location,
-                Gc<'b, Environment<'b>>,
-            ) -> Result<Value<'b>, LocatedControlFlow<'b>>,
+pub enum FunctionValue<'a> {
+    Function {
+        parameters: Vec<String>,
+        body: Gc<'a, StaticCollect<LocatedExpression>>,
+        env: Gc<'a, Environment<'a>>,
+    },
+    Builtin {
+        func: StaticCollect<
+            Box<
+                dyn for<'b> Fn(
+                    &Mutation<'b>,
+                    &MyRoot<'b>,
+                    Vec<Value<'b>>,
+                    &Location,
+                    Gc<'b, Environment<'b>>,
+                ) -> Result<Value<'b>, LocatedControlFlow<'b>>,
+            >,
         >,
-    >,
-    pub kind: FunctionKind<'a>,
+    },
 }
 
-impl std::fmt::Debug for BuiltinFunctionValue<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BuiltinFunctionValue").finish()
-    }
-}
-
-#[derive(Collect)]
-#[collect(no_drop)]
-pub struct FunctionValue<'a> {
-    pub parameters: Vec<String>,
-    pub body: Gc<'a, StaticCollect<LocatedExpression>>,
-    pub env: Gc<'a, Environment<'a>>,
-    pub kind: FunctionKind<'a>,
-}
 impl std::fmt::Debug for FunctionValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FunctionValue")
-            .field("parameters", &self.parameters)
-            .field("body", &self.body)
-            .finish()
+        match self {
+            FunctionValue::Function { parameters, .. } => {
+                write!(f, "<function ({})>", parameters.join(", "))
+            }
+            FunctionValue::Builtin { .. } => write!(f, "<builtin function>"),
+        }
     }
 }
 
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
-pub struct PrototypeValue<'a> {
-    pub properties: HashMap<String, Value<'a>>,
-    pub parent: Option<GcRefLock<'a, PrototypeValue<'a>>>,
+pub struct ClassInstanceValue<'a> {
+    pub fields: HashMap<String, Value<'a>>,
+    pub class: GcRefLock<'a, ClassValue<'a>>,
 }
 
-#[derive(Clone, Collect, Debug)]
+#[derive(Collect, Debug)]
 #[collect(no_drop)]
-pub enum FunctionKind<'a> {
-    Function,
-    Method,
-    Constructor(GcRefLock<'a, PrototypeValue<'a>>),
-}
-
-impl std::fmt::Display for FunctionKind<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FunctionKind::Function => write!(f, "function"),
-            FunctionKind::Method => write!(f, "method"),
-            FunctionKind::Constructor(_) => write!(f, "constructor"),
-        }
-    }
+pub struct ClassValue<'a> {
+    pub instance_fields: HashMap<String, Value<'a>>,
+    pub constructor: Option<GcRefLock<'a, FunctionValue<'a>>>,
+    pub static_fields: HashMap<String, Value<'a>>,
+    pub methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
+    pub static_methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
+    pub parent: Option<GcRefLock<'a, ClassValue<'a>>>,
 }
 
 #[derive(Clone, Collect)]
@@ -200,23 +378,56 @@ impl<'a> Environment<'a> {
     }
 }
 
+impl<'a> Value<'a> {
+    pub fn get_type(&self) -> &'static str {
+        match self {
+            Value::Number(_) => "Number",
+            Value::Integer(_) => "Integer",
+            Value::Bool(_) => "Bool",
+            Value::String(_) => "String",
+            Value::Null => "Null",
+            Value::Array(_) => "Array",
+            Value::Object(_) => "Object",
+            Value::ClassInstance(_) => "ClassInstance",
+            Value::Function(_) => "Function",
+            Value::Class(_) => "Class",
+            Value::Resource(_) => "Resource",
+            Value::Buffer(_) => "Buffer",
+            Value::TypedSlice { .. } => "TypedSlice",
+        }
+    }
+}
+
 pub fn variable_to_string(var: &Value) -> String {
     match var {
         Value::Number(n) => n.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Bool(b) => b.to_string(),
-        Value::String(s) => s.iter().collect(),
+        Value::String(s) => s.to_string(),
         Value::Null => "null".to_string(),
         Value::Resource(_) => "<resource>".to_string(),
         Value::Object(entries) => {
             let entries = entries
                 .borrow()
-                .properties
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{{{}}}", entries)
+        }
+        Value::ClassInstance(class_instance) => {
+            let class_instance = class_instance.borrow();
+            let entries = class_instance
+                .fields
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "<instance of {} {{{}}}>",
+                variable_to_string(&Value::Class(class_instance.class.clone())),
+                entries
+            )
         }
         Value::Array(elements) => {
             let elements = elements
@@ -227,12 +438,16 @@ pub fn variable_to_string(var: &Value) -> String {
                 .join(", ");
             format!("[{}]", elements)
         }
-        Value::BuiltinFunction { .. } => "<builtin function>".to_string(),
-        Value::Function(f) => format!("<{}>", f.borrow().kind),
-        Value::Prototype(p) => {
+        Value::Function(f) => match &*f.borrow() {
+            FunctionValue::Function { parameters, .. } => {
+                format!("<function ({})>", parameters.join(", "))
+            }
+            FunctionValue::Builtin { .. } => format!("<builtin function>"),
+        },
+        Value::Class(p) => {
             let entries = p
                 .borrow()
-                .properties
+                .static_fields
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v)))
                 .collect::<Vec<_>>()
@@ -240,7 +455,7 @@ pub fn variable_to_string(var: &Value) -> String {
             let parent = if let Some(parent) = &p.borrow().parent {
                 format!(
                     " extends {}",
-                    variable_to_string(&Value::Prototype(parent.clone()))
+                    variable_to_string(&Value::Class(parent.clone()))
                 )
             } else {
                 "".to_string()
@@ -265,6 +480,31 @@ pub fn variable_to_string(var: &Value) -> String {
             };
             format!("<buffer [{}]>", display)
         }
+        Value::TypedSlice {
+            buffer,
+            start,
+            length,
+            buffer_type,
+        } => {
+            let buf = buffer.borrow();
+            let end = start + length;
+            let display = if *length > 10 {
+                let mut s = buf[*start..(*start + 10).min(buf.len())]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                s.push_str(" ...");
+                s
+            } else {
+                buf[*start..end.min(buf.len())]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            format!("<typed slice of {:?} [{}]>", buffer_type, display)
+        }
     }
 }
 
@@ -277,3 +517,22 @@ pub enum ControlFlow<'a> {
 }
 
 pub type LocatedControlFlow<'a> = Located<ControlFlow<'a>>;
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub struct ValueClasses<'a> {
+    pub number: GcRefLock<'a, ClassValue<'a>>,
+    pub string: GcRefLock<'a, ClassValue<'a>>,
+    pub array: GcRefLock<'a, ClassValue<'a>>,
+    pub object: GcRefLock<'a, ClassValue<'a>>,
+    pub function: GcRefLock<'a, ClassValue<'a>>,
+    pub class_instance: GcRefLock<'a, ClassValue<'a>>,
+    pub integer: GcRefLock<'a, ClassValue<'a>>,
+    pub bool: GcRefLock<'a, ClassValue<'a>>,
+    pub null: GcRefLock<'a, ClassValue<'a>>,
+    pub class: GcRefLock<'a, ClassValue<'a>>,
+    pub exception: GcRefLock<'a, ClassValue<'a>>,
+    pub resource: GcRefLock<'a, ClassValue<'a>>,
+    pub buffer: GcRefLock<'a, ClassValue<'a>>,
+    pub typed_slice: GcRefLock<'a, ClassValue<'a>>,
+}

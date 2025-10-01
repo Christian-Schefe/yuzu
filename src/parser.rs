@@ -248,15 +248,14 @@ where
         });
 
     let define_constructor_fn = just(Token::Constructor)
-        .ignore_then(select! { Token::Ident(name) => name.to_string() }.or_not())
-        .then(
+        .ignore_then(
             select! { Token::Ident(name) => name.to_string() }
                 .separated_by(just(Token::Comma))
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
         )
         .then(expr.clone())
-        .try_map_with(|((name, params), body), extra| {
+        .try_map_with(|(params, body), extra| {
             if !is_unique(&params) {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
@@ -265,7 +264,7 @@ where
             }
             Ok(located(
                 Expression::Define(
-                    name.unwrap_or("$constructor".to_string()),
+                    "$constructor".to_string(),
                     Box::new(located(
                         Expression::FunctionLiteral {
                             parameters: params,
@@ -422,7 +421,7 @@ where
                 Expression::Define(
                     name,
                     Box::new(located(
-                        Expression::PrototypeLiteral {
+                        Expression::ClassLiteral {
                             properties: body,
                             parent: superclass.map(Box::new),
                         },
@@ -686,7 +685,7 @@ fn needs_semi<T>(expr: &Expression<T>) -> bool {
         Expression::FunctionLiteral { body, .. } => needs_semi(&body.expr),
         Expression::Loop { body, .. } => needs_semi(&body.expr),
         Expression::IterLoop { body, .. } => needs_semi(&body.expr),
-        Expression::PrototypeLiteral { .. } => false,
+        Expression::ClassLiteral { .. } => false,
         _ => true,
     }
 }

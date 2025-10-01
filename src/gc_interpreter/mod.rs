@@ -8,23 +8,23 @@ use gc_arena::{
 use crate::{
     gc_interpreter::{
         exception::{
-            duplicate_variable_definition, field_access_error, import_error, type_error,
-            undefined_variable, unhandled_control_flow,
+            array_index_out_of_bounds, duplicate_variable_definition, field_access_error,
+            import_error, type_error, undefined_variable, unhandled_control_flow,
         },
         standard::{define_globals, root_prototypes},
         value::{
-            ControlFlow, Environment, FunctionKind, LocatedControlFlow, ObjectValue,
-            PrototypeValue, Value, variable_to_string,
+            ClassInstanceValue, ClassValue, ControlFlow, Environment, FunctionValue,
+            LocatedControlFlow, StringVariant, Value, ValueClasses, variable_to_string,
         },
     },
+    location::{Located, Location},
     parse_string,
     parser::{BinaryOp, Expression, Extra, MemberKind, UnaryOp},
-    tree_interpreter::{Located, Location},
 };
 
 mod exception;
 mod resource;
-mod standard;
+pub mod standard;
 mod value;
 
 #[derive(Collect)]
@@ -32,8 +32,8 @@ mod value;
 pub struct MyRoot<'a> {
     modules: GcRefLock<'a, HashMap<String, ModuleRoot<'a>>>,
     module_values: GcRefLock<'a, HashMap<String, Option<Value<'a>>>>,
-    root_prototypes: RootPrototypes<'a>,
-    std_prototype: GcRefLock<'a, Option<GcRefLock<'a, ObjectValue<'a>>>>,
+    value_classes: ValueClasses<'a>,
+    std_export: GcRefLock<'a, Option<GcRefLock<'a, HashMap<String, Value<'a>>>>>,
     pwd: std::path::PathBuf,
 }
 
@@ -42,24 +42,6 @@ pub struct MyRoot<'a> {
 pub struct ModuleRoot<'a> {
     env: Environment<'a>,
     expr: Gc<'a, StaticCollect<LocatedExpression>>,
-}
-
-#[derive(Collect)]
-#[collect(no_drop)]
-pub struct RootPrototypes<'a> {
-    pub number: GcRefLock<'a, PrototypeValue<'a>>,
-    pub string: GcRefLock<'a, PrototypeValue<'a>>,
-    pub array: GcRefLock<'a, PrototypeValue<'a>>,
-    pub object: GcRefLock<'a, PrototypeValue<'a>>,
-    pub function: GcRefLock<'a, PrototypeValue<'a>>,
-    pub builtin_function: GcRefLock<'a, PrototypeValue<'a>>,
-    pub integer: GcRefLock<'a, PrototypeValue<'a>>,
-    pub bool: GcRefLock<'a, PrototypeValue<'a>>,
-    pub null: GcRefLock<'a, PrototypeValue<'a>>,
-    pub prototype: GcRefLock<'a, PrototypeValue<'a>>,
-    pub exception: GcRefLock<'a, PrototypeValue<'a>>,
-    pub resource: GcRefLock<'a, PrototypeValue<'a>>,
-    pub buffer: GcRefLock<'a, PrototypeValue<'a>>,
 }
 
 type LocatedExpression = Extra<Location>;
@@ -72,8 +54,8 @@ pub fn interpret_global(
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| MyRoot {
         modules: Gc::new(mc, RefLock::new(HashMap::new())),
         module_values: Gc::new(mc, RefLock::new(HashMap::new())),
-        root_prototypes: root_prototypes(mc),
-        std_prototype: Gc::new(mc, RefLock::new(None)),
+        value_classes: root_prototypes(mc),
+        std_export: Gc::new(mc, RefLock::new(None)),
         pwd,
     });
     arena.mutate(
@@ -174,7 +156,7 @@ pub enum Kont<'a> {
         entries_remaining: Vec<&'a LocatedExpression>,
         elements: Vec<Value<'a>>,
     },
-    PrototypeLiteral {
+    ClassLiteral {
         properties_remaining: Vec<((String, &'a MemberKind), &'a LocatedExpression)>,
         map: HashMap<String, (&'a MemberKind, Value<'a>)>,
         current_key: Option<(String, &'a MemberKind)>,
@@ -183,11 +165,14 @@ pub enum Kont<'a> {
     FieldAccess {
         field: String,
     },
+    ArrayAccess {
+        index: &'a LocatedExpression,
+        array: Option<Value<'a>>,
+    },
     PropertyFunctionCall {
         args_remaining: Vec<&'a LocatedExpression>,
         args: Vec<Value<'a>>,
         function_field: String,
-        function: Option<Value<'a>>,
         target: Option<Value<'a>>,
     },
     ConstructorCall {
@@ -198,6 +183,11 @@ pub enum Kont<'a> {
     ReturnBarrier,
     Assign(&'a LocatedExpression),
     FieldAssign(Value<'a>, String),
+    ArrayAssign {
+        value: Value<'a>,
+        index: &'a LocatedExpression,
+        array: Option<Value<'a>>,
+    },
     Set(ExecResult<'a>),
     IfElse {
         then_branch: &'a LocatedExpression,
@@ -323,7 +313,7 @@ fn interpret_frame_eval<'a>(
             *last = ExecResult::Value(Value::Integer(*i));
         }
         Expression::String(s) => {
-            *last = ExecResult::Value(Value::String(s.chars().collect()));
+            *last = ExecResult::Value(Value::String(Gc::new(mc, StringVariant::from_string(s))));
         }
         Expression::Break => {
             *last = ExecResult::Break(location.clone());
@@ -357,23 +347,16 @@ fn interpret_frame_eval<'a>(
         Expression::FunctionLiteral { parameters, body } => {
             *last = ExecResult::Value(Value::Function(Gc::new(
                 mc,
-                RefLock::new(value::FunctionValue {
+                RefLock::new(FunctionValue::Function {
                     parameters: parameters.clone(),
                     body: Gc::new(mc, StaticCollect(*body.clone())),
                     env,
-                    kind: FunctionKind::Function,
                 }),
             )));
         }
         Expression::ObjectLiteral(entries) => {
             if entries.is_empty() {
-                *last = ExecResult::Value(Value::Object(Gc::new(
-                    mc,
-                    RefLock::new(ObjectValue {
-                        properties: HashMap::new(),
-                        prototype: root.root_prototypes.object,
-                    }),
-                )));
+                *last = ExecResult::Value(Value::Object(Gc::new(mc, RefLock::new(HashMap::new()))));
             } else {
                 let mut entries_remaining = entries
                     .iter()
@@ -395,12 +378,16 @@ fn interpret_frame_eval<'a>(
                 stack.push(Frame::eval(first_entry, env));
             }
         }
-        Expression::PrototypeLiteral { parent, properties } => {
+        Expression::ClassLiteral { parent, properties } => {
             if properties.is_empty() && parent.is_none() {
-                *last = ExecResult::Value(Value::Prototype(Gc::new(
+                *last = ExecResult::Value(Value::Class(Gc::new(
                     mc,
-                    RefLock::new(PrototypeValue {
-                        properties: HashMap::new(),
+                    RefLock::new(ClassValue {
+                        static_fields: HashMap::new(),
+                        instance_fields: HashMap::new(),
+                        methods: HashMap::new(),
+                        static_methods: HashMap::new(),
+                        constructor: None,
                         parent: None,
                     }),
                 )));
@@ -412,7 +399,7 @@ fn interpret_frame_eval<'a>(
                     .collect::<Vec<_>>();
                 if let Some(parent) = parent {
                     stack.push(Frame::kont(
-                        Kont::PrototypeLiteral {
+                        Kont::ClassLiteral {
                             properties_remaining: entries_remaining,
                             map: HashMap::new(),
                             current_key: None,
@@ -427,7 +414,7 @@ fn interpret_frame_eval<'a>(
                         .pop()
                         .expect("Entries should never be empty");
                     stack.push(Frame::kont(
-                        Kont::PrototypeLiteral {
+                        Kont::ClassLiteral {
                             properties_remaining: entries_remaining,
                             map: HashMap::new(),
                             current_key: Some(first_key),
@@ -521,6 +508,14 @@ fn interpret_frame_eval<'a>(
             ));
             stack.push(Frame::eval(object, env));
         }
+        Expression::ArrayIndex { array, index } => {
+            stack.push(Frame::kont(
+                Kont::ArrayAccess { index, array: None },
+                env,
+                location.clone(),
+            ));
+            stack.push(Frame::eval(array, env));
+        }
         Expression::PropertyFunctionCall {
             object,
             function,
@@ -530,7 +525,6 @@ fn interpret_frame_eval<'a>(
                 Kont::PropertyFunctionCall {
                     args_remaining: arguments.iter().rev().collect(),
                     args: vec![],
-                    function: None,
                     target: None,
                     function_field: function.clone(),
                 },
@@ -716,16 +710,10 @@ fn interpret_kont_eval<'a>(
                 ));
                 stack.push(Frame::eval(next_expr, env));
             } else {
-                *last = ExecResult::Value(Value::Object(Gc::new(
-                    mc,
-                    RefLock::new(ObjectValue {
-                        properties: map,
-                        prototype: root.root_prototypes.object,
-                    }),
-                )));
+                *last = ExecResult::Value(Value::Object(Gc::new(mc, RefLock::new(map))));
             }
         }
-        Kont::PrototypeLiteral {
+        Kont::ClassLiteral {
             mut properties_remaining,
             mut map,
             current_key,
@@ -738,7 +726,7 @@ fn interpret_kont_eval<'a>(
                 map.insert(current_key, (kind, last_value));
                 parent
             } else {
-                let Value::Prototype(_) = last_value else {
+                let Value::Class(_) = last_value else {
                     *last = convert_err(type_error(
                         mc,
                         root,
@@ -753,7 +741,7 @@ fn interpret_kont_eval<'a>(
 
             if let Some((next_key, next_expr)) = properties_remaining.pop() {
                 stack.push(Frame::kont(
-                    Kont::PrototypeLiteral {
+                    Kont::ClassLiteral {
                         properties_remaining,
                         map,
                         current_key: Some(next_key),
@@ -766,10 +754,14 @@ fn interpret_kont_eval<'a>(
             } else {
                 let prototype = Gc::new(
                     mc,
-                    RefLock::new(PrototypeValue {
-                        properties: HashMap::new(),
+                    RefLock::new(ClassValue {
+                        static_fields: HashMap::new(),
+                        instance_fields: HashMap::new(),
+                        constructor: None,
+                        methods: HashMap::new(),
+                        static_methods: HashMap::new(),
                         parent: parent.map(|x| {
-                            if let Value::Prototype(p) = x {
+                            if let Value::Class(p) = x {
                                 p
                             } else {
                                 unreachable!();
@@ -778,7 +770,7 @@ fn interpret_kont_eval<'a>(
                     }),
                 );
                 map_prototype_functions(mc, map, prototype);
-                *last = ExecResult::Value(Value::Prototype(prototype));
+                *last = ExecResult::Value(Value::Class(prototype));
             }
         }
         Kont::ArrayLiteral {
@@ -890,68 +882,135 @@ fn interpret_kont_eval<'a>(
                 ));
                 stack.push(Frame::eval(next_arg, env));
             } else {
-                call_function(
-                    mc, root, stack, last, &location, env, args, function, None, false,
-                );
+                call_function(mc, root, stack, last, &location, env, args, &function);
             }
         }
         Kont::FieldAccess { field } => {
             let Some(object) = maybe_take_last_value(last) else {
                 return;
             };
-            *last = if let Some(value) = get_property(root, object, &field) {
+            *last = if let Some((value, _)) = get_property(root, &object, &field) {
                 ExecResult::Value(value)
             } else {
                 convert_err(field_access_error(mc, root, field, &env, location))
             };
         }
+        Kont::ArrayAccess { index, array } => {
+            let Some(val) = maybe_take_last_value(last) else {
+                return;
+            };
+            let Some(array) = array else {
+                stack.push(Frame::kont(
+                    Kont::ArrayAccess {
+                        index,
+                        array: Some(val),
+                    },
+                    env,
+                    location.clone(),
+                ));
+                stack.push(Frame::eval(index, env));
+                return;
+            };
+
+            match array {
+                Value::Array(arr) => {
+                    let Value::Integer(i) = val else {
+                        *last = convert_err(type_error(
+                            mc,
+                            root,
+                            "Array index must be an integer",
+                            &env,
+                            &location,
+                        ));
+                        return;
+                    };
+                    let arr_ref = arr.borrow();
+                    if let Ok(index) = TryInto::<usize>::try_into(i)
+                        && index < arr_ref.len()
+                    {
+                        let value = arr_ref[index].clone();
+                        *last = ExecResult::Value(value);
+                    } else {
+                        *last =
+                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
+                        return;
+                    }
+                }
+                Value::TypedSlice {
+                    buffer,
+                    start,
+                    length,
+                    buffer_type,
+                } => {
+                    let Value::Integer(i) = val else {
+                        *last = convert_err(type_error(
+                            mc,
+                            root,
+                            "Array index must be an integer",
+                            &env,
+                            &location,
+                        ));
+                        return;
+                    };
+                    let byte_start = start * buffer_type.byte_size();
+                    let byte_end = byte_start + length * buffer_type.byte_size();
+                    let arr_ref = buffer.borrow();
+                    if let Ok(index) = TryInto::<usize>::try_into(i)
+                        && index < arr_ref.len()
+                    {
+                        let byte_offset = byte_start + index * buffer_type.byte_size();
+                        let Some(value) =
+                            buffer_type.try_read_value(&arr_ref[byte_offset..byte_end])
+                        else {
+                            *last = convert_err(type_error(
+                                mc,
+                                root,
+                                "Failed to read value from typed slice",
+                                &env,
+                                &location,
+                            ));
+                            return;
+                        };
+                        *last = ExecResult::Value(value);
+                    } else {
+                        *last =
+                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
+                        return;
+                    }
+                }
+                _ => {
+                    *last = convert_err(type_error(
+                        mc,
+                        root,
+                        "Attempted to index a non-array value",
+                        &env,
+                        &location,
+                    ));
+                    return;
+                }
+            }
+        }
         Kont::PropertyFunctionCall {
             mut args_remaining,
             mut args,
             function_field,
-            function,
             target,
         } => {
             let Some(val) = maybe_take_last_value(last) else {
                 return;
             };
 
-            let Some(target) = target else {
-                stack.push(Frame::kont(
-                    Kont::PropertyFunctionCall {
-                        args_remaining,
-                        args,
-                        function_field: function_field.clone(),
-                        function,
-                        target: Some(val.clone()),
-                    },
-                    env,
-                    location.clone(),
-                ));
-                // Small trick to avoid duplicating code: reuse FieldAccess kont to get the function
-                *last = ExecResult::Value(val);
-                stack.push(Frame::kont(
-                    Kont::FieldAccess {
-                        field: function_field,
-                    },
-                    env,
-                    location.clone(),
-                ));
-                return;
-            };
-            let function = if let Some(f) = function {
+            let target = if let Some(target) = target {
                 args.push(val);
-                f
+                target
             } else {
                 val
             };
-
             if let Some(next_arg) = args_remaining.pop() {
                 stack.push(Frame::kont(
                     Kont::PropertyFunctionCall {
                         args_remaining,
                         args,
-                        function: Some(function),
                         function_field: function_field,
                         target: Some(target),
                     },
@@ -960,18 +1019,20 @@ fn interpret_kont_eval<'a>(
                 ));
                 stack.push(Frame::eval(next_arg, env));
             } else {
-                call_function(
-                    mc,
-                    root,
-                    stack,
-                    last,
-                    &location,
-                    env,
-                    args,
-                    function,
-                    Some(target),
-                    false,
-                );
+                let Some((func, kind)) = get_property(root, &target, &function_field) else {
+                    *last = convert_err(field_access_error(
+                        mc,
+                        root,
+                        function_field,
+                        &env,
+                        &location,
+                    ));
+                    return;
+                };
+                if let MemberKind::Method = kind {
+                    args.insert(0, target);
+                }
+                call_function(mc, root, stack, last, &location, env, args, &func);
             }
         }
         Kont::ConstructorCall {
@@ -1001,38 +1062,39 @@ fn interpret_kont_eval<'a>(
                 ));
                 stack.push(Frame::eval(next_arg, env));
             } else {
-                let function = match function {
-                    Value::Function(_) | Value::BuiltinFunction(_) => function,
-                    Value::Prototype(_) => {
-                        let Some(
-                            default_constructor @ (Value::Function(_) | Value::BuiltinFunction(_)),
-                        ) = get_property(root, function, "$constructor")
-                        else {
-                            *last = convert_err(type_error(
-                                mc,
-                                root,
-                                "Attempted to call a prototype without a default constructor with 'new'",
-                                &env,
-                                &location,
-                            ));
-                            return;
-                        };
-                        default_constructor
-                    }
-                    _ => {
-                        *last = convert_err(type_error(
-                            mc,
-                            root,
-                            "Attempted to call a non-function value with 'new'",
-                            &env,
-                            &location,
-                        ));
-                        return;
-                    }
+                let Value::Class(class) = function else {
+                    *last = convert_err(type_error(
+                        mc,
+                        root,
+                        "Attempted to call a non-prototype value with 'new'",
+                        &env,
+                        &location,
+                    ));
+                    return;
                 };
-                call_function(
-                    mc, root, stack, last, &location, env, args, function, None, true,
-                );
+                let class_ref = class.borrow();
+                let function = if let Some(constructor) = class_ref.constructor {
+                    Value::Function(constructor)
+                } else {
+                    *last = convert_err(type_error(
+                        mc,
+                        root,
+                        "Attempted to call a prototype without a constructor with 'new'",
+                        &env,
+                        &location,
+                    ));
+                    return;
+                };
+
+                let instance = create_class_instance(mc, class);
+                args.insert(0, instance.clone());
+
+                stack.push(Frame::kont(
+                    Kont::Set(ExecResult::Value(instance)),
+                    env.clone(),
+                    location.clone(),
+                ));
+                call_function(mc, root, stack, last, &location, env, args, &function);
             }
         }
         Kont::Assign(target) => {
@@ -1055,6 +1117,18 @@ fn interpret_kont_eval<'a>(
                     ));
                     stack.push(Frame::eval(object, env));
                 }
+                Expression::ArrayIndex { array, index } => {
+                    stack.push(Frame::kont(
+                        Kont::ArrayAssign {
+                            value: value,
+                            index,
+                            array: None,
+                        },
+                        env,
+                        location.clone(),
+                    ));
+                    stack.push(Frame::eval(array, env));
+                }
                 _ => {
                     *last = convert_err(type_error(
                         mc,
@@ -1072,8 +1146,22 @@ fn interpret_kont_eval<'a>(
             };
             match object {
                 Value::Object(obj) => {
-                    obj.borrow_mut(mc).properties.insert(field, value.clone());
+                    obj.borrow_mut(mc).insert(field, value.clone());
                     *last = ExecResult::Value(value);
+                }
+                Value::ClassInstance(obj) => {
+                    if let Some(field) = obj.borrow_mut(mc).fields.get_mut(&field) {
+                        *field = value.clone();
+                        *last = ExecResult::Value(value);
+                    } else {
+                        *last = convert_err(type_error(
+                            mc,
+                            root,
+                            &format!("Field '{}' does not exist on class instance", field),
+                            &env,
+                            &location,
+                        ));
+                    }
                 }
                 _ => {
                     *last = convert_err(type_error(
@@ -1083,6 +1171,105 @@ fn interpret_kont_eval<'a>(
                         &env,
                         &location,
                     ));
+                }
+            }
+        }
+        Kont::ArrayAssign {
+            value,
+            index,
+            array,
+        } => {
+            let Some(val) = maybe_take_last_value(last) else {
+                return;
+            };
+            let Some(array) = array else {
+                stack.push(Frame::kont(
+                    Kont::ArrayAssign {
+                        value,
+                        index,
+                        array: Some(val),
+                    },
+                    env,
+                    location.clone(),
+                ));
+                stack.push(Frame::eval(index, env));
+                return;
+            };
+
+            match array {
+                Value::Array(arr) => {
+                    let Value::Integer(i) = val else {
+                        *last = convert_err(type_error(
+                            mc,
+                            root,
+                            "Array index must be an integer",
+                            &env,
+                            &location,
+                        ));
+                        return;
+                    };
+                    let mut arr_ref = arr.borrow_mut(mc);
+                    if let Ok(index) = TryInto::<usize>::try_into(i)
+                        && index < arr_ref.len()
+                    {
+                        arr_ref[index] = value.clone();
+                        *last = ExecResult::Value(value);
+                    } else {
+                        *last =
+                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
+                        return;
+                    }
+                }
+                Value::TypedSlice {
+                    buffer,
+                    start,
+                    length,
+                    buffer_type,
+                } => {
+                    let Value::Integer(i) = val else {
+                        *last = convert_err(type_error(
+                            mc,
+                            root,
+                            "Array index must be an integer",
+                            &env,
+                            &location,
+                        ));
+                        return;
+                    };
+                    let mut buf_ref = buffer.borrow_mut(mc);
+                    let byte_start = start * buffer_type.byte_size();
+                    let byte_end = byte_start + length * buffer_type.byte_size();
+                    if let Ok(index) = TryInto::<usize>::try_into(i)
+                        && index < buf_ref.len()
+                    {
+                        let byte_offset = byte_start + index * buffer_type.byte_size();
+                        if !buffer_type.try_write_value(&mut buf_ref[byte_offset..byte_end], &value)
+                        {
+                            *last = convert_err(type_error(
+                                mc,
+                                root,
+                                "Failed to write value to typed slice",
+                                &env,
+                                &location,
+                            ));
+                            return;
+                        }
+                        *last = ExecResult::Value(value);
+                    } else {
+                        *last =
+                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
+                        return;
+                    }
+                }
+                _ => {
+                    *last = convert_err(type_error(
+                        mc,
+                        root,
+                        "Attempted to index a non-array value",
+                        &env,
+                        &location,
+                    ));
+                    return;
                 }
             }
         }
@@ -1202,83 +1389,43 @@ fn call_function<'a>(
     location: &Location,
     env: Gc<'a, Environment<'a>>,
     args: Vec<Value<'a>>,
-    function: Value<'a>,
-    target: Option<Value<'a>>,
-    constructor_call: bool,
+    function: &Value<'a>,
 ) {
-    match function {
-        Value::BuiltinFunction(f) => {
-            let mut result_override = None;
-            let target =
-                adjust_function_target(mc, target, constructor_call, &f.kind, &mut result_override);
-
-            if constructor_call && result_override.is_none() {
-                *last = convert_err(type_error(
-                    mc,
-                    root,
-                    "Attempted to call a non-constructor function with 'new'",
-                    &env,
-                    location,
-                ));
-                return;
-            }
-
-            let args_iter = target.into_iter().chain(args.into_iter());
+    let Value::Function(f) = function else {
+        *last = convert_err(type_error(
+            mc,
+            root,
+            "Attempted to call a non-function value",
+            &env,
+            location,
+        ));
+        return;
+    };
+    match *f.borrow() {
+        FunctionValue::Builtin { ref func } => {
             // No call environment for builtin functions, as they won't define variables
-            *last = convert_err((f.func)(mc, root, args_iter.collect(), location, env));
-            if let Some(v) = result_override {
-                *last = ExecResult::Value(v);
-            }
+            *last = convert_err(func(mc, root, args, location, env));
         }
-        Value::Function(f) => {
-            let mut result_override = None;
-            let f_ref = f.borrow();
-            let target = adjust_function_target(
-                mc,
-                target,
-                constructor_call,
-                &f_ref.kind,
-                &mut result_override,
-            );
-
-            if constructor_call && result_override.is_none() {
+        FunctionValue::Function {
+            ref parameters,
+            body,
+            env: func_env,
+        } => {
+            let args_len = args.len();
+            if args_len != parameters.len() {
                 *last = convert_err(type_error(
                     mc,
                     root,
-                    "Attempted to call a non-constructor function with 'new'",
-                    &env,
-                    location,
-                ));
-                return;
-            }
-
-            let args_len = args.len() + if target.is_some() { 1 } else { 0 };
-            if args_len != f_ref.parameters.len() {
-                *last = convert_err(type_error(
-                    mc,
-                    root,
-                    &format!(
-                        "Expected {} arguments, got {}",
-                        f_ref.parameters.len(),
-                        args_len
-                    ),
+                    &format!("Expected {} arguments, got {}", parameters.len(), args_len),
                     &env,
                     location,
                 ));
             } else {
-                let args_iter = target.into_iter().chain(args.into_iter());
-                let call_env = Gc::new(mc, Environment::new(mc, f_ref.env));
-                for (param, arg) in f_ref.parameters.iter().zip(args_iter) {
+                let call_env = Gc::new(mc, Environment::new(mc, func_env));
+                for (param, arg) in parameters.iter().zip(args.into_iter()) {
                     call_env.define(mc, param, arg);
                 }
-                let body_ref = f_ref.body.as_ref();
-                if let Some(v) = result_override {
-                    stack.push(Frame::kont(
-                        Kont::Set(ExecResult::Value(v)),
-                        env.clone(),
-                        location.clone(),
-                    ));
-                }
+                let body_ref = body.as_ref();
                 stack.push(Frame::kont(
                     Kont::ReturnBarrier,
                     call_env.clone(),
@@ -1287,57 +1434,7 @@ fn call_function<'a>(
                 stack.push(Frame::eval(body_ref, call_env));
             }
         }
-        _ => {
-            *last = convert_err(type_error(
-                mc,
-                root,
-                "Attempted to call a non-function value",
-                &env,
-                location,
-            ));
-        }
     }
-}
-
-fn adjust_function_target<'a>(
-    mc: &Mutation<'a>,
-    target: Option<Value<'a>>,
-    constructor_call: bool,
-    kind: &FunctionKind<'a>,
-    result_override: &mut Option<Value<'a>>,
-) -> Option<Value<'a>> {
-    let target = match kind {
-        FunctionKind::Function => None,
-        FunctionKind::Method => {
-            if let Some(target) = target
-                && !matches!(target, Value::Prototype(_))
-            {
-                Some(target)
-            } else {
-                None
-            }
-        }
-        FunctionKind::Constructor(prot) => {
-            if constructor_call {
-                let obj = Gc::new(
-                    mc,
-                    RefLock::new(ObjectValue {
-                        properties: HashMap::new(),
-                        prototype: *prot,
-                    }),
-                );
-                *result_override = Some(Value::Object(obj));
-                Some(Value::Object(obj))
-            } else if let Some(target) = target
-                && !matches!(target, Value::Prototype(_))
-            {
-                Some(target)
-            } else {
-                None
-            }
-        }
-    };
-    target
 }
 
 fn import_module<'a>(
@@ -1525,66 +1622,147 @@ fn interpret_simple_binary_op<'a>(
     })
 }
 
-fn get_property<'a>(root: &MyRoot<'a>, object: Value<'a>, field: &str) -> Option<Value<'a>> {
-    let proto = match &object {
-        Value::Object(object_map) => {
-            let object_ref = object_map.borrow();
-            if let Some(val) = object_ref.properties.get(field).cloned() {
-                return Some(val);
+fn get_class<'a>(root: &MyRoot<'a>, target: &Value<'a>) -> GcRefLock<'a, ClassValue<'a>> {
+    if let Value::ClassInstance(instance) = target {
+        instance.borrow().class
+    } else if let Value::Class(class) = target {
+        *class
+    } else {
+        let classes = &root.value_classes;
+        let value_class = match target {
+            Value::Number(_) => classes.number,
+            Value::Integer(_) => classes.integer,
+            Value::Bool(_) => classes.bool,
+            Value::String(_) => classes.string,
+            Value::Null => classes.null,
+            Value::Function { .. } => classes.function,
+            Value::Array { .. } => classes.array,
+            Value::Object { .. } => classes.object,
+            Value::ClassInstance { .. } => classes.class_instance,
+            Value::Class { .. } => classes.class,
+            Value::Resource(_) => classes.resource,
+            Value::Buffer(_) => classes.buffer,
+            Value::TypedSlice { .. } => classes.typed_slice,
+        };
+        value_class
+    }
+}
+
+fn get_property<'a>(
+    root: &MyRoot<'a>,
+    target: &Value<'a>,
+    field: &str,
+) -> Option<(Value<'a>, MemberKind)> {
+    match target {
+        Value::Object(obj) => {
+            let obj_ref = obj.borrow();
+            if let Some(val) = obj_ref.get(field).cloned() {
+                return Some((val, MemberKind::Field));
             }
-            Some(object_ref.prototype.clone())
         }
-        Value::Prototype(p) => Some(p.clone()),
-        _ => None,
-    };
-    if let Some(mut cur) = proto {
+        Value::ClassInstance(obj) => {
+            let obj_ref = obj.borrow();
+            if let Some(val) = obj_ref.fields.get(field).cloned() {
+                return Some((val, MemberKind::Field));
+            }
+        }
+        _ => {}
+    }
+
+    let class = get_class(root, target);
+
+    fn look_for_property_in_class<'a>(
+        mut class: GcRefLock<'a, ClassValue<'a>>,
+        field: &str,
+    ) -> Option<(Value<'a>, MemberKind)> {
         loop {
-            let cur_ref = cur.borrow();
-            if let Some(val) = cur_ref.properties.get(field).cloned() {
-                return Some(val);
-            } else if let Some(parent) = &cur_ref.parent {
+            let cur_ref = class.borrow();
+            if let Some(val) = cur_ref.static_fields.get(field).cloned() {
+                return Some((val, MemberKind::StaticField));
+            } else if let Some(val) = cur_ref.methods.get(field) {
+                return Some((Value::Function(*val), MemberKind::Method));
+            } else if let Some(val) = cur_ref.static_methods.get(field) {
+                return Some((Value::Function(*val), MemberKind::StaticMethod));
+            }
+
+            if let Some(parent) = &cur_ref.parent {
                 let parent = parent.clone();
                 drop(cur_ref);
-                cur = parent;
+                class = parent;
             } else {
-                break;
+                return None;
             }
         }
     }
-    let root = &root.root_prototypes;
-    let root_prot = match object {
-        Value::Number(_) => root.number,
-        Value::Integer(_) => root.integer,
-        Value::Bool(_) => root.bool,
-        Value::String(_) => root.string,
-        Value::Null => root.null,
-        Value::Function { .. } => root.function,
-        Value::BuiltinFunction { .. } => root.builtin_function,
-        Value::Array { .. } => root.array,
-        Value::Object { .. } => root.object,
-        Value::Prototype { .. } => root.prototype,
-        Value::Resource(_) => root.resource,
-        Value::Buffer(_) => root.buffer,
-    };
-    let root_ref = root_prot.borrow();
-    root_ref.properties.get(field).cloned()
+    if let Some(res) = look_for_property_in_class(class, field) {
+        Some(res)
+    } else if let Value::ClassInstance(_) = target {
+        look_for_property_in_class(root.value_classes.class_instance, field)
+    } else if let Value::Class(_) = target {
+        look_for_property_in_class(root.value_classes.class, field)
+    } else {
+        None
+    }
 }
 
 fn map_prototype_functions<'a>(
     mc: &Mutation<'a>,
     map: HashMap<String, (&'a MemberKind, Value<'a>)>,
-    prototype: GcRefLock<'a, PrototypeValue<'a>>,
+    prototype: GcRefLock<'a, ClassValue<'a>>,
 ) {
     let mut prot_ref = prototype.borrow_mut(mc);
     for (key, (kind, v)) in map.into_iter() {
-        if let Value::Function(f) = v {
-            let mut f_ref = f.borrow_mut(mc);
-            f_ref.kind = match kind {
-                MemberKind::Method => FunctionKind::Method,
-                MemberKind::Constructor => FunctionKind::Constructor(prototype),
-                _ => FunctionKind::Function,
-            };
+        match kind {
+            MemberKind::Field => {
+                prot_ref.instance_fields.insert(key, v);
+            }
+            MemberKind::StaticField => {
+                prot_ref.static_fields.insert(key, v);
+            }
+            MemberKind::Method => {
+                let Value::Function(f) = v else {
+                    //This shouldn't be possible because the parser only assigns functions as methods
+                    eprintln!("Warning: Attempted to add non-function as method to prototype");
+                    continue;
+                };
+                prot_ref.methods.insert(key.clone(), f);
+            }
+            MemberKind::StaticMethod => {
+                let Value::Function(f) = v else {
+                    //This shouldn't be possible because the parser only assigns functions as static methods
+                    eprintln!(
+                        "Warning: Attempted to add non-function as static method to prototype"
+                    );
+                    continue;
+                };
+                prot_ref.static_methods.insert(key.clone(), f);
+            }
+            MemberKind::Constructor => {
+                let Value::Function(f) = v else {
+                    //This shouldn't be possible because the parser only assigns functions as constructors
+                    eprintln!("Warning: Attempted to add non-function as constructor to prototype");
+                    continue;
+                };
+                prot_ref.constructor = Some(f);
+            }
         }
-        prot_ref.properties.insert(key, v);
     }
+}
+
+fn create_class_instance<'a>(mc: &Mutation<'a>, class: GcRefLock<'a, ClassValue<'a>>) -> Value<'a> {
+    let mut fields = HashMap::new();
+    let mut current_class = Some(class);
+    while let Some(class) = current_class {
+        let class_ref = class.borrow();
+        for (key, value) in class_ref.instance_fields.iter() {
+            if !fields.contains_key(key) {
+                fields.insert(key.clone(), value.clone());
+            }
+        }
+        current_class = class_ref.parent.clone();
+    }
+    Value::ClassInstance(Gc::new(
+        mc,
+        RefLock::new(ClassInstanceValue { class, fields }),
+    ))
 }

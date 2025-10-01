@@ -4,3 +4,39 @@ file.close();
 
 file = new File("reference/test.txt");
 print(file.read_to_end());
+
+class BaseClass {
+    let field = "";
+    constructor(val) {
+        print(this, val);
+        this.field = val;
+    }
+    static fn static_test() {
+        print("BaseClass static test");
+    }
+}
+
+class DerivedClass : BaseClass {
+    constructor(val) {
+        this.get_class().super()(this, val);
+        this.field = this.field.concat(" derived");
+    }
+    static fn static_test() {
+        print("DerivedClass static test");
+    }
+}
+
+let obj = new DerivedClass("base");
+print(obj.field);
+BaseClass.static_test();
+DerivedClass.static_test();
+
+obj.static_test();
+
+let buffer = Buffer.with_size(16);
+let array = Uint32Array.of(buffer);
+for (let i = 0; i < array.length(); i = i + 1) {
+    print(array[i]);
+    array[i] = i * 2;
+    print(array[i]);
+}

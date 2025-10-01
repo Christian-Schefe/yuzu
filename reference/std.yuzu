@@ -12,9 +12,10 @@ class Iterator {
 }
 
 class IndexIterator : Iterator {
-    constructor(target) {
+    let target = null;
+    let current = -1;
+    constructor(target) { 
         this.target = target;
-        this.current = -1;
     }
     fn next() {
         this.current += 1;
@@ -24,6 +25,8 @@ class IndexIterator : Iterator {
 }
 
 class MapIterator : Iterator {
+    let iterator = null;
+    let map_fn = null;
     constructor(iterator, map_fn) {
         this.iterator = iterator;
         this.map_fn = map_fn;
@@ -37,6 +40,9 @@ class MapIterator : Iterator {
 }
 
 class BufferSlice {
+    let buffer = null;
+    let start = 0;
+    let end = 0;
     constructor(buffer, start, end) {
         this.buffer = buffer;
         this.start = start;
@@ -61,6 +67,7 @@ class String {
 }
 
 class Exception {
+    let message = "";
     constructor(message) {
         this.message = message;
     }
@@ -68,7 +75,9 @@ class Exception {
 
 let IntrinsicFile = File;
 class File {
+    let file = null;
     constructor(path) {
+        print(IntrinsicFile);
         this.file = IntrinsicFile.open(path);
     }
     fn close() {

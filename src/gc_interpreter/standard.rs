@@ -7,17 +7,101 @@ use gc_arena::{
 
 use crate::{
     gc_interpreter::{
-        MyRoot, RootPrototypes,
+        MyRoot, ValueClasses,
         exception::{function_argument_error, io_error, type_error},
         import_module, interpret_string,
         resource::{FileResource, SocketResource},
         value::{
-            BuiltinFunctionValue, Environment, FunctionKind, LocatedControlFlow, PrototypeValue,
-            Value, variable_to_string,
+            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedControlFlow,
+            StringVariant, TypedBufferType, Value, variable_to_string,
         },
     },
-    tree_interpreter::Location,
+    location::Location,
 };
+
+fn expect_arg_len<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    args: &Vec<Value<'a>>,
+    expected: usize,
+    env: &Environment<'a>,
+    expr: &Location,
+) -> Result<(), LocatedControlFlow<'a>> {
+    if args.len() != expected {
+        function_argument_error(
+            mc,
+            root,
+            &format!("Expected {} arguments, got {}", expected, args.len()),
+            env,
+            expr,
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn expect_class_arg<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    value: &Value<'a>,
+    env: &Environment<'a>,
+    expr: &Location,
+) -> Result<GcRefLock<'a, ClassValue<'a>>, LocatedControlFlow<'a>> {
+    if let Value::Class(c) = value {
+        Ok(c.clone())
+    } else {
+        type_error(
+            mc,
+            root,
+            &format!("Expected argument to be a Class, got {}", value.get_type()),
+            env,
+            expr,
+        )
+    }
+}
+
+fn expect_class_instance_arg<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    value: &Value<'a>,
+    env: &Environment<'a>,
+    expr: &Location,
+) -> Result<GcRefLock<'a, ClassInstanceValue<'a>>, LocatedControlFlow<'a>> {
+    if let Value::ClassInstance(c) = value {
+        Ok(c.clone())
+    } else {
+        type_error(
+            mc,
+            root,
+            &format!(
+                "Expected argument to be a ClassInstance, got {}",
+                value.get_type()
+            ),
+            env,
+            expr,
+        )
+    }
+}
+
+fn exprect_buffer_arg<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    value: &Value<'a>,
+    env: &Environment<'a>,
+    expr: &Location,
+) -> Result<GcRefLock<'a, Vec<u8>>, LocatedControlFlow<'a>> {
+    if let Value::Buffer(b) = value {
+        Ok(b.clone())
+    } else {
+        type_error(
+            mc,
+            root,
+            &format!("Expected argument to be a Buffer, got {}", value.get_type()),
+            env,
+            expr,
+        )
+    }
+}
 
 fn make_builtin_function<'a>(
     mc: &Mutation<'a>,
@@ -29,34 +113,13 @@ fn make_builtin_function<'a>(
         Gc<'b, Environment<'b>>,
     ) -> Result<Value<'b>, LocatedControlFlow<'b>>
     + 'static,
-) -> Value<'a> {
-    Value::BuiltinFunction(Gc::new(
+) -> GcRefLock<'a, FunctionValue<'a>> {
+    Gc::new(
         mc,
-        BuiltinFunctionValue {
+        RefLock::new(FunctionValue::Builtin {
             func: StaticCollect(Box::new(func)),
-            kind: FunctionKind::Function,
-        },
-    ))
-}
-
-fn make_builtin_method<'a>(
-    mc: &Mutation<'a>,
-    func: impl for<'b> Fn(
-        &Mutation<'b>,
-        &MyRoot<'b>,
-        Vec<Value<'b>>,
-        &Location,
-        Gc<'b, Environment<'b>>,
-    ) -> Result<Value<'b>, LocatedControlFlow<'b>>
-    + 'static,
-) -> Value<'a> {
-    Value::BuiltinFunction(Gc::new(
-        mc,
-        BuiltinFunctionValue {
-            func: StaticCollect(Box::new(func)),
-            kind: FunctionKind::Method,
-        },
-    ))
+        }),
+    )
 }
 
 pub fn define_globals<'a>(
@@ -68,7 +131,7 @@ pub fn define_globals<'a>(
     env.define(
         mc,
         "print",
-        make_builtin_function(mc, |_, _, args, _, _| {
+        Value::Function(make_builtin_function(mc, |_, _, args, _, _| {
             let str = args
                 .into_iter()
                 .map(|arg| variable_to_string(&arg))
@@ -76,51 +139,39 @@ pub fn define_globals<'a>(
                 .join(" ");
             println!("{}", str);
             Ok(Value::Null)
-        }),
+        })),
     );
     env.define(
         mc,
         "import",
-        make_builtin_function(mc, |mc, root, args, span, env| {
-            if args.len() != 1 {
-                return function_argument_error(
-                    mc,
-                    root,
-                    &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
-                    span,
-                );
-            }
+        Value::Function(make_builtin_function(mc, |mc, root, args, span, env| {
+            expect_arg_len(mc, root, &args, 1, &env, span)?;
             let path = match &args[0] {
-                Value::String(s) => s.iter().collect::<String>(),
+                Value::String(s) => s.to_string(),
                 _ => return type_error(mc, root, "Import argument must be a string", &env, span),
             };
             import_module(mc, root, &path, &span, env)
-        }),
+        })),
     );
 
     env.define(
         mc,
         "File",
-        Value::Prototype(Gc::new(
+        Value::Class(Gc::new(
             mc,
-            RefLock::new(PrototypeValue {
-                properties: {
+            RefLock::new(ClassValue {
+                instance_fields: HashMap::new(),
+                constructor: None,
+                static_fields: HashMap::new(),
+                methods: HashMap::new(),
+                static_methods: {
                     let mut map = HashMap::new();
                     map.insert(
                         "open".to_string(),
                         make_builtin_function(mc, |mc, root, args, span, env| {
-                            if args.len() != 1 {
-                                return function_argument_error(
-                                    mc,
-                                    root,
-                                    &format!("Expected 1 argument, got {}", args.len()),
-                                    &env,
-                                    span,
-                                );
-                            }
+                            expect_arg_len(mc, root, &args, 1, &env, span)?;
                             let path = match &args[0] {
-                                Value::String(s) => s.iter().collect::<String>(),
+                                Value::String(s) => s.to_string(),
                                 _ => {
                                     return type_error(
                                         mc,
@@ -154,25 +205,21 @@ pub fn define_globals<'a>(
     env.define(
         mc,
         "Socket",
-        Value::Prototype(Gc::new(
+        Value::Class(Gc::new(
             mc,
-            RefLock::new(PrototypeValue {
-                properties: {
+            RefLock::new(ClassValue {
+                instance_fields: HashMap::new(),
+                constructor: None,
+                static_fields: HashMap::new(),
+                methods: HashMap::new(),
+                static_methods: {
                     let mut map = HashMap::new();
                     map.insert(
                         "connect".to_string(),
                         make_builtin_function(mc, |mc, root, args, span, env| {
-                            if args.len() != 2 {
-                                return function_argument_error(
-                                    mc,
-                                    root,
-                                    &format!("Expected 2 arguments, got {}", args.len()),
-                                    &env,
-                                    span,
-                                );
-                            }
+                            expect_arg_len(mc, root, &args, 2, &env, span)?;
                             let host = match &args[0] {
-                                Value::String(s) => s.iter().collect::<String>(),
+                                Value::String(s) => s.to_string(),
                                 _ => {
                                     return type_error(
                                         mc,
@@ -229,58 +276,99 @@ pub fn define_globals<'a>(
     env.define(
         mc,
         "typeof",
-        make_builtin_function(mc, |mc, root, args, span, env| {
-            if args.len() != 1 {
-                return function_argument_error(
-                    mc,
-                    root,
-                    &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
-                    span,
-                );
-            }
-            let type_str = match &args[0] {
-                Value::Null => "null",
-                Value::Bool(_) => "boolean",
-                Value::Number(_) => "number",
-                Value::Integer(_) => "integer",
-                Value::String(_) => "string",
-                Value::Object(_) => "object",
-                Value::Array(_) => "array",
-                Value::Prototype { .. } => "prototype",
-                Value::Function { .. } => "function",
-                Value::BuiltinFunction { .. } => "builtin_function",
-                Value::Resource(_) => "resource",
-                Value::Buffer(_) => "buffer",
-            };
-            Ok(Value::String(type_str.chars().collect()))
-        }),
+        Value::Function(make_builtin_function(mc, |mc, root, args, span, env| {
+            expect_arg_len(mc, root, &args, 1, &env, span)?;
+            let type_str = args[0].get_type();
+            Ok(Value::String(Gc::new(
+                mc,
+                StringVariant::from_string(type_str),
+            )))
+        })),
     );
 
-    let root_prototypes = &root.root_prototypes;
-    env.define(mc, "Integer", Value::Prototype(root_prototypes.integer));
-    env.define(mc, "String", Value::Prototype(root_prototypes.string));
-    env.define(mc, "Array", Value::Prototype(root_prototypes.array));
-    env.define(mc, "Object", Value::Prototype(root_prototypes.object));
-    env.define(mc, "Bool", Value::Prototype(root_prototypes.bool));
-    env.define(mc, "Number", Value::Prototype(root_prototypes.number));
-    env.define(mc, "Null", Value::Prototype(root_prototypes.null));
-    env.define(mc, "Function", Value::Prototype(root_prototypes.function));
+    let root_prototypes = &root.value_classes;
+    env.define(mc, "Integer", Value::Class(root_prototypes.integer));
+    env.define(mc, "String", Value::Class(root_prototypes.string));
+    env.define(mc, "Array", Value::Class(root_prototypes.array));
+    env.define(mc, "Object", Value::Class(root_prototypes.object));
+    env.define(mc, "Bool", Value::Class(root_prototypes.bool));
+    env.define(mc, "Number", Value::Class(root_prototypes.number));
+    env.define(mc, "Null", Value::Class(root_prototypes.null));
+    env.define(mc, "Function", Value::Class(root_prototypes.function));
     env.define(
         mc,
-        "BuiltinFunction",
-        Value::Prototype(root_prototypes.builtin_function),
+        "ClassInstance",
+        Value::Class(root_prototypes.class_instance),
     );
-    env.define(mc, "Prototype", Value::Prototype(root_prototypes.prototype));
-    env.define(mc, "Exception", Value::Prototype(root_prototypes.exception));
-    env.define(mc, "Resource", Value::Prototype(root_prototypes.resource));
-    env.define(mc, "Buffer", Value::Prototype(root_prototypes.buffer));
+    env.define(mc, "Prototype", Value::Class(root_prototypes.class));
+    env.define(mc, "Exception", Value::Class(root_prototypes.exception));
+    env.define(mc, "Resource", Value::Class(root_prototypes.resource));
+    env.define(mc, "Buffer", Value::Class(root_prototypes.buffer));
+    env.define(mc, "TypedSlice", Value::Class(root_prototypes.typed_slice));
+
+    let typed_slice_variants = [
+        TypedBufferType::Uint8,
+        TypedBufferType::Int8,
+        TypedBufferType::Uint16,
+        TypedBufferType::Int16,
+        TypedBufferType::Uint32,
+        TypedBufferType::Int32,
+        TypedBufferType::Uint64,
+        TypedBufferType::Int64,
+        TypedBufferType::Float32,
+        TypedBufferType::Float64,
+    ];
+
+    for buffer_type in typed_slice_variants {
+        let name = match buffer_type {
+            TypedBufferType::Uint8 => "Uint8Array",
+            TypedBufferType::Int8 => "Int8Array",
+            TypedBufferType::Uint16 => "Uint16Array",
+            TypedBufferType::Int16 => "Int16Array",
+            TypedBufferType::Uint32 => "Uint32Array",
+            TypedBufferType::Int32 => "Int32Array",
+            TypedBufferType::Uint64 => "Uint64Array",
+            TypedBufferType::Int64 => "Int64Array",
+            TypedBufferType::Float32 => "Float32Array",
+            TypedBufferType::Float64 => "Float64Array",
+        };
+        let mut static_methods = HashMap::new();
+        static_methods.insert(
+            "of".to_string(),
+            make_builtin_function(mc, move |mc, root, args, span, env| {
+                expect_arg_len(mc, root, &args, 1, &env, span)?;
+                let buf = exprect_buffer_arg(mc, root, &args[0], &env, span)?;
+                let length = buf.borrow().len() / buffer_type.byte_size();
+                Ok(Value::TypedSlice {
+                    buffer: buf.clone(),
+                    start: 0,
+                    length,
+                    buffer_type: buffer_type.clone(),
+                })
+            }),
+        );
+        env.define(
+            mc,
+            name,
+            Value::Class(Gc::new(
+                mc,
+                RefLock::new(ClassValue {
+                    instance_fields: HashMap::new(),
+                    constructor: None,
+                    static_fields: HashMap::new(),
+                    methods: HashMap::new(),
+                    static_methods,
+                    parent: Some(root_prototypes.typed_slice),
+                }),
+            )),
+        );
+    }
 
     if no_std {
         return;
     }
 
-    let std_ref = root.std_prototype.borrow_mut(mc);
+    let std_ref = root.std_export.borrow_mut(mc);
     let std_val = if let Some(&v) = std_ref.as_ref() {
         v
     } else {
@@ -305,84 +393,149 @@ pub fn define_globals<'a>(
         std
     };
 
-    for (key, value) in std_val.borrow().properties.iter() {
+    for (key, value) in std_val.borrow().iter() {
         if !env.define(mc, key, value.clone()) {
             let prev = env.get(key).unwrap();
-            let Value::Prototype(real_p) = prev else {
+            let Value::Class(real_p) = prev else {
                 panic!("Global {} in std is not a prototype, cannot merge", key);
             };
-            let Value::Prototype(new_p) = value else {
+            let Value::Class(new_p) = value else {
                 panic!("Global {} in std is not a prototype, cannot merge", key);
             };
             let mut real_p_ref = real_p.borrow_mut(mc);
             let new_p = new_p.borrow();
-            for (k, v) in new_p.properties.iter() {
-                if let Value::Function(f) = v {
-                    let mut f = f.borrow_mut(mc);
-                    if let FunctionKind::Constructor(_) = f.kind {
-                        f.kind = FunctionKind::Constructor(real_p);
-                    }
-                };
-                real_p_ref.properties.insert(k.clone(), v.clone());
+            for (k, v) in new_p.static_fields.iter() {
+                real_p_ref.static_fields.insert(k.clone(), v.clone());
+            }
+            for (k, v) in new_p.instance_fields.iter() {
+                real_p_ref.instance_fields.insert(k.clone(), v.clone());
+            }
+            for (k, v) in new_p.static_methods.iter() {
+                real_p_ref.static_methods.insert(k.clone(), v.clone());
+            }
+            for (k, v) in new_p.methods.iter() {
+                real_p_ref.methods.insert(k.clone(), v.clone());
+            }
+            real_p_ref.constructor = new_p.constructor.clone();
+            if let Some(parent) = new_p.parent
+                && !Gc::ptr_eq(parent, real_p)
+            {
+                real_p_ref.parent = Some(parent.clone());
             }
         }
     }
 }
 
-pub fn root_prototypes<'a>(mc: &Mutation<'a>) -> RootPrototypes<'a> {
-    let object_proto = object_prototype(mc);
-    RootPrototypes {
+pub fn root_prototypes<'a>(mc: &Mutation<'a>) -> ValueClasses<'a> {
+    let empty_class = || {
+        Gc::new(
+            mc,
+            RefLock::new(ClassValue {
+                instance_fields: HashMap::new(),
+                constructor: None,
+                static_fields: HashMap::new(),
+                methods: HashMap::new(),
+                static_methods: HashMap::new(),
+                parent: None,
+            }),
+        )
+    };
+    ValueClasses {
         integer: integer_prototype(mc),
         string: string_prototype(mc),
         array: array_prototype(mc),
-        object: object_proto,
-        bool: Gc::new(
-            mc,
-            RefLock::new(PrototypeValue {
-                properties: HashMap::new(),
-                parent: None,
-            }),
-        ),
-        number: Gc::new(
-            mc,
-            RefLock::new(PrototypeValue {
-                properties: HashMap::new(),
-                parent: None,
-            }),
-        ),
-        null: Gc::new(
-            mc,
-            RefLock::new(PrototypeValue {
-                properties: HashMap::new(),
-                parent: None,
-            }),
-        ),
-        function: Gc::new(
-            mc,
-            RefLock::new(PrototypeValue {
-                properties: HashMap::new(),
-                parent: None,
-            }),
-        ),
-        builtin_function: Gc::new(
-            mc,
-            RefLock::new(PrototypeValue {
-                properties: HashMap::new(),
-                parent: None,
-            }),
-        ),
-        prototype: prototype_prototype(mc),
-        exception: exception_prototype(mc, object_proto),
+        object: object_prototype(mc),
+        bool: empty_class(),
+        number: empty_class(),
+        null: empty_class(),
+        function: empty_class(),
+        class_instance: class_instance_prototype(mc),
+        class: class_prototype(mc),
+        exception: exception_prototype(mc),
         resource: resource_prototype(mc),
         buffer: buffer_prototype(mc),
+        typed_slice: typed_slice_prototype(mc),
     }
 }
 
-fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
-    let mut map = HashMap::new();
-    map.insert(
+fn typed_slice_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
+    let mut methods = HashMap::new();
+    methods.insert(
         "length".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
+            if args.len() != 1 {
+                return function_argument_error(
+                    mc,
+                    root,
+                    &format!("Expected 1 argument, got {}", args.len()),
+                    &env,
+                    expr,
+                );
+            }
+            match &args[0] {
+                Value::TypedSlice { length, .. } => Ok(Value::Integer((*length) as i64)),
+                _ => {
+                    return type_error(
+                        mc,
+                        root,
+                        "length can only be called on TypedSlice",
+                        &env,
+                        expr,
+                    );
+                }
+            }
+        }),
+    );
+    Gc::new(
+        mc,
+        RefLock::new(ClassValue {
+            methods,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            static_fields: HashMap::new(),
+            static_methods: HashMap::new(),
+            parent: None,
+        }),
+    )
+}
+
+fn class_instance_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
+    let mut methods = HashMap::new();
+    methods.insert(
+        "get_class".to_string(),
+        make_builtin_function(mc, |mc, root, args, expr, env| {
+            if args.len() != 1 {
+                return function_argument_error(
+                    mc,
+                    root,
+                    &format!("Expected 1 argument, got {}", args.len()),
+                    &env,
+                    expr,
+                );
+            }
+            let obj = expect_class_instance_arg(mc, root, &args[0], &env, expr)?;
+            Ok(Value::Class(obj.borrow().class))
+        }),
+    );
+    Gc::new(
+        mc,
+        RefLock::new(ClassValue {
+            static_fields: HashMap::new(),
+            instance_fields: HashMap::new(),
+            constructor: None,
+            methods,
+            static_methods: HashMap::new(),
+            parent: None,
+        }),
+    )
+}
+
+fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
+    let mut methods = HashMap::new();
+    let mut static_methods = HashMap::new();
+    methods.insert(
+        "length".to_string(),
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -400,9 +553,9 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
         }),
     );
-    map.insert(
+    methods.insert(
         "to_string".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -414,8 +567,9 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
             match &args[0] {
                 Value::Buffer(buf) => {
-                    let s = String::from_utf8_lossy(&buf.borrow()).to_string();
-                    Ok(Value::String(s.chars().collect()))
+                    let buf_ref = buf.borrow();
+                    let s = String::from_utf8_lossy(&buf_ref);
+                    Ok(Value::String(Gc::new(mc, StringVariant::from_string(&s))))
                 }
                 _ => {
                     return type_error(
@@ -429,7 +583,7 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
         }),
     );
-    map.insert(
+    static_methods.insert(
         "from_string".to_string(),
         make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
@@ -443,7 +597,7 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
             match &args[0] {
                 Value::String(s) => {
-                    let bytes = s.iter().map(|c| *c as u8).collect::<Vec<u8>>();
+                    let bytes = s.to_string().into_bytes();
                     Ok(Value::Buffer(Gc::new(mc, RefLock::new(bytes))))
                 }
                 _ => {
@@ -458,9 +612,9 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             }
         }),
     );
-    map.insert(
+    static_methods.insert(
         "with_size".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -489,18 +643,22 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
     );
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            methods,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            static_fields: HashMap::new(),
+            static_methods,
             parent: None,
         }),
     )
 }
 
-fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
+fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "close".to_string(),
-        make_builtin_method(mc, |mc, root, args, span, env| {
+        make_builtin_function(mc, |mc, root, args, span, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -531,7 +689,7 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
     );
     map.insert(
         "read".to_string(),
-        make_builtin_method(mc, |mc, root, args, span, env| {
+        make_builtin_function(mc, |mc, root, args, span, env| {
             if args.len() != 4 {
                 return function_argument_error(
                     mc,
@@ -600,7 +758,7 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
     );
     map.insert(
         "write".to_string(),
-        make_builtin_method(mc, |mc, root, args, span, env| {
+        make_builtin_function(mc, |mc, root, args, span, env| {
             if args.len() != 4 {
                 return function_argument_error(
                     mc,
@@ -668,68 +826,48 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>
     );
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            static_fields: HashMap::new(),
+            instance_fields: HashMap::new(),
+            constructor: None,
+            methods: map,
+            static_methods: HashMap::new(),
             parent: None,
         }),
     )
 }
 
-fn exception_prototype<'a>(
-    mc: &Mutation<'a>,
-    parent: GcRefLock<'a, PrototypeValue<'a>>,
-) -> GcRefLock<'a, PrototypeValue<'a>> {
+fn exception_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let map = HashMap::new();
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
-            parent: Some(parent),
-        }),
-    )
-}
-
-fn object_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
-    let mut map = HashMap::new();
-    map.insert(
-        "prototype".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
-            if args.len() != 1 {
-                return function_argument_error(
-                    mc,
-                    root,
-                    &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
-                    expr,
-                );
-            }
-            match &args[0] {
-                Value::Object(obj) => {
-                    let proto = obj.borrow().prototype;
-                    Ok(Value::Prototype(proto))
-                }
-                _ => {
-                    return type_error(
-                        mc,
-                        root,
-                        "prototype can only be called on Object",
-                        &env,
-                        expr,
-                    );
-                }
-            }
-        }),
-    );
-    Gc::new(
-        mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            static_fields: map,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            methods: HashMap::new(),
+            static_methods: HashMap::new(),
             parent: None,
         }),
     )
 }
 
-fn prototype_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
+fn object_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
+    let map = HashMap::new();
+    Gc::new(
+        mc,
+        RefLock::new(ClassValue {
+            static_fields: map,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            methods: HashMap::new(),
+            static_methods: HashMap::new(),
+            parent: None,
+        }),
+    )
+}
+
+fn class_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "super".to_string(),
@@ -743,37 +881,34 @@ fn prototype_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a
                     expr,
                 );
             }
-            match &args[0] {
-                Value::Prototype(obj) => {
-                    let proto = obj.borrow().parent;
-                    Ok(proto.map_or(Value::Null, Value::Prototype))
-                }
-                _ => {
-                    return type_error(
-                        mc,
-                        root,
-                        "super can only be called on Prototype",
-                        &env,
-                        expr,
-                    );
-                }
-            }
+            let class = expect_class_arg(mc, root, &args[0], &env, expr)?;
+            let Some(parent) = class.borrow().parent else {
+                return type_error(mc, root, "Class has no parent", &env, expr);
+            };
+            let Some(ctor) = parent.borrow().constructor else {
+                return type_error(mc, root, "Parent class has no constructor", &env, expr);
+            };
+            Ok(Value::Function(ctor))
         }),
     );
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            methods: map,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            static_fields: HashMap::new(),
+            static_methods: HashMap::new(),
             parent: None,
         }),
     )
 }
 
-fn integer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
+fn integer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "to_string".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -784,7 +919,10 @@ fn integer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>>
                 );
             }
             match &args[0] {
-                Value::Integer(i) => Ok(Value::String(i.to_string().chars().collect())),
+                Value::Integer(i) => Ok(Value::String(Gc::new(
+                    mc,
+                    StringVariant::from_string(&i.to_string()),
+                ))),
                 _ => {
                     return type_error(
                         mc,
@@ -799,18 +937,22 @@ fn integer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>>
     );
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            methods: map,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            static_fields: HashMap::new(),
+            static_methods: HashMap::new(),
             parent: None,
         }),
     )
 }
 
-fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
+fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "length".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -830,7 +972,7 @@ fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
     );
     map.insert(
         "concat".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() < 2 {
                 return function_argument_error(
                     mc,
@@ -843,7 +985,7 @@ fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
             let strings = args
                 .iter()
                 .map(|arg| match arg {
-                    Value::String(s) => Ok(s.iter().collect::<String>()),
+                    Value::String(s) => Ok(s.to_string()),
                     _ => {
                         return type_error(
                             mc,
@@ -855,23 +997,30 @@ fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> 
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Value::String(strings.concat().chars().collect()))
+            Ok(Value::String(Gc::new(
+                mc,
+                StringVariant::from_string(&strings.join("")),
+            )))
         }),
     );
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            methods: map,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            static_fields: HashMap::new(),
+            static_methods: HashMap::new(),
             parent: None,
         }),
     )
 }
 
-fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
+fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "length".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
@@ -889,7 +1038,7 @@ fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
     );
     map.insert(
         "push".to_string(),
-        make_builtin_method(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, env| {
             if args.len() < 2 {
                 return function_argument_error(
                     mc,
@@ -913,8 +1062,12 @@ fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, PrototypeValue<'a>> {
     );
     Gc::new(
         mc,
-        RefLock::new(PrototypeValue {
-            properties: map,
+        RefLock::new(ClassValue {
+            methods: map,
+            instance_fields: HashMap::new(),
+            constructor: None,
+            static_fields: HashMap::new(),
+            static_methods: HashMap::new(),
             parent: None,
         }),
     )

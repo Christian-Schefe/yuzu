@@ -5,9 +5,9 @@ use gc_arena::{Gc, Mutation, lock::RefLock};
 use crate::{
     gc_interpreter::{
         Environment, MyRoot, Value,
-        value::{ControlFlow, LocatedControlFlow, ObjectValue},
+        value::{ClassInstanceValue, ControlFlow, LocatedControlFlow, StringVariant},
     },
-    tree_interpreter::{HasLocation, Located},
+    location::{HasLocation, Located},
 };
 
 fn make_exception<'a>(
@@ -17,19 +17,22 @@ fn make_exception<'a>(
     variant: &str,
     env: &Environment<'a>,
 ) -> Value<'a> {
-    let p = if let Some(Value::Prototype(p)) = env.root().get(variant) {
+    let p = if let Some(Value::Class(p)) = env.root().get(variant) {
         p
     } else {
-        root.root_prototypes.exception
+        root.value_classes.exception
     };
 
     let mut map = HashMap::new();
-    map.insert("message".to_string(), Value::String(msg.chars().collect()));
-    Value::Object(Gc::new(
+    map.insert(
+        "message".to_string(),
+        Value::String(Gc::new(mc, StringVariant::from_string(msg))),
+    );
+    Value::ClassInstance(Gc::new(
         mc,
-        RefLock::new(ObjectValue {
-            properties: map,
-            prototype: p,
+        RefLock::new(ClassInstanceValue {
+            fields: map,
+            class: p,
         }),
     ))
 }

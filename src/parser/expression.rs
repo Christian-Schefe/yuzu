@@ -13,7 +13,7 @@ pub enum Expression<T> {
         parameters: Vec<String>,
         body: Box<Extra<T>>,
     },
-    PrototypeLiteral {
+    ClassLiteral {
         parent: Option<Box<Extra<T>>>,
         properties: Vec<(String, MemberKind, Extra<T>)>,
     },
@@ -85,6 +85,7 @@ pub enum Expression<T> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemberKind {
     Field,
+    StaticField,
     Method,
     StaticMethod,
     Constructor,
@@ -111,10 +112,10 @@ impl<T> Extra<T> {
                     parameters,
                     body: Box::new(body.map_extra(f)),
                 },
-                Expression::PrototypeLiteral {
+                Expression::ClassLiteral {
                     parent: superclass,
                     properties,
-                } => Expression::PrototypeLiteral {
+                } => Expression::ClassLiteral {
                     parent: superclass.map(|sc| Box::new(sc.map_extra(f))),
                     properties: properties
                         .into_iter()
@@ -259,7 +260,7 @@ where
                 }
                 write!(f, "], body: {})", body.expr)
             }
-            Self::PrototypeLiteral {
+            Self::ClassLiteral {
                 properties,
                 parent: superclass,
             } => {

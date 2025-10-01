@@ -4,12 +4,12 @@ use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
 use clio::Input;
 
-use crate::{parser::LocatedExpression, tree_interpreter::Location};
+use crate::{parser::LocatedExpression, location::Location};
 
 mod gc_interpreter;
 mod lexer;
 mod parser;
-mod tree_interpreter;
+mod location;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -66,7 +66,7 @@ fn main() {
         .finish()
         .eprint(ariadne::sources(vec![
             (file_location_str.to_string(), input.as_ref()),
-            ("std".to_string(), tree_interpreter::standard::STD),
+            ("std".to_string(), gc_interpreter::standard::STD),
         ]))
         .unwrap();
         std::process::exit(1);
