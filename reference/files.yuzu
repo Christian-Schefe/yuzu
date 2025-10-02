@@ -40,3 +40,8 @@ for (let i = 0; i < array.length(); i = i + 1) {
     array[i] = i * 2;
     print(array[i]);
 }
+let bool: bool = true;
+let str: string = "test";
+let union: string | number = "union";
+union = 42;
+bool = false && print("short-circuit");

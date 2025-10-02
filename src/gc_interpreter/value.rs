@@ -277,7 +277,7 @@ pub enum FunctionValue<'a> {
                     Vec<Value<'b>>,
                     &Location,
                     Gc<'b, Environment<'b>>,
-                ) -> Result<Value<'b>, LocatedControlFlow<'b>>,
+                ) -> Result<Value<'b>, LocatedError<'b>>,
             >,
         >,
     },
@@ -508,15 +508,7 @@ pub fn variable_to_string(var: &Value) -> String {
     }
 }
 
-#[derive(Clone, Collect, Debug)]
-#[collect(no_drop)]
-pub enum ControlFlow<'a> {
-    Break,
-    Continue,
-    Error(Value<'a>),
-}
-
-pub type LocatedControlFlow<'a> = Located<ControlFlow<'a>>;
+pub type LocatedError<'a> = Located<Value<'a>>;
 
 #[derive(Collect)]
 #[collect(no_drop)]

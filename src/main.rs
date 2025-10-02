@@ -4,12 +4,13 @@ use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
 use clio::Input;
 
-use crate::{parser::LocatedExpression, location::Location};
+use crate::parser::LocatedExpression;
 
 mod gc_interpreter;
 mod lexer;
-mod parser;
 mod location;
+mod parser;
+mod type_checker;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -42,13 +43,35 @@ fn main() {
     }
     let input = String::from_utf8_lossy(&buf);
     let file_location_str = args.input.path().to_string_lossy().to_string();
-    let Ok(parsed) = parse_string(&input, Some(&file_location_str)) else {
+    let Ok(mut parsed) = parse_string(&input, Some(&file_location_str)) else {
         std::process::exit(1);
     };
+    parsed.set_module(&file_location_str);
 
-    let add_file_info = |extra| Location::new(extra, file_location_str.clone());
+    let errors = type_checker::check_types(&parsed, "root".to_string());
+    if !errors.is_empty() {
+        for err in errors {
+            Report::build(
+                ReportKind::Error,
+                (err.location.module.clone(), err.location.span.clone()),
+            )
+            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
+            .with_message(err.data.to_string())
+            .with_label(
+                Label::new((err.location.module, err.location.span))
+                    .with_message(err.data.to_string())
+                    .with_color(Color::Red),
+            )
+            .finish()
+            .eprint(ariadne::sources(vec![(
+                file_location_str.to_string(),
+                input.as_ref(),
+            )]))
+            .unwrap();
+        }
+        std::process::exit(1);
+    }
 
-    let parsed = parsed.map_extra(&add_file_info);
     let interpreted = gc_interpreter::interpret_global(parsed, "root".to_string(), path);
     if let Err(err) = interpreted {
         let err_message = err.data;

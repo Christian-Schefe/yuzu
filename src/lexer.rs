@@ -154,12 +154,15 @@ pub enum Token<'a> {
     #[token("as")]
     As,
 
-    #[token("or")]
+    #[token("||")]
     Or,
-    #[token("and")]
+    #[token("&&")]
     And,
-    #[token("not")]
+    #[token("!")]
     Not,
+
+    #[token("|")]
+    Pipe,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
     Ident(&'a str),
@@ -235,9 +238,10 @@ impl fmt::Display for Token<'_> {
             Self::Let => write!(f, "let"),
             Self::Fn => write!(f, "fn"),
             Self::Class => write!(f, "class"),
-            Self::Or => write!(f, "or"),
-            Self::And => write!(f, "and"),
-            Self::Not => write!(f, "not"),
+            Self::Or => write!(f, "||"),
+            Self::And => write!(f, "&&"),
+            Self::Not => write!(f, "!"),
+            Self::Pipe => write!(f, "|"),
             Self::If => write!(f, "if"),
             Self::Else => write!(f, "else"),
             Self::For => write!(f, "for"),

@@ -1,0 +1,10 @@
+let a: int = 5;
+let obj: any = {a: 5, extra: 10};
+let b = obj.a;
+let int_arr: int[] = [1, 2, 3];
+let c = int_arr[0];
+obj.extra;
+obj.unknown;
+b + a;
+c+c;
+5;

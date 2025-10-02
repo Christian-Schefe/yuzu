@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use chumsky::{
     Parser,
@@ -7,19 +7,25 @@ use chumsky::{
     prelude::*,
 };
 
-use crate::lexer::{LocatedToken, Token};
+use crate::{
+    lexer::{LocatedToken, Token},
+    location::{Located, Location},
+};
 
 mod expression;
+mod types;
 
 pub use expression::*;
+pub use types::*;
 
-pub type LocatedExpression = Extra<core::ops::Range<usize>>;
-
-fn located(expr: Expression<core::ops::Range<usize>>, span: SimpleSpan) -> LocatedExpression {
-    LocatedExpression {
+fn located<T>(expr: T, span: SimpleSpan) -> Located<T> {
+    Located::new(
         expr,
-        extra: span.into_range(),
-    }
+        Location {
+            span: span.into_range(),
+            module: "".to_string(),
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,12 +45,6 @@ pub enum BinaryOp {
     And,
     Or,
 
-    Assign,
-    AddAssign,
-    SubtractAssign,
-    MultiplyAssign,
-    DivideAssign,
-
     NullCoalesce,
 }
 
@@ -63,11 +63,6 @@ impl fmt::Display for BinaryOp {
             Self::GreaterEqual => write!(f, ">="),
             Self::And => write!(f, "and"),
             Self::Or => write!(f, "or"),
-            Self::Assign => write!(f, "="),
-            Self::AddAssign => write!(f, "+="),
-            Self::SubtractAssign => write!(f, "-="),
-            Self::MultiplyAssign => write!(f, "*="),
-            Self::DivideAssign => write!(f, "/="),
             Self::NullCoalesce => write!(f, "??"),
         }
     }
@@ -88,12 +83,62 @@ impl fmt::Display for UnaryOp {
     }
 }
 
+fn type_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, TypeHint, extra::Err<Rich<'tokens, Token<'src>>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
+{
+    let mut type_hint = Recursive::declare();
+    let simple_type = select! {Token::Ident(name) => match name {
+            "number" => TypeHint::Union(vec![TypeHint::Number, TypeHint::Integer]),
+            "float" => TypeHint::Number,
+            "int" => TypeHint::Integer,
+            "bool" => TypeHint::Bool,
+            "string" => TypeHint::String,
+            "any" => TypeHint::Any,
+            name => TypeHint::ClassInstance(name.to_string()),
+        },
+        Token::Null => TypeHint::Null,
+    };
+
+    let obj_type = just(Token::LBrace)
+        .ignore_then(
+            select! { Token::Ident(name) => name.to_string() }
+                .then_ignore(just(Token::Colon))
+                .then(type_hint.clone())
+                .separated_by(just(Token::Comma))
+                .collect::<Vec<_>>()
+                .then_ignore(just(Token::Comma).or_not()),
+        )
+        .then_ignore(just(Token::RBrace))
+        .map(|fields| TypeHint::Object(fields.into_iter().collect::<HashMap<String, TypeHint>>()));
+
+    let basic = choice((obj_type, simple_type));
+
+    let operators = basic.pratt((
+        postfix(
+            15,
+            just(Token::LBracket).ignore_then(just(Token::RBracket)),
+            |lhs, _, _| TypeHint::Array(Some(Box::new(lhs))),
+        ),
+        infix(
+            Associativity::Left(10),
+            just(Token::Pipe),
+            move |lhs, _, rhs, _| TypeHint::union(lhs, rhs),
+        ),
+    ));
+    type_hint.define(operators);
+    type_hint
+}
+
 fn parser<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, LocatedExpression, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
     let mut expr = Recursive::declare();
+
+    let colon_type_hint = just(Token::Colon).ignore_then(type_parser()).or_not();
 
     let atom = select! {
         Token::Number(n) => Expression::Number(n),
@@ -155,7 +200,7 @@ where
         .clone()
         .then(just(Token::Semicolon).or_not())
         .try_map_with(|(expr, semicolon), extra| {
-            if needs_semi(&expr.expr) && semicolon.is_none() {
+            if needs_semi(&expr.data) && semicolon.is_none() {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
                     "Expected ';' after expression in block",
@@ -211,9 +256,14 @@ where
 
     let define_let = just(Token::Let)
         .ignore_then(select! { Token::Ident(name) => name.to_string() })
+        .then(colon_type_hint)
         .then_ignore(just(Token::Assign))
         .then(expr.clone())
-        .map(|(name, value)| Expression::Define(name, Box::new(value)))
+        .map(|((name, type_hint), value)| Expression::Define {
+            name,
+            value: Box::new(value),
+            type_hint,
+        })
         .map_with(|expr, extra| located(expr, extra.span()));
 
     let define_fn = just(Token::Fn)
@@ -233,16 +283,17 @@ where
                 ));
             }
             Ok(located(
-                Expression::Define(
+                Expression::Define {
                     name,
-                    Box::new(located(
+                    value: Box::new(located(
                         Expression::FunctionLiteral {
                             parameters: params,
                             body: Box::new(body),
                         },
                         extra.span(),
                     )),
-                ),
+                    type_hint: None,
+                },
                 extra.span(),
             ))
         });
@@ -263,16 +314,17 @@ where
                 ));
             }
             Ok(located(
-                Expression::Define(
-                    "$constructor".to_string(),
-                    Box::new(located(
+                Expression::Define {
+                    name: "$constructor".to_string(),
+                    value: Box::new(located(
                         Expression::FunctionLiteral {
                             parameters: params,
                             body: Box::new(body),
                         },
                         extra.span(),
                     )),
-                ),
+                    type_hint: None,
+                },
                 extra.span(),
             ))
         });
@@ -358,8 +410,13 @@ where
         .then(
             choice((
                 define_fn.clone().map(|lf| {
-                    if let Expression::Define(name, mut expr) = lf.expr {
-                        let Expression::FunctionLiteral { parameters, .. } = &mut expr.expr else {
+                    if let Expression::Define {
+                        name,
+                        value: mut expr,
+                        type_hint: _,
+                    } = lf.data
+                    {
+                        let Expression::FunctionLiteral { parameters, .. } = &mut expr.data else {
                             panic!("Expected function definition in class body")
                         };
                         parameters.insert(0, "this".to_string());
@@ -371,15 +428,25 @@ where
                 just(Token::Static)
                     .ignore_then(define_fn.clone())
                     .map(|lf| {
-                        if let Expression::Define(name, expr) = lf.expr {
+                        if let Expression::Define {
+                            name,
+                            value: expr,
+                            type_hint: _,
+                        } = lf.data
+                        {
                             (name, MemberKind::StaticMethod, *expr)
                         } else {
                             panic!("Expected static method definition in class body")
                         }
                     }),
                 define_constructor_fn.clone().map(|lf| {
-                    if let Expression::Define(name, mut expr) = lf.expr {
-                        let Expression::FunctionLiteral { parameters, .. } = &mut expr.expr else {
+                    if let Expression::Define {
+                        name,
+                        value: mut expr,
+                        type_hint: _,
+                    } = lf.data
+                    {
+                        let Expression::FunctionLiteral { parameters, .. } = &mut expr.data else {
                             panic!("Expected function definition in class body")
                         };
                         parameters.insert(0, "this".to_string());
@@ -389,7 +456,12 @@ where
                     }
                 }),
                 define_let.clone().map(|lf| {
-                    if let Expression::Define(name, expr) = lf.expr {
+                    if let Expression::Define {
+                        name,
+                        value: expr,
+                        type_hint: _,
+                    } = lf.data
+                    {
                         (name, MemberKind::Field, *expr)
                     } else {
                         panic!("Expected field definition in class body")
@@ -398,7 +470,7 @@ where
             ))
             .then(just(Token::Semicolon).or_not())
             .try_map_with(|(data, semicolon), extra| {
-                if needs_semi(&data.2.expr) && semicolon.is_none() {
+                if needs_semi(&data.2.data) && semicolon.is_none() {
                     return Err(chumsky::error::Rich::custom(
                         extra.span(),
                         "Expected ';' after expression in block",
@@ -418,16 +490,17 @@ where
                 ));
             }
             Ok(located(
-                Expression::Define(
+                Expression::Define {
                     name,
-                    Box::new(located(
+                    value: Box::new(located(
                         Expression::ClassLiteral {
                             properties: body,
                             parent: superclass.map(Box::new),
                         },
                         extra.span(),
                     )),
-                ),
+                    type_hint: None,
+                },
                 extra.span(),
             ))
         });
@@ -508,6 +581,18 @@ where
             )
         })
     };
+    let bin_infix_assign = |assoc, token, binary_op: Option<BinaryOp>| {
+        infix(assoc, op(token), move |lhs, _, rhs, extra| {
+            located(
+                Expression::Assign {
+                    op: binary_op.clone(),
+                    target: Box::new(lhs),
+                    value: Box::new(rhs),
+                },
+                extra.span(),
+            )
+        })
+    };
 
     let unary_prefix = |token, unary_op: UnaryOp| {
         prefix(14, op(token), move |_, expr, extra| {
@@ -549,26 +634,26 @@ where
             Token::NullCoalesce,
             BinaryOp::NullCoalesce,
         ),
-        bin_infix(Associativity::Right(3), Token::Assign, BinaryOp::Assign),
-        bin_infix(
+        bin_infix_assign(Associativity::Right(3), Token::Assign, None),
+        bin_infix_assign(
             Associativity::Right(3),
             Token::PlusAssign,
-            BinaryOp::AddAssign,
+            Some(BinaryOp::Add),
         ),
-        bin_infix(
+        bin_infix_assign(
             Associativity::Right(3),
             Token::MinusAssign,
-            BinaryOp::SubtractAssign,
+            Some(BinaryOp::Subtract),
         ),
-        bin_infix(
+        bin_infix_assign(
             Associativity::Right(3),
             Token::StarAssign,
-            BinaryOp::MultiplyAssign,
+            Some(BinaryOp::Multiply),
         ),
-        bin_infix(
+        bin_infix_assign(
             Associativity::Right(3),
             Token::SlashAssign,
-            BinaryOp::DivideAssign,
+            Some(BinaryOp::Divide),
         ),
         postfix(
             16,
@@ -650,7 +735,7 @@ where
 
     expr.then(just(Token::Semicolon).or_not())
         .try_map_with(|(data, semicolon), extra| {
-            if needs_semi(&data.expr) && semicolon.is_none() {
+            if needs_semi(&data.data) && semicolon.is_none() {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
                     "Expected ';' after expression in block",
@@ -673,18 +758,18 @@ pub fn parse<'a>(
     parser().parse(token_stream).into_result()
 }
 
-fn needs_semi<T>(expr: &Expression<T>) -> bool {
+fn needs_semi(expr: &Expression) -> bool {
     match expr {
         Expression::Block { .. } => false,
-        Expression::Define(_, expr) => needs_semi(&expr.expr),
+        Expression::Define { value, .. } => needs_semi(&value.data),
         Expression::If {
             then_branch,
             else_branch,
             ..
-        } => needs_semi(&else_branch.as_ref().unwrap_or(then_branch).expr),
-        Expression::FunctionLiteral { body, .. } => needs_semi(&body.expr),
-        Expression::Loop { body, .. } => needs_semi(&body.expr),
-        Expression::IterLoop { body, .. } => needs_semi(&body.expr),
+        } => needs_semi(&else_branch.as_ref().unwrap_or(then_branch).data),
+        Expression::FunctionLiteral { body, .. } => needs_semi(&body.data),
+        Expression::Loop { body, .. } => needs_semi(&body.data),
+        Expression::IterLoop { body, .. } => needs_semi(&body.data),
         Expression::ClassLiteral { .. } => false,
         _ => true,
     }

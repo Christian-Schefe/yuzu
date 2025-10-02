@@ -12,7 +12,7 @@ use crate::{
         import_module, interpret_string,
         resource::{FileResource, SocketResource},
         value::{
-            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedControlFlow,
+            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError,
             StringVariant, TypedBufferType, Value, variable_to_string,
         },
     },
@@ -26,7 +26,7 @@ fn expect_arg_len<'a>(
     expected: usize,
     env: &Environment<'a>,
     expr: &Location,
-) -> Result<(), LocatedControlFlow<'a>> {
+) -> Result<(), LocatedError<'a>> {
     if args.len() != expected {
         function_argument_error(
             mc,
@@ -46,7 +46,7 @@ fn expect_class_arg<'a>(
     value: &Value<'a>,
     env: &Environment<'a>,
     expr: &Location,
-) -> Result<GcRefLock<'a, ClassValue<'a>>, LocatedControlFlow<'a>> {
+) -> Result<GcRefLock<'a, ClassValue<'a>>, LocatedError<'a>> {
     if let Value::Class(c) = value {
         Ok(c.clone())
     } else {
@@ -66,7 +66,7 @@ fn expect_class_instance_arg<'a>(
     value: &Value<'a>,
     env: &Environment<'a>,
     expr: &Location,
-) -> Result<GcRefLock<'a, ClassInstanceValue<'a>>, LocatedControlFlow<'a>> {
+) -> Result<GcRefLock<'a, ClassInstanceValue<'a>>, LocatedError<'a>> {
     if let Value::ClassInstance(c) = value {
         Ok(c.clone())
     } else {
@@ -89,7 +89,7 @@ fn exprect_buffer_arg<'a>(
     value: &Value<'a>,
     env: &Environment<'a>,
     expr: &Location,
-) -> Result<GcRefLock<'a, Vec<u8>>, LocatedControlFlow<'a>> {
+) -> Result<GcRefLock<'a, Vec<u8>>, LocatedError<'a>> {
     if let Value::Buffer(b) = value {
         Ok(b.clone())
     } else {
@@ -111,7 +111,7 @@ fn make_builtin_function<'a>(
         Vec<Value<'b>>,
         &Location,
         Gc<'b, Environment<'b>>,
-    ) -> Result<Value<'b>, LocatedControlFlow<'b>>
+    ) -> Result<Value<'b>, LocatedError<'b>>
     + 'static,
 ) -> GcRefLock<'a, FunctionValue<'a>> {
     Gc::new(

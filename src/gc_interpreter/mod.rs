@@ -13,13 +13,13 @@ use crate::{
         },
         standard::{define_globals, root_prototypes},
         value::{
-            ClassInstanceValue, ClassValue, ControlFlow, Environment, FunctionValue,
-            LocatedControlFlow, StringVariant, Value, ValueClasses, variable_to_string,
+            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError,
+            StringVariant, Value, ValueClasses, variable_to_string,
         },
     },
     location::{Located, Location},
     parse_string,
-    parser::{BinaryOp, Expression, Extra, MemberKind, UnaryOp},
+    parser::{BinaryOp, Expression, LocatedExpression, MemberKind, UnaryOp},
 };
 
 mod exception;
@@ -44,8 +44,6 @@ pub struct ModuleRoot<'a> {
     expr: Gc<'a, StaticCollect<LocatedExpression>>,
 }
 
-type LocatedExpression = Extra<Location>;
-
 pub fn interpret_global(
     expr: LocatedExpression,
     module_path: String,
@@ -62,15 +60,8 @@ pub fn interpret_global(
         |mc, root| match interpret(mc, root, expr, module_path, false) {
             Ok(_) => Ok(()),
             Err(e) => Err(Located {
-                data: format!(
-                    "Uncaught exception: {:?}",
-                    match e.data {
-                        ControlFlow::Break => "<break>".to_string(),
-                        ControlFlow::Continue => "<continue>".to_string(),
-                        ControlFlow::Error(v) => variable_to_string(&v),
-                    }
-                ),
-                location: e.location.clone(),
+                data: format!("Uncaught exception: {:?}", variable_to_string(&e.data)),
+                location: e.location,
             }),
         },
     )?;
@@ -86,12 +77,11 @@ fn interpret_string<'a>(
     file_path: Option<&str>,
     env: Gc<'a, Environment<'a>>,
     no_std: bool,
-) -> Result<Value<'a>, LocatedControlFlow<'a>> {
-    let parsed = parse_string(input, file_path).map_err(|_| {
+) -> Result<Value<'a>, LocatedError<'a>> {
+    let mut parsed = parse_string(input, file_path).map_err(|_| {
         import_error::<()>(mc, root, "Failed to parse input", &env, span).unwrap_err()
     })?;
-    let add_file_info = |extra| Location::new(extra, module_path.clone());
-    let parsed = parsed.map_extra(&add_file_info);
+    parsed.set_module(&module_path);
     interpret(mc, root, parsed, module_path, no_std)
 }
 
@@ -181,12 +171,16 @@ pub enum Kont<'a> {
         function: Option<Value<'a>>,
     },
     ReturnBarrier,
-    Assign(&'a LocatedExpression),
-    FieldAssign(Value<'a>, String),
+    Assign {
+        target: &'a LocatedExpression,
+        op: Option<&'a BinaryOp>,
+    },
+    FieldAssign(Value<'a>, Option<&'a BinaryOp>, String),
     ArrayAssign {
         value: Value<'a>,
         index: &'a LocatedExpression,
         array: Option<Value<'a>>,
+        op: Option<&'a BinaryOp>,
     },
     Set(ExecResult<'a>),
     IfElse {
@@ -222,14 +216,10 @@ impl Default for ExecResult<'_> {
     }
 }
 
-fn convert_err<'a>(val: Result<Value<'a>, LocatedControlFlow<'a>>) -> ExecResult<'a> {
+fn convert_err<'a>(val: Result<Value<'a>, LocatedError<'a>>) -> ExecResult<'a> {
     match val {
         Ok(v) => ExecResult::Value(v),
-        Err(LocatedControlFlow { data, location }) => match data {
-            ControlFlow::Error(e) => ExecResult::Error(e, location),
-            ControlFlow::Break => ExecResult::Break(location),
-            ControlFlow::Continue => ExecResult::Continue(location),
-        },
+        Err(LocatedError { data, location }) => ExecResult::Error(data, location),
     }
 }
 
@@ -239,7 +229,7 @@ pub fn interpret<'a>(
     expr: LocatedExpression,
     module_path: String,
     no_std: bool,
-) -> Result<Value<'a>, LocatedControlFlow<'a>> {
+) -> Result<Value<'a>, LocatedError<'a>> {
     let env = Gc::new(mc, Environment::new_global(mc, module_path.clone()));
     define_globals(mc, root, env, no_std);
     let expr = Gc::new(mc, StaticCollect(expr));
@@ -249,45 +239,33 @@ pub fn interpret<'a>(
     };
     let mut modules = root.modules.borrow_mut(mc);
     modules.insert(module_path.clone(), module_root);
-    let do_processing = || {
-        let mut stack: Vec<EnvFrame<'a>> = vec![Frame::eval(expr.as_ref(), env)];
-        let mut last: ExecResult<'a> = ExecResult::Value(Value::Null);
-        while let Some(frame) = stack.pop() {
-            match frame.frame {
-                Frame::Eval(expr) => {
-                    interpret_frame_eval(mc, root, &mut stack, &mut last, &expr, frame.env);
-                }
-                Frame::Kont(kont) => {
-                    interpret_kont_eval(
-                        mc,
-                        root,
-                        &mut stack,
-                        &mut last,
-                        kont.data,
-                        kont.location,
-                        frame.env,
-                    );
-                }
+    let mut stack: Vec<EnvFrame<'a>> = vec![Frame::eval(expr.as_ref(), env)];
+    let mut last: ExecResult<'a> = ExecResult::Value(Value::Null);
+    while let Some(frame) = stack.pop() {
+        match frame.frame {
+            Frame::Eval(expr) => {
+                interpret_frame_eval(mc, root, &mut stack, &mut last, &expr, frame.env);
+            }
+            Frame::Kont(kont) => {
+                interpret_frame_kont(
+                    mc,
+                    root,
+                    &mut stack,
+                    &mut last,
+                    kont.data,
+                    kont.location,
+                    frame.env,
+                );
             }
         }
-        match last {
-            ExecResult::Value(v) => Ok(v),
-            ExecResult::Return(v) => Ok(v),
-            ExecResult::Error(v, location) => Err(LocatedControlFlow {
-                data: ControlFlow::Error(v),
-                location,
-            }),
-            ExecResult::Break(location) => Err(LocatedControlFlow {
-                data: ControlFlow::Break,
-                location,
-            }),
-            ExecResult::Continue(location) => Err(LocatedControlFlow {
-                data: ControlFlow::Continue,
-                location,
-            }),
-        }
-    };
-    handle_return_control_flow(mc, root, do_processing(), &env)
+    }
+    match last {
+        ExecResult::Value(v) => Ok(v),
+        ExecResult::Return(v) => Ok(v),
+        ExecResult::Error(v, location) => Err(LocatedError { data: v, location }),
+        ExecResult::Break(location) => unhandled_control_flow(mc, root, &env, location),
+        ExecResult::Continue(location) => unhandled_control_flow(mc, root, &env, location),
+    }
 }
 
 fn interpret_frame_eval<'a>(
@@ -298,8 +276,8 @@ fn interpret_frame_eval<'a>(
     expr: &'a LocatedExpression,
     env: Gc<'a, Environment<'a>>,
 ) {
-    let location = &expr.extra;
-    match &expr.expr {
+    let location = &expr.location;
+    match &expr.data {
         Expression::Null => {
             *last = ExecResult::Value(Value::Null);
         }
@@ -329,7 +307,11 @@ fn interpret_frame_eval<'a>(
                 *last = ExecResult::Return(Value::Null);
             }
         }
-        Expression::Define(name, expr) => {
+        Expression::Define {
+            name,
+            value: expr,
+            type_hint: _,
+        } => {
             stack.push(Frame::kont(
                 Kont::Define(name.clone()),
                 env,
@@ -397,6 +379,7 @@ fn interpret_frame_eval<'a>(
                     .map(|(k, kind, v)| ((k.to_string(), kind), v))
                     .rev()
                     .collect::<Vec<_>>();
+                let class_env = Gc::new(mc, Environment::new(mc, env));
                 if let Some(parent) = parent {
                     stack.push(Frame::kont(
                         Kont::ClassLiteral {
@@ -405,10 +388,10 @@ fn interpret_frame_eval<'a>(
                             current_key: None,
                             parent: None,
                         },
-                        env.clone(),
+                        class_env,
                         location.clone(),
                     ));
-                    stack.push(Frame::eval(parent, env));
+                    stack.push(Frame::eval(parent, class_env));
                 } else {
                     let (first_key, first_entry) = entries_remaining
                         .pop()
@@ -420,10 +403,10 @@ fn interpret_frame_eval<'a>(
                             current_key: Some(first_key),
                             parent: None,
                         },
-                        env.clone(),
+                        class_env,
                         location.clone(),
                     ));
-                    stack.push(Frame::eval(first_entry, env));
+                    stack.push(Frame::eval(first_entry, class_env));
                 }
             }
         }
@@ -450,28 +433,18 @@ fn interpret_frame_eval<'a>(
                 stack.push(Frame::eval(first_expr, block_env));
             }
         }
+        Expression::Assign { target, value, op } => {
+            stack.push(Frame::kont(
+                Kont::Assign {
+                    target,
+                    op: op.as_ref(),
+                },
+                env,
+                location.clone(),
+            ));
+            stack.push(Frame::eval(value, env));
+        }
         Expression::BinaryOp { op, left, right } => {
-            if let BinaryOp::Assign = op {
-                stack.push(Frame::kont(Kont::Assign(left), env, location.clone()));
-                stack.push(Frame::eval(right, env));
-                return;
-            }
-            let op = if let BinaryOp::AddAssign
-            | BinaryOp::SubtractAssign
-            | BinaryOp::MultiplyAssign
-            | BinaryOp::DivideAssign = op
-            {
-                stack.push(Frame::kont(Kont::Assign(left), env, location.clone()));
-                match op {
-                    BinaryOp::AddAssign => &BinaryOp::Add,
-                    BinaryOp::SubtractAssign => &BinaryOp::Subtract,
-                    BinaryOp::MultiplyAssign => &BinaryOp::Multiply,
-                    BinaryOp::DivideAssign => &BinaryOp::Divide,
-                    _ => unreachable!(),
-                }
-            } else {
-                op
-            };
             stack.push(Frame::kont(
                 Kont::Binary { op, right },
                 env,
@@ -610,7 +583,7 @@ fn interpret_frame_eval<'a>(
                 stack.push(Frame::eval(condition, loop_env));
             }
         }
-        _ => unimplemented!("Expression not implemented: {:?}", expr.expr),
+        _ => unimplemented!("Expression not implemented: {:?}", expr.data),
     }
 }
 
@@ -624,7 +597,7 @@ fn maybe_take_last_value<'a>(last: &mut ExecResult<'a>) -> Option<Value<'a>> {
     Some(val)
 }
 
-fn interpret_kont_eval<'a>(
+fn interpret_frame_kont<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     stack: &mut Vec<EnvFrame<'a>>,
@@ -911,84 +884,7 @@ fn interpret_kont_eval<'a>(
                 stack.push(Frame::eval(index, env));
                 return;
             };
-
-            match array {
-                Value::Array(arr) => {
-                    let Value::Integer(i) = val else {
-                        *last = convert_err(type_error(
-                            mc,
-                            root,
-                            "Array index must be an integer",
-                            &env,
-                            &location,
-                        ));
-                        return;
-                    };
-                    let arr_ref = arr.borrow();
-                    if let Ok(index) = TryInto::<usize>::try_into(i)
-                        && index < arr_ref.len()
-                    {
-                        let value = arr_ref[index].clone();
-                        *last = ExecResult::Value(value);
-                    } else {
-                        *last =
-                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
-                        return;
-                    }
-                }
-                Value::TypedSlice {
-                    buffer,
-                    start,
-                    length,
-                    buffer_type,
-                } => {
-                    let Value::Integer(i) = val else {
-                        *last = convert_err(type_error(
-                            mc,
-                            root,
-                            "Array index must be an integer",
-                            &env,
-                            &location,
-                        ));
-                        return;
-                    };
-                    let byte_start = start * buffer_type.byte_size();
-                    let byte_end = byte_start + length * buffer_type.byte_size();
-                    let arr_ref = buffer.borrow();
-                    if let Ok(index) = TryInto::<usize>::try_into(i)
-                        && index < arr_ref.len()
-                    {
-                        let byte_offset = byte_start + index * buffer_type.byte_size();
-                        let Some(value) =
-                            buffer_type.try_read_value(&arr_ref[byte_offset..byte_end])
-                        else {
-                            *last = convert_err(type_error(
-                                mc,
-                                root,
-                                "Failed to read value from typed slice",
-                                &env,
-                                &location,
-                            ));
-                            return;
-                        };
-                        *last = ExecResult::Value(value);
-                    } else {
-                        *last =
-                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
-                        return;
-                    }
-                }
-                _ => {
-                    *last = convert_err(type_error(
-                        mc,
-                        root,
-                        "Attempted to index a non-array value",
-                        &env,
-                        &location,
-                    ));
-                    return;
-                }
-            }
+            *last = get_at_index(mc, root, env, &location, array, val);
         }
         Kont::PropertyFunctionCall {
             mut args_remaining,
@@ -1097,21 +993,41 @@ fn interpret_kont_eval<'a>(
                 call_function(mc, root, stack, last, &location, env, args, &function);
             }
         }
-        Kont::Assign(target) => {
+        Kont::Assign { target, op } => {
             let Some(value) = maybe_take_last_value(last) else {
                 return;
             };
-            match &target.expr {
+            match &target.data {
                 Expression::Ident(name) => {
-                    if env.set(mc, &name, value.clone()) {
-                        *last = ExecResult::Value(value);
+                    let result = if let Some(op) = op {
+                        let Some(left_val) = env.get(name) else {
+                            *last =
+                                convert_err(undefined_variable(mc, root, name, &env, &location));
+                            return;
+                        };
+                        let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
+                            *last = convert_err(type_error(
+                                mc,
+                                root,
+                                &format!("Invalid operand types for binary operator {:?}", op),
+                                &env,
+                                location,
+                            ));
+                            return;
+                        };
+                        result
+                    } else {
+                        value
+                    };
+                    if env.set(mc, &name, result.clone()) {
+                        *last = ExecResult::Value(result);
                     } else {
                         *last = convert_err(undefined_variable(mc, root, &name, &env, &location));
                     }
                 }
                 Expression::FieldAccess { object, field } => {
                     stack.push(Frame::kont(
-                        Kont::FieldAssign(value, field.clone()),
+                        Kont::FieldAssign(value, op, field.clone()),
                         env,
                         location.clone(),
                     ));
@@ -1123,6 +1039,7 @@ fn interpret_kont_eval<'a>(
                             value: value,
                             index,
                             array: None,
+                            op,
                         },
                         env,
                         location.clone(),
@@ -1140,44 +1057,36 @@ fn interpret_kont_eval<'a>(
                 }
             }
         }
-        Kont::FieldAssign(value, field) => {
+        Kont::FieldAssign(value, op, field) => {
             let Some(object) = maybe_take_last_value(last) else {
                 return;
             };
-            match object {
-                Value::Object(obj) => {
-                    obj.borrow_mut(mc).insert(field, value.clone());
-                    *last = ExecResult::Value(value);
-                }
-                Value::ClassInstance(obj) => {
-                    if let Some(field) = obj.borrow_mut(mc).fields.get_mut(&field) {
-                        *field = value.clone();
-                        *last = ExecResult::Value(value);
-                    } else {
-                        *last = convert_err(type_error(
-                            mc,
-                            root,
-                            &format!("Field '{}' does not exist on class instance", field),
-                            &env,
-                            &location,
-                        ));
-                    }
-                }
-                _ => {
+            let result = if let Some(op) = op {
+                let Some((left_val, _)) = get_property(root, &object, &field) else {
+                    *last = convert_err(field_access_error(mc, root, field, &env, &location));
+                    return;
+                };
+                let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
                     *last = convert_err(type_error(
                         mc,
                         root,
-                        "Attempted to assign field on non-object value",
+                        &format!("Invalid operand types for binary operator {:?}", op),
                         &env,
-                        &location,
+                        location,
                     ));
-                }
-            }
+                    return;
+                };
+                result
+            } else {
+                value
+            };
+            *last = set_property(root, mc, env, &location, object, field, result);
         }
         Kont::ArrayAssign {
             value,
             index,
             array,
+            op,
         } => {
             let Some(val) = maybe_take_last_value(last) else {
                 return;
@@ -1188,6 +1097,7 @@ fn interpret_kont_eval<'a>(
                         value,
                         index,
                         array: Some(val),
+                        op,
                     },
                     env,
                     location.clone(),
@@ -1196,82 +1106,30 @@ fn interpret_kont_eval<'a>(
                 return;
             };
 
-            match array {
-                Value::Array(arr) => {
-                    let Value::Integer(i) = val else {
-                        *last = convert_err(type_error(
-                            mc,
-                            root,
-                            "Array index must be an integer",
-                            &env,
-                            &location,
-                        ));
-                        return;
-                    };
-                    let mut arr_ref = arr.borrow_mut(mc);
-                    if let Ok(index) = TryInto::<usize>::try_into(i)
-                        && index < arr_ref.len()
-                    {
-                        arr_ref[index] = value.clone();
-                        *last = ExecResult::Value(value);
-                    } else {
-                        *last =
-                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
-                        return;
-                    }
-                }
-                Value::TypedSlice {
-                    buffer,
-                    start,
-                    length,
-                    buffer_type,
-                } => {
-                    let Value::Integer(i) = val else {
-                        *last = convert_err(type_error(
-                            mc,
-                            root,
-                            "Array index must be an integer",
-                            &env,
-                            &location,
-                        ));
-                        return;
-                    };
-                    let mut buf_ref = buffer.borrow_mut(mc);
-                    let byte_start = start * buffer_type.byte_size();
-                    let byte_end = byte_start + length * buffer_type.byte_size();
-                    if let Ok(index) = TryInto::<usize>::try_into(i)
-                        && index < buf_ref.len()
-                    {
-                        let byte_offset = byte_start + index * buffer_type.byte_size();
-                        if !buffer_type.try_write_value(&mut buf_ref[byte_offset..byte_end], &value)
-                        {
-                            *last = convert_err(type_error(
-                                mc,
-                                root,
-                                "Failed to write value to typed slice",
-                                &env,
-                                &location,
-                            ));
+            let result = if let Some(op) = op {
+                let left_val =
+                    match get_at_index(mc, root, env, &location, array.clone(), val.clone()) {
+                        ExecResult::Value(v) => v,
+                        other => {
+                            *last = other;
                             return;
                         }
-                        *last = ExecResult::Value(value);
-                    } else {
-                        *last =
-                            convert_err(array_index_out_of_bounds(mc, root, i, &env, &location));
-                        return;
-                    }
-                }
-                _ => {
+                    };
+                let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
                     *last = convert_err(type_error(
                         mc,
                         root,
-                        "Attempted to index a non-array value",
+                        &format!("Invalid operand types for binary operator {:?}", op),
                         &env,
-                        &location,
+                        location,
                     ));
                     return;
-                }
-            }
+                };
+                result
+            } else {
+                value
+            };
+            *last = set_at_index(mc, root, &location, env, val, array, result);
         }
         Kont::IfElse {
             then_branch,
@@ -1381,6 +1239,83 @@ fn interpret_kont_eval<'a>(
     }
 }
 
+fn set_at_index<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    location: &Location,
+    env: Gc<'a, Environment<'a>>,
+    index: Value<'a>,
+    array: Value<'a>,
+    result: Value<'a>,
+) -> ExecResult<'a> {
+    match array {
+        Value::Array(arr) => {
+            let Value::Integer(i) = index else {
+                return convert_err(type_error(
+                    mc,
+                    root,
+                    "Array index must be an integer",
+                    &env,
+                    location,
+                ));
+            };
+            let mut arr_ref = arr.borrow_mut(mc);
+            if let Ok(index) = TryInto::<usize>::try_into(i)
+                && index < arr_ref.len()
+            {
+                arr_ref[index] = result.clone();
+                ExecResult::Value(result)
+            } else {
+                convert_err(array_index_out_of_bounds(mc, root, i, &env, location))
+            }
+        }
+        Value::TypedSlice {
+            buffer,
+            start,
+            length,
+            buffer_type,
+        } => {
+            let Value::Integer(i) = index else {
+                return convert_err(type_error(
+                    mc,
+                    root,
+                    "Array index must be an integer",
+                    &env,
+                    location,
+                ));
+            };
+            let mut buf_ref = buffer.borrow_mut(mc);
+            let byte_start = start * buffer_type.byte_size();
+            let byte_end = byte_start + length * buffer_type.byte_size();
+            if let Ok(index) = TryInto::<usize>::try_into(i)
+                && index < buf_ref.len()
+            {
+                let byte_offset = byte_start + index * buffer_type.byte_size();
+                if buffer_type.try_write_value(&mut buf_ref[byte_offset..byte_end], &result) {
+                    ExecResult::Value(result)
+                } else {
+                    convert_err(type_error(
+                        mc,
+                        root,
+                        "Failed to write value to typed slice",
+                        &env,
+                        location,
+                    ))
+                }
+            } else {
+                convert_err(array_index_out_of_bounds(mc, root, i, &env, location))
+            }
+        }
+        _ => convert_err(type_error(
+            mc,
+            root,
+            "Attempted to index a non-array value",
+            &env,
+            location,
+        )),
+    }
+}
+
 fn call_function<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
@@ -1443,7 +1378,7 @@ fn import_module<'a>(
     module_relative_path: &str,
     span: &Location,
     env: Gc<'a, Environment<'a>>,
-) -> Result<Value<'a>, LocatedControlFlow<'a>> {
+) -> Result<Value<'a>, LocatedError<'a>> {
     let parts = module_relative_path.split('/').collect::<Vec<_>>();
     let mut module_path = env
         .module_path
@@ -1522,27 +1457,6 @@ fn import_module<'a>(
     state.insert(module_path, Some(val.clone()));
 
     Ok(val)
-}
-
-fn handle_return_control_flow<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    res: Result<Value<'a>, LocatedControlFlow<'a>>,
-    env: &Environment<'a>,
-) -> Result<Value<'a>, LocatedControlFlow<'a>> {
-    match res {
-        Ok(v) => Ok(v),
-        Err(LocatedControlFlow {
-            data,
-            location: span,
-        }) => match data {
-            ControlFlow::Error(e) => Err(Located {
-                data: ControlFlow::Error(e),
-                location: span,
-            }),
-            _ => unhandled_control_flow(mc, root, &env, span),
-        },
-    }
 }
 
 fn interpret_short_circuit<'a>(
@@ -1765,4 +1679,118 @@ fn create_class_instance<'a>(mc: &Mutation<'a>, class: GcRefLock<'a, ClassValue<
         mc,
         RefLock::new(ClassInstanceValue { class, fields }),
     ))
+}
+
+fn get_at_index<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    env: Gc<'a, Environment<'a>>,
+    location: &Location,
+    array: Value<'a>,
+    index: Value<'a>,
+) -> ExecResult<'a> {
+    match array {
+        Value::Array(arr) => {
+            let Value::Integer(i) = index else {
+                return convert_err(type_error(
+                    mc,
+                    root,
+                    "Array index must be an integer",
+                    &env,
+                    location,
+                ));
+            };
+            let arr_ref = arr.borrow();
+            if let Ok(index) = TryInto::<usize>::try_into(i)
+                && index < arr_ref.len()
+            {
+                let value = arr_ref[index].clone();
+                ExecResult::Value(value)
+            } else {
+                convert_err(array_index_out_of_bounds(mc, root, i, &env, location))
+            }
+        }
+        Value::TypedSlice {
+            buffer,
+            start,
+            length,
+            buffer_type,
+        } => {
+            let Value::Integer(i) = index else {
+                return convert_err(type_error(
+                    mc,
+                    root,
+                    "Array index must be an integer",
+                    &env,
+                    location,
+                ));
+            };
+            let byte_start = start * buffer_type.byte_size();
+            let byte_end = byte_start + length * buffer_type.byte_size();
+            let arr_ref = buffer.borrow();
+            if let Ok(index) = TryInto::<usize>::try_into(i)
+                && index < arr_ref.len()
+            {
+                let byte_offset = byte_start + index * buffer_type.byte_size();
+                let Some(value) = buffer_type.try_read_value(&arr_ref[byte_offset..byte_end])
+                else {
+                    return convert_err(type_error(
+                        mc,
+                        root,
+                        "Failed to read value from typed slice",
+                        &env,
+                        &location,
+                    ));
+                };
+                ExecResult::Value(value)
+            } else {
+                convert_err(array_index_out_of_bounds(mc, root, i, &env, &location))
+            }
+        }
+        _ => convert_err(type_error(
+            mc,
+            root,
+            "Attempted to index a non-array value",
+            &env,
+            &location,
+        )),
+    }
+}
+
+fn set_property<'a>(
+    root: &MyRoot<'a>,
+    mc: &Mutation<'a>,
+    env: Gc<'a, Environment<'a>>,
+    location: &Location,
+    object: Value<'a>,
+    field: String,
+    result: Value<'a>,
+) -> ExecResult<'a> {
+    match object {
+        Value::Object(obj) => {
+            obj.borrow_mut(mc).insert(field, result.clone());
+            ExecResult::Value(result)
+        }
+        Value::ClassInstance(obj) => {
+            if let Some(field) = obj.borrow_mut(mc).fields.get_mut(&field) {
+                *field = result.clone();
+                ExecResult::Value(result)
+            } else {
+                convert_err(type_error(
+                    mc,
+                    root,
+                    &format!("Field '{}' does not exist on class instance", field),
+                    &env,
+                    &location,
+                ))
+            }
+        }
+        _ => convert_err(type_error(
+            mc,
+            root,
+            "Attempted to assign field on non-object value",
+            &env,
+            &location,
+        )),
+    }
 }

@@ -5,9 +5,9 @@ use gc_arena::{Gc, Mutation, lock::RefLock};
 use crate::{
     gc_interpreter::{
         Environment, MyRoot, Value,
-        value::{ClassInstanceValue, ControlFlow, LocatedControlFlow, StringVariant},
+        value::{ClassInstanceValue, LocatedError, StringVariant},
     },
-    location::{HasLocation, Located},
+    location::HasLocation,
 };
 
 fn make_exception<'a>(
@@ -44,10 +44,10 @@ pub fn runtime_error<'a, T>(
     variant: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     let exception = make_exception(mc, root, msg, variant, env);
-    Err(Located {
-        data: ControlFlow::Error(exception),
+    Err(LocatedError {
+        data: exception,
         location: expr.location().clone(),
     })
 }
@@ -58,7 +58,7 @@ pub fn type_error<'a, T>(
     msg: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(mc, root, msg, "TypeError", env, expr)
 }
 
@@ -68,7 +68,7 @@ pub fn array_index_out_of_bounds<'a, T>(
     index: i64,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(
         mc,
         root,
@@ -85,7 +85,7 @@ pub fn function_argument_error<'a, T>(
     msg: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(mc, root, msg, "FunctionArgumentError", env, expr)
 }
 
@@ -95,7 +95,7 @@ pub fn io_error<'a, T>(
     msg: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(mc, root, msg, "IOError", env, expr)
 }
 
@@ -104,7 +104,7 @@ pub fn unhandled_control_flow<'a, T>(
     root: &MyRoot<'a>,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(
         mc,
         root,
@@ -121,7 +121,7 @@ pub fn field_access_error<'a, T>(
     field: String,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(
         mc,
         root,
@@ -138,7 +138,7 @@ pub fn undefined_variable<'a, T>(
     name: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(
         mc,
         root,
@@ -155,7 +155,7 @@ pub fn duplicate_variable_definition<'a, T>(
     name: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(
         mc,
         root,
@@ -172,6 +172,6 @@ pub fn import_error<'a, T>(
     msg: &str,
     env: &Environment<'a>,
     expr: impl HasLocation,
-) -> Result<T, LocatedControlFlow<'a>> {
+) -> Result<T, LocatedError<'a>> {
     runtime_error(mc, root, msg, "ImportError", env, expr)
 }

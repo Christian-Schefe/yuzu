@@ -1,5 +1,3 @@
-use crate::parser::Extra;
-
 #[derive(Clone, Debug)]
 pub struct Location {
     pub span: core::ops::Range<usize>,
@@ -19,6 +17,12 @@ impl Location {
 pub struct Located<T> {
     pub data: T,
     pub location: Location,
+}
+
+impl<T> Located<T> {
+    pub fn new(data: T, location: Location) -> Self {
+        Self { data, location }
+    }
 }
 
 pub trait HasLocation {
@@ -43,12 +47,6 @@ where
 {
     fn location(&self) -> &Location {
         (*self).location()
-    }
-}
-
-impl HasLocation for Extra<Location> {
-    fn location(&self) -> &Location {
-        &self.extra
     }
 }
 

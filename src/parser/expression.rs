@@ -1,84 +1,95 @@
-use std::fmt;
+use crate::{
+    location::Located,
+    parser::{BinaryOp, UnaryOp, types::TypeHint},
+};
 
-use crate::parser::{BinaryOp, UnaryOp};
+pub type LocatedExpression = Located<Expression>;
 
 #[derive(Debug, Clone)]
-pub enum Expression<T> {
+pub enum Expression {
     Number(f64),
     Integer(i64),
     Bool(bool),
     String(String),
-    ArrayLiteral(Vec<Extra<T>>),
+    ArrayLiteral(Vec<LocatedExpression>),
     FunctionLiteral {
         parameters: Vec<String>,
-        body: Box<Extra<T>>,
+        body: Box<LocatedExpression>,
     },
     ClassLiteral {
-        parent: Option<Box<Extra<T>>>,
-        properties: Vec<(String, MemberKind, Extra<T>)>,
+        parent: Option<Box<LocatedExpression>>,
+        properties: Vec<(String, MemberKind, LocatedExpression)>,
     },
-    ObjectLiteral(Vec<(String, Extra<T>)>),
+    ObjectLiteral(Vec<(String, LocatedExpression)>),
     Null,
-
+    Assign {
+        target: Box<LocatedExpression>,
+        value: Box<LocatedExpression>,
+        op: Option<BinaryOp>,
+    },
     BinaryOp {
         op: BinaryOp,
-        left: Box<Extra<T>>,
-        right: Box<Extra<T>>,
+        left: Box<LocatedExpression>,
+        right: Box<LocatedExpression>,
     },
     UnaryOp {
         op: UnaryOp,
-        expr: Box<Extra<T>>,
+        expr: Box<LocatedExpression>,
     },
 
-    Define(String, Box<Extra<T>>),
-    Block(Vec<Extra<T>>, Option<Box<Extra<T>>>),
+    Define {
+        name: String,
+        value: Box<LocatedExpression>,
+        type_hint: Option<TypeHint>,
+    },
+    Block(Vec<LocatedExpression>, Option<Box<LocatedExpression>>),
     If {
-        condition: Box<Extra<T>>,
-        then_branch: Box<Extra<T>>,
-        else_branch: Option<Box<Extra<T>>>,
+        condition: Box<LocatedExpression>,
+        then_branch: Box<LocatedExpression>,
+        else_branch: Option<Box<LocatedExpression>>,
     },
     TryCatch {
-        try_block: Box<Extra<T>>,
-        exception_prototype: Option<Box<Extra<T>>>,
+        try_block: Box<LocatedExpression>,
+        exception_prototype: Option<Box<LocatedExpression>>,
         exception_var: String,
-        catch_block: Box<Extra<T>>,
+        catch_block: Box<LocatedExpression>,
     },
     Loop {
-        init: Option<Box<Extra<T>>>,
-        condition: Box<Extra<T>>,
-        increment: Option<Box<Extra<T>>>,
-        body: Box<Extra<T>>,
+        init: Option<Box<LocatedExpression>>,
+        condition: Box<LocatedExpression>,
+        increment: Option<Box<LocatedExpression>>,
+        body: Box<LocatedExpression>,
     },
     IterLoop {
         item: String,
-        iterable: Box<Extra<T>>,
-        body: Box<Extra<T>>,
+        iterable: Box<LocatedExpression>,
+        body: Box<LocatedExpression>,
     },
     Ident(String),
     ArrayIndex {
-        array: Box<Extra<T>>,
-        index: Box<Extra<T>>,
+        array: Box<LocatedExpression>,
+        index: Box<LocatedExpression>,
     },
     FieldAccess {
-        object: Box<Extra<T>>,
+        object: Box<LocatedExpression>,
         field: String,
     },
     FunctionCall {
-        function: Box<Extra<T>>,
-        arguments: Vec<Extra<T>>,
+        function: Box<LocatedExpression>,
+        arguments: Vec<LocatedExpression>,
     },
     PropertyFunctionCall {
-        object: Box<Extra<T>>,
+        object: Box<LocatedExpression>,
         function: String,
-        arguments: Vec<Extra<T>>,
+        arguments: Vec<LocatedExpression>,
     },
     Break,
     Continue,
-    Return(Option<Box<Extra<T>>>),
-    Raise(Box<Extra<T>>),
+    Return(Option<Box<LocatedExpression>>),
+    Raise(Box<LocatedExpression>),
     New {
-        expr: Box<Extra<T>>,
-        arguments: Vec<Extra<T>>,
+        expr: Box<LocatedExpression>,
+        arguments: Vec<LocatedExpression>,
     },
 }
 
@@ -91,311 +102,149 @@ pub enum MemberKind {
     Constructor,
 }
 
-impl<T> Extra<T> {
-    pub fn map_extra<K>(self, f: &impl Fn(T) -> K) -> Extra<K> {
-        Extra {
-            expr: match self.expr {
-                Expression::Number(n) => Expression::Number(n),
-                Expression::Integer(i) => Expression::Integer(i),
-                Expression::Bool(b) => Expression::Bool(b),
-                Expression::String(s) => Expression::String(s),
-                Expression::ArrayLiteral(elements) => {
-                    Expression::ArrayLiteral(elements.into_iter().map(|e| e.map_extra(f)).collect())
-                }
-                Expression::ObjectLiteral(fields) => Expression::ObjectLiteral(
-                    fields
-                        .into_iter()
-                        .map(|(k, v)| (k, v.map_extra(f)))
-                        .collect(),
-                ),
-                Expression::FunctionLiteral { parameters, body } => Expression::FunctionLiteral {
-                    parameters,
-                    body: Box::new(body.map_extra(f)),
-                },
-                Expression::ClassLiteral {
-                    parent: superclass,
-                    properties,
-                } => Expression::ClassLiteral {
-                    parent: superclass.map(|sc| Box::new(sc.map_extra(f))),
-                    properties: properties
-                        .into_iter()
-                        .map(|(name, member_kind, expr)| (name, member_kind, expr.map_extra(f)))
-                        .collect(),
-                },
-                Expression::Null => Expression::Null,
-                Expression::BinaryOp { op, left, right } => Expression::BinaryOp {
-                    op,
-                    left: Box::new(left.map_extra(f)),
-                    right: Box::new(right.map_extra(f)),
-                },
-                Expression::UnaryOp { op, expr } => Expression::UnaryOp {
-                    op,
-                    expr: Box::new(expr.map_extra(f)),
-                },
-                Expression::Define(name, value) => {
-                    Expression::Define(name, Box::new(value.map_extra(f)))
-                }
-                Expression::Block(exprs, ret) => Expression::Block(
-                    exprs.into_iter().map(|e| e.map_extra(f)).collect(),
-                    ret.map(|r| Box::new(r.map_extra(f))),
-                ),
-                Expression::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                } => Expression::If {
-                    condition: Box::new(condition.map_extra(f)),
-                    then_branch: Box::new(then_branch.map_extra(f)),
-                    else_branch: else_branch.map(|eb| Box::new(eb.map_extra(f))),
-                },
-                Expression::TryCatch {
-                    try_block,
-                    exception_prototype,
-                    exception_var,
-                    catch_block,
-                } => Expression::TryCatch {
-                    try_block: Box::new(try_block.map_extra(f)),
-                    exception_prototype: exception_prototype.map(|ep| Box::new(ep.map_extra(f))),
-                    exception_var,
-                    catch_block: Box::new(catch_block.map_extra(f)),
-                },
-                Expression::Loop {
-                    init,
-                    condition,
-                    increment,
-                    body,
-                } => Expression::Loop {
-                    init: init.map(|i| Box::new(i.map_extra(f))),
-                    condition: Box::new(condition.map_extra(f)),
-                    increment: increment.map(|inc| Box::new(inc.map_extra(f))),
-                    body: Box::new(body.map_extra(f)),
-                },
-                Expression::IterLoop {
-                    item,
-                    iterable,
-                    body,
-                } => Expression::IterLoop {
-                    item,
-                    iterable: Box::new(iterable.map_extra(f)),
-                    body: Box::new(body.map_extra(f)),
-                },
-                Expression::Ident(name) => Expression::Ident(name),
-                Expression::ArrayIndex { array, index } => Expression::ArrayIndex {
-                    array: Box::new(array.map_extra(f)),
-                    index: Box::new(index.map_extra(f)),
-                },
-                Expression::FieldAccess { object, field } => Expression::FieldAccess {
-                    object: Box::new(object.map_extra(f)),
-                    field,
-                },
-                Expression::FunctionCall {
-                    function,
-                    arguments,
-                } => Expression::FunctionCall {
-                    function: Box::new(function.map_extra(f)),
-                    arguments: arguments.into_iter().map(|arg| arg.map_extra(f)).collect(),
-                },
-                Expression::PropertyFunctionCall {
-                    object,
-                    function,
-                    arguments,
-                } => Expression::PropertyFunctionCall {
-                    object: Box::new(object.map_extra(f)),
-                    function,
-                    arguments: arguments.into_iter().map(|arg| arg.map_extra(f)).collect(),
-                },
-                Expression::Break => Expression::Break,
-                Expression::Continue => Expression::Continue,
-                Expression::Return(expr) => {
-                    Expression::Return(expr.map(|e| Box::new(e.map_extra(f))))
-                }
-                Expression::Raise(expr) => Expression::Raise(Box::new(expr.map_extra(f))),
-                Expression::New { expr, arguments } => Expression::New {
-                    expr: Box::new(expr.map_extra(f)),
-                    arguments: arguments.into_iter().map(|arg| arg.map_extra(f)).collect(),
-                },
-            },
-            extra: f(self.extra),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ExtraVal<T, K> {
-    pub expr: K,
-    pub extra: T,
-}
-
-pub type Extra<T> = ExtraVal<T, Expression<T>>;
-
-impl<T> fmt::Display for Expression<Extra<T>>
-where
-    T: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Number(n) => write!(f, "Number({})", n),
-            Self::Integer(i) => write!(f, "Integer({})", i),
-            Self::Bool(b) => write!(f, "Bool({})", b),
-            Self::String(s) => write!(f, "String({:?})", s),
-            Self::ArrayLiteral(elements) => {
-                write!(f, "ArrayLiteral([")?;
-                for elem in elements {
-                    write!(f, "{}, ", elem.expr)?;
-                }
-                write!(f, "])")
+impl LocatedExpression {
+    pub fn set_module(&mut self, module_path: &str) {
+        self.location.module = module_path.to_string();
+        match &mut self.data {
+            Expression::Number(_) => {}
+            Expression::Integer(_) => {}
+            Expression::Bool(_) => {}
+            Expression::String(_) => {}
+            Expression::ArrayLiteral(elements) => {
+                elements.iter_mut().for_each(|e| e.set_module(module_path))
             }
-            Self::ObjectLiteral(fields) => {
-                write!(f, "ObjectLiteral({{")?;
-                for (key, value) in fields {
-                    write!(f, "{}: {}, ", key, value.expr)?;
-                }
-                write!(f, "}})")
-            }
-            Self::FunctionLiteral { parameters, body } => {
-                write!(f, "FunctionLiteral(")?;
-                write!(f, "params: [")?;
-                for param in parameters {
-                    write!(f, "{}, ", param)?;
-                }
-                write!(f, "], body: {})", body.expr)
-            }
-            Self::ClassLiteral {
-                properties,
+            Expression::ObjectLiteral(fields) => fields
+                .iter_mut()
+                .for_each(|(_, v)| v.set_module(module_path)),
+
+            Expression::FunctionLiteral {
+                body,
+                parameters: _,
+            } => body.set_module(module_path),
+            Expression::ClassLiteral {
                 parent: superclass,
+                properties,
             } => {
-                write!(
-                    f,
-                    "PrototypeLiteral(superclass: {:?}, properties: [",
-                    superclass
-                )?;
-                for property in properties {
-                    write!(
-                        f,
-                        "{} ({:?}): {}, ",
-                        property.0, property.1, property.2.expr
-                    )?;
+                if let Some(superclass) = superclass {
+                    superclass.set_module(module_path);
                 }
-                write!(f, "])")
+                properties
+                    .iter_mut()
+                    .for_each(|(_, _, expr)| expr.set_module(module_path))
             }
-            Self::Null => write!(f, "Null"),
-            Self::BinaryOp { op, left, right } => {
-                write!(f, "BinaryOp({}, {}, {})", op, left.expr, right.expr)
+            Expression::Null => {}
+            Expression::Assign {
+                target,
+                value,
+                op: _,
+            } => {
+                target.set_module(module_path);
+                value.set_module(module_path);
             }
-            Self::UnaryOp { op, expr } => write!(f, "UnaryOp({}, {})", op, expr.expr),
-            Self::Define(name, value) => write!(f, "Define({}, {})", name, value.expr),
-            Self::Block(exprs, ret) => {
-                write!(f, "Block(")?;
-                for expr in exprs {
-                    write!(f, "{};", expr.expr)?;
-                }
+            Expression::BinaryOp { op: _, left, right } => {
+                left.set_module(module_path);
+                right.set_module(module_path);
+            }
+            Expression::UnaryOp { op: _, expr } => expr.set_module(module_path),
+            Expression::Define {
+                name: _,
+                value,
+                type_hint: _,
+            } => {
+                value.set_module(module_path);
+            }
+            Expression::Block(exprs, ret) => {
+                exprs.iter_mut().for_each(|e| e.set_module(module_path));
                 if let Some(ret) = ret {
-                    write!(f, "{}", ret.expr)?;
+                    ret.set_module(module_path);
                 }
-                write!(f, ")")
             }
-            Self::If {
+            Expression::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
-                write!(f, "If({}, {}, ", condition.expr, then_branch.expr)?;
+                condition.set_module(module_path);
+                then_branch.set_module(module_path);
                 if let Some(else_branch) = else_branch {
-                    write!(f, "{})", else_branch.expr)
-                } else {
-                    write!(f, "None)")
+                    else_branch.set_module(module_path);
                 }
             }
-            Self::TryCatch {
+            Expression::TryCatch {
                 try_block,
                 exception_prototype,
-                exception_var,
+                exception_var: _,
                 catch_block,
             } => {
-                write!(
-                    f,
-                    "TryCatch(try: {}, exception_prototype: {:?}, exception_var: {}, catch: {})",
-                    try_block.expr,
-                    exception_prototype.as_ref().map(|ep| &ep.expr),
-                    exception_var,
-                    catch_block.expr
-                )
+                try_block.set_module(module_path);
+                if let Some(exception_prototype) = exception_prototype {
+                    exception_prototype.set_module(module_path);
+                }
+                catch_block.set_module(module_path);
             }
-            Self::Loop {
+            Expression::Loop {
                 init,
                 condition,
                 increment,
                 body,
             } => {
-                write!(f, "Loop(")?;
                 if let Some(init) = init {
-                    write!(f, "init: {}, ", init.expr)?;
-                } else {
-                    write!(f, "init: None, ")?;
+                    init.set_module(module_path);
                 }
-                write!(f, "condition: {}, ", condition.expr)?;
+                condition.set_module(module_path);
                 if let Some(increment) = increment {
-                    write!(f, "increment: {}, ", increment.expr)?;
-                } else {
-                    write!(f, "increment: None, ")?;
+                    increment.set_module(module_path);
                 }
-                write!(f, "body: {})", body.expr)
+                body.set_module(module_path);
             }
-            Self::IterLoop {
-                item,
+            Expression::IterLoop {
+                item: _,
                 iterable,
                 body,
             } => {
-                write!(
-                    f,
-                    "IterLoop(item: {}, iterable: {}, body: {})",
-                    item, iterable.expr, body.expr
-                )
+                iterable.set_module(module_path);
+                body.set_module(module_path);
             }
-            Self::Ident(name) => write!(f, "Ident({})", name),
-            Self::ArrayIndex { array, index } => {
-                write!(f, "ArrayIndex({}, {})", array.expr, index.expr)
+            Expression::Ident(_) => {}
+            Expression::ArrayIndex { array, index } => {
+                array.set_module(module_path);
+                index.set_module(module_path);
             }
-            Self::FieldAccess { object, field } => {
-                write!(f, "FieldAccess({}, {})", object.expr, field)
+            Expression::FieldAccess { object, field: _ } => {
+                object.set_module(module_path);
             }
-            Self::FunctionCall {
+            Expression::FunctionCall {
                 function,
                 arguments,
             } => {
-                write!(f, "FunctionCall({}, [", function.expr)?;
-                for arg in arguments {
-                    write!(f, "{}, ", arg.expr)?;
-                }
-                write!(f, "])")
+                function.set_module(module_path);
+                arguments
+                    .into_iter()
+                    .for_each(|arg| arg.set_module(module_path));
             }
-            Self::PropertyFunctionCall {
+            Expression::PropertyFunctionCall {
                 object,
-                function,
+                function: _,
                 arguments,
             } => {
-                write!(f, "PropertyFunctionCall({}, {}, [", object.expr, function)?;
-                for arg in arguments {
-                    write!(f, "{}, ", arg.expr)?;
-                }
-                write!(f, "])")
+                object.set_module(module_path);
+                arguments
+                    .into_iter()
+                    .for_each(|arg| arg.set_module(module_path));
             }
-            Self::Break => write!(f, "Break"),
-            Self::Continue => write!(f, "Continue"),
-            Self::Return(expr) => {
+            Expression::Break => {}
+            Expression::Continue => {}
+            Expression::Return(expr) => {
                 if let Some(expr) = expr {
-                    write!(f, "Return({})", expr.expr)
-                } else {
-                    write!(f, "Return(None)")
+                    expr.set_module(module_path);
                 }
             }
-            Self::Raise(expr) => write!(f, "Raise({})", expr.expr),
-            Self::New { expr, arguments } => {
-                write!(f, "New({}, [", expr.expr)?;
-                for arg in arguments {
-                    write!(f, "{}, ", arg.expr)?;
-                }
-                write!(f, "])")
+            Expression::Raise(expr) => expr.set_module(module_path),
+            Expression::New { expr, arguments } => {
+                expr.set_module(module_path);
+                arguments
+                    .into_iter()
+                    .for_each(|arg| arg.set_module(module_path));
             }
         }
     }
