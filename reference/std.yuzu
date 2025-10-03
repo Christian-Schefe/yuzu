@@ -113,6 +113,10 @@ class File {
     }
 }
 
+class TypedSlice {
+    fn iter() new IndexIterator(this);
+}
+
 return {
     Array,
     String,
@@ -120,4 +124,5 @@ return {
     MapIterator,
     Exception,
     File,
+    TypedSlice,
 };

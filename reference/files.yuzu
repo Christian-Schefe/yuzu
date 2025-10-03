@@ -45,3 +45,9 @@ let str: string = "test";
 let union: string | number = "union";
 union = 42;
 bool = false && print("short-circuit");
+
+print(TypedSlice);
+let arr = [1, 2, 3];
+for (i in array) print(i);
+
+print("hi");

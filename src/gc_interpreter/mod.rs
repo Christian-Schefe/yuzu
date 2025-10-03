@@ -193,6 +193,13 @@ pub enum Kont<'a> {
         increment: Option<&'a LocatedExpression>,
         state: LoopState,
     },
+    TryCatch {
+        exception_prototype: Option<Value<'a>>,
+        has_prototype: bool,
+        try_block: &'a LocatedExpression,
+        exception_var: String,
+        catch_block: &'a LocatedExpression,
+    },
 }
 
 pub enum LoopState {
@@ -583,7 +590,27 @@ fn interpret_frame_eval<'a>(
                 stack.push(Frame::eval(condition, loop_env));
             }
         }
-        _ => unimplemented!("Expression not implemented: {:?}", expr.data),
+        Expression::TryCatch {
+            try_block,
+            exception_prototype,
+            exception_var,
+            catch_block,
+        } => {
+            stack.push(Frame::kont(
+                Kont::TryCatch {
+                    exception_prototype: None,
+                    has_prototype: exception_prototype.is_some(),
+                    exception_var: exception_var.clone(),
+                    try_block,
+                    catch_block,
+                },
+                env,
+                location.clone(),
+            ));
+            if let Some(exception_prototype) = exception_prototype {
+                stack.push(Frame::eval(exception_prototype, env));
+            }
+        }
     }
 }
 
@@ -1167,47 +1194,38 @@ fn interpret_frame_kont<'a>(
             body,
         } => {
             let next_state = 'm: {
+                // Handle break/continue, propagate error and return upwards
                 match last {
                     ExecResult::Break(_) => {
                         *last = ExecResult::Value(Value::Null);
                         return;
                     }
-                    ExecResult::Continue(_) => break 'm LoopState::Body,
+                    ExecResult::Continue(_) => break 'm LoopState::Condition,
                     _ => {}
                 }
+                let Some(val) = maybe_take_last_value(last) else {
+                    return;
+                };
                 match state {
-                    LoopState::Init => {
-                        let Some(_) = maybe_take_last_value(last) else {
+                    LoopState::Init => LoopState::Condition,
+                    LoopState::Condition => match val {
+                        Value::Bool(true) => LoopState::Body,
+                        Value::Bool(false) => {
+                            *last = ExecResult::Value(Value::Null);
                             return;
-                        };
-                        LoopState::Condition
-                    }
-                    LoopState::Condition => {
-                        let Some(condition) = maybe_take_last_value(last) else {
-                            return;
-                        };
-                        match condition {
-                            Value::Bool(true) => LoopState::Body,
-                            Value::Bool(false) => {
-                                *last = ExecResult::Value(Value::Null);
-                                return;
-                            }
-                            _ => {
-                                *last = convert_err(type_error(
-                                    mc,
-                                    root,
-                                    "Condition in loop expression must be a boolean",
-                                    &env,
-                                    &location,
-                                ));
-                                return;
-                            }
                         }
-                    }
-                    LoopState::Body | LoopState::Increment => {
-                        let Some(_) = maybe_take_last_value(last) else {
+                        _ => {
+                            *last = convert_err(type_error(
+                                mc,
+                                root,
+                                "Condition in loop expression must be a boolean",
+                                &env,
+                                &location,
+                            ));
                             return;
-                        };
+                        }
+                    },
+                    LoopState::Body | LoopState::Increment => {
                         if let LoopState::Body = state
                             && let Some(_) = increment
                         {
@@ -1235,6 +1253,46 @@ fn interpret_frame_kont<'a>(
                 location,
             ));
             stack.push(Frame::eval(next_expr, env));
+        }
+        Kont::TryCatch {
+            has_prototype,
+            exception_prototype,
+            try_block,
+            exception_var,
+            catch_block,
+        } => {
+            if has_prototype && exception_prototype.is_none() {
+                let Some(last) = maybe_take_last_value(last) else {
+                    return;
+                };
+                stack.push(Frame::kont(
+                    Kont::TryCatch {
+                        exception_prototype: Some(last),
+                        has_prototype,
+                        exception_var: exception_var.clone(),
+                        try_block,
+                        catch_block,
+                    },
+                    env,
+                    location.clone(),
+                ));
+                stack.push(Frame::eval(try_block, env));
+                return;
+            }
+            let ExecResult::Error(exception, _) = last else {
+                return;
+            };
+            if let Some(Value::Class(c)) = exception_prototype
+                && !is_instance_of(&exception, c)
+            {
+                return;
+            }
+            let ExecResult::Error(exception, _) = std::mem::take(last) else {
+                unreachable!();
+            };
+            let catch_env = Gc::new(mc, Environment::new(mc, env));
+            catch_env.define(mc, &exception_var, exception);
+            stack.push(Frame::eval(catch_block, catch_env));
         }
     }
 }
@@ -1793,4 +1851,18 @@ fn set_property<'a>(
             &location,
         )),
     }
+}
+
+fn is_instance_of<'a>(object: &Value<'a>, class: GcRefLock<'a, ClassValue<'a>>) -> bool {
+    let Value::ClassInstance(instance) = object else {
+        return false;
+    };
+    let mut current_class = Some(instance.borrow().class);
+    while let Some(class_ref) = current_class {
+        if Gc::ptr_eq(class_ref, class) {
+            return true;
+        }
+        current_class = class_ref.borrow().parent;
+    }
+    false
 }

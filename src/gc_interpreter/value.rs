@@ -445,13 +445,42 @@ pub fn variable_to_string(var: &Value) -> String {
             FunctionValue::Builtin { .. } => format!("<builtin function>"),
         },
         Value::Class(p) => {
-            let entries = p
+            let static_fields = p
                 .borrow()
                 .static_fields
                 .iter()
                 .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let static_methods = p
+                .borrow()
+                .static_methods
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&Value::Function(*v))))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let methods = p
+                .borrow()
+                .methods
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&Value::Function(*v))))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let instance_fields = p
+                .borrow()
+                .instance_fields
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let constructor = p.borrow().constructor.map_or("none".to_string(), |c| {
+                variable_to_string(&Value::Function(c))
+            });
+            let entries = format!(
+                "static fields: {{{}}}, static methods: {{{}}}, constructor: {}, fields: {{{}}}, methods: {{{}}}",
+                static_fields, static_methods, constructor, instance_fields, methods
+            );
+
             let parent = if let Some(parent) = &p.borrow().parent {
                 format!(
                     " extends {}",

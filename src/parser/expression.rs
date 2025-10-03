@@ -60,11 +60,6 @@ pub enum Expression {
         increment: Option<Box<LocatedExpression>>,
         body: Box<LocatedExpression>,
     },
-    IterLoop {
-        item: String,
-        iterable: Box<LocatedExpression>,
-        body: Box<LocatedExpression>,
-    },
     Ident(String),
     ArrayIndex {
         array: Box<LocatedExpression>,
@@ -91,6 +86,126 @@ pub enum Expression {
         expr: Box<LocatedExpression>,
         arguments: Vec<LocatedExpression>,
     },
+}
+
+/// Desugars:
+/// ```
+/// for (item in iterable) [body]
+/// ```
+/// into:
+/// ```
+/// {
+///     let $iterable = iterable.iter();
+///     let $item = $iterable.next();
+///     while ($item != null) {
+///         let item = $item.value;
+///         [body]
+///         $item = $iterable.next();
+///     }
+/// }
+/// ```
+pub fn desugar_iter_loop(
+    item: String,
+    iterable: LocatedExpression,
+    body: LocatedExpression,
+) -> Expression {
+    let get_iterable_call = LocatedExpression::new(
+        Expression::PropertyFunctionCall {
+            object: Box::new(iterable.clone()),
+            function: "iter".to_string(),
+            arguments: vec![],
+        },
+        iterable.location.clone(),
+    );
+    let iter_init = LocatedExpression::new(
+        Expression::Define {
+            name: "$iterable".to_string(),
+            value: Box::new(get_iterable_call),
+            type_hint: None,
+        },
+        iterable.location.clone(),
+    );
+
+    let get_item_call = LocatedExpression::new(
+        Expression::PropertyFunctionCall {
+            object: Box::new(LocatedExpression::new(
+                Expression::Ident("$iterable".to_string()),
+                iterable.location.clone(),
+            )),
+            function: "next".to_string(),
+            arguments: vec![],
+        },
+        iterable.location.clone(),
+    );
+    let outer_item_init = LocatedExpression::new(
+        Expression::Define {
+            name: "$item".to_string(),
+            value: Box::new(get_item_call.clone()),
+            type_hint: None,
+        },
+        iterable.location.clone(),
+    );
+
+    let condition = LocatedExpression::new(
+        Expression::BinaryOp {
+            op: BinaryOp::NotEqual,
+            left: Box::new(LocatedExpression::new(
+                Expression::Ident("$item".to_string()),
+                iterable.location.clone(),
+            )),
+            right: Box::new(LocatedExpression::new(
+                Expression::Null,
+                iterable.location.clone(),
+            )),
+        },
+        iterable.location.clone(),
+    );
+
+    let get_inner_item_value = LocatedExpression::new(
+        Expression::FieldAccess {
+            object: Box::new(LocatedExpression::new(
+                Expression::Ident("$item".to_string()),
+                iterable.location.clone(),
+            )),
+            field: "value".to_string(),
+        },
+        iterable.location.clone(),
+    );
+    let inner_item_init = LocatedExpression::new(
+        Expression::Define {
+            name: item.clone(),
+            value: Box::new(get_inner_item_value.clone()),
+            type_hint: None,
+        },
+        iterable.location.clone(),
+    );
+    let outer_item_update = LocatedExpression::new(
+        Expression::Assign {
+            target: Box::new(LocatedExpression::new(
+                Expression::Ident("$item".to_string()),
+                iterable.location.clone(),
+            )),
+            value: Box::new(get_item_call),
+            op: None,
+        },
+        iterable.location.clone(),
+    );
+
+    let body = LocatedExpression::new(
+        Expression::Block(vec![inner_item_init, body], None),
+        iterable.location.clone(),
+    );
+
+    let loop_expr = LocatedExpression::new(
+        Expression::Loop {
+            init: None,
+            condition: Box::new(condition),
+            increment: Some(Box::new(outer_item_update)),
+            body: Box::new(body),
+        },
+        iterable.location.clone(),
+    );
+    Expression::Block(vec![iter_init, outer_item_init, loop_expr], None)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,14 +310,6 @@ impl LocatedExpression {
                 if let Some(increment) = increment {
                     increment.set_module(module_path);
                 }
-                body.set_module(module_path);
-            }
-            Expression::IterLoop {
-                item: _,
-                iterable,
-                body,
-            } => {
-                iterable.set_module(module_path);
                 body.set_module(module_path);
             }
             Expression::Ident(_) => {}

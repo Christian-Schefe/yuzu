@@ -394,14 +394,7 @@ where
         )
         .then(expr.clone())
         .map_with(|((item, iterable), body), extra| {
-            located(
-                Expression::IterLoop {
-                    item,
-                    iterable: Box::new(iterable),
-                    body: Box::new(body),
-                },
-                extra.span(),
-            )
+            located(desugar_iter_loop(item, iterable, body), extra.span())
         });
 
     let define_class = just(Token::Class)
@@ -769,7 +762,6 @@ fn needs_semi(expr: &Expression) -> bool {
         } => needs_semi(&else_branch.as_ref().unwrap_or(then_branch).data),
         Expression::FunctionLiteral { body, .. } => needs_semi(&body.data),
         Expression::Loop { body, .. } => needs_semi(&body.data),
-        Expression::IterLoop { body, .. } => needs_semi(&body.data),
         Expression::ClassLiteral { .. } => false,
         _ => true,
     }
