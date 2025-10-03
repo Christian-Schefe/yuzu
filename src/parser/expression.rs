@@ -13,7 +13,8 @@ pub enum Expression {
     String(String),
     ArrayLiteral(Vec<LocatedExpression>),
     FunctionLiteral {
-        parameters: Vec<String>,
+        parameters: Vec<(String, Option<TypeHint>)>,
+        return_type: Option<TypeHint>,
         body: Box<LocatedExpression>,
     },
     ClassLiteral {
@@ -235,6 +236,7 @@ impl LocatedExpression {
             Expression::FunctionLiteral {
                 body,
                 parameters: _,
+                return_type: _,
             } => body.set_module(module_path),
             Expression::ClassLiteral {
                 parent: superclass,

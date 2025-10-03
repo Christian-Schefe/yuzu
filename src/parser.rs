@@ -101,6 +101,29 @@ where
         Token::Null => TypeHint::Null,
     };
 
+    let class_type = just(Token::Class)
+        .ignore_then(
+            select! { Token::Ident(name) => name.to_string() }
+                .delimited_by(just(Token::Less), just(Token::Greater)),
+        )
+        .map(TypeHint::Class);
+
+    let parenthesized = type_hint
+        .clone()
+        .delimited_by(just(Token::LParen), just(Token::RParen));
+
+    let function_type = type_hint
+        .clone()
+        .separated_by(just(Token::Comma))
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .then_ignore(just(Token::DoubleArrow))
+        .then(type_hint.clone())
+        .map(|(parameters, return_type)| TypeHint::Function {
+            parameters,
+            return_type: Box::new(return_type),
+        });
+
     let obj_type = just(Token::LBrace)
         .ignore_then(
             select! { Token::Ident(name) => name.to_string() }
@@ -113,7 +136,13 @@ where
         .then_ignore(just(Token::RBrace))
         .map(|fields| TypeHint::Object(fields.into_iter().collect::<HashMap<String, TypeHint>>()));
 
-    let basic = choice((obj_type, simple_type));
+    let basic = choice((
+        function_type,
+        parenthesized,
+        class_type,
+        obj_type,
+        simple_type,
+    ));
 
     let operators = basic.pratt((
         postfix(
@@ -233,13 +262,15 @@ where
         ));
 
     let lambda_literal = select! { Token::Ident(name) => name.to_string() }
+        .then(colon_type_hint.clone())
         .separated_by(just(Token::Comma))
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LParen), just(Token::RParen))
         .then_ignore(just(Token::DoubleArrow))
         .then(expr.clone())
         .try_map_with(|(params, body), extra| {
-            if !is_unique(&params) {
+            let param_names = params.iter().map(|(n, _)| n).collect::<Vec<_>>();
+            if !is_unique(&param_names) {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
                     "Function parameters must be unique",
@@ -248,6 +279,7 @@ where
             Ok(located(
                 Expression::FunctionLiteral {
                     parameters: params,
+                    return_type: None,
                     body: Box::new(body),
                 },
                 extra.span(),
@@ -256,7 +288,7 @@ where
 
     let define_let = just(Token::Let)
         .ignore_then(select! { Token::Ident(name) => name.to_string() })
-        .then(colon_type_hint)
+        .then(colon_type_hint.clone())
         .then_ignore(just(Token::Assign))
         .then(expr.clone())
         .map(|((name, type_hint), value)| Expression::Define {
@@ -266,32 +298,38 @@ where
         })
         .map_with(|expr, extra| located(expr, extra.span()));
 
-    let define_fn = just(Token::Fn)
-        .ignore_then(select! { Token::Ident(name) => name.to_string() })
-        .then(
-            select! { Token::Ident(name) => name.to_string() }
-                .separated_by(just(Token::Comma))
-                .collect::<Vec<_>>()
-                .delimited_by(just(Token::LParen), just(Token::RParen)),
-        )
+    let function_literal = select! { Token::Ident(name) => name.to_string() }
+        .then(colon_type_hint.clone())
+        .separated_by(just(Token::Comma))
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
         .then(expr.clone())
-        .try_map_with(|((name, params), body), extra| {
-            if !is_unique(&params) {
+        .try_map_with(|(params, body), extra| {
+            let param_names = params.iter().map(|(n, _)| n).collect::<Vec<_>>();
+            if !is_unique(&param_names) {
                 return Err(chumsky::error::Rich::custom(
                     extra.span(),
                     "Function parameters must be unique",
                 ));
             }
+            Ok(Box::new(located(
+                Expression::FunctionLiteral {
+                    parameters: params,
+                    return_type: None,
+                    body: Box::new(body),
+                },
+                extra.span(),
+            )))
+        });
+
+    let define_fn = just(Token::Fn)
+        .ignore_then(select! { Token::Ident(name) => name.to_string() })
+        .then(function_literal.clone())
+        .try_map_with(|(name, func), extra| {
             Ok(located(
                 Expression::Define {
                     name,
-                    value: Box::new(located(
-                        Expression::FunctionLiteral {
-                            parameters: params,
-                            body: Box::new(body),
-                        },
-                        extra.span(),
-                    )),
+                    value: func,
                     type_hint: None,
                 },
                 extra.span(),
@@ -299,30 +337,12 @@ where
         });
 
     let define_constructor_fn = just(Token::Constructor)
-        .ignore_then(
-            select! { Token::Ident(name) => name.to_string() }
-                .separated_by(just(Token::Comma))
-                .collect::<Vec<_>>()
-                .delimited_by(just(Token::LParen), just(Token::RParen)),
-        )
-        .then(expr.clone())
-        .try_map_with(|(params, body), extra| {
-            if !is_unique(&params) {
-                return Err(chumsky::error::Rich::custom(
-                    extra.span(),
-                    "Function parameters must be unique",
-                ));
-            }
+        .ignore_then(function_literal)
+        .try_map_with(|func, extra| {
             Ok(located(
                 Expression::Define {
                     name: "$constructor".to_string(),
-                    value: Box::new(located(
-                        Expression::FunctionLiteral {
-                            parameters: params,
-                            body: Box::new(body),
-                        },
-                        extra.span(),
-                    )),
+                    value: func,
                     type_hint: None,
                 },
                 extra.span(),
@@ -412,7 +432,7 @@ where
                         let Expression::FunctionLiteral { parameters, .. } = &mut expr.data else {
                             panic!("Expected function definition in class body")
                         };
-                        parameters.insert(0, "this".to_string());
+                        parameters.insert(0, ("this".to_string(), Some(TypeHint::This)));
                         (name, MemberKind::Method, *expr)
                     } else {
                         panic!("Expected function definition in class body")
@@ -442,7 +462,7 @@ where
                         let Expression::FunctionLiteral { parameters, .. } = &mut expr.data else {
                             panic!("Expected function definition in class body")
                         };
-                        parameters.insert(0, "this".to_string());
+                        parameters.insert(0, ("this".to_string(), Some(TypeHint::This)));
                         (name, MemberKind::Constructor, *expr)
                     } else {
                         panic!("Expected constructor definition in class body")

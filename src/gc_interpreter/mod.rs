@@ -333,11 +333,15 @@ fn interpret_frame_eval<'a>(
                 *last = convert_err(undefined_variable(mc, root, name, &env, expr));
             }
         }
-        Expression::FunctionLiteral { parameters, body } => {
+        Expression::FunctionLiteral {
+            parameters,
+            body,
+            return_type: _,
+        } => {
             *last = ExecResult::Value(Value::Function(Gc::new(
                 mc,
                 RefLock::new(FunctionValue::Function {
-                    parameters: parameters.clone(),
+                    parameters: parameters.iter().map(|(n, _)| n.clone()).collect(),
                     body: Gc::new(mc, StaticCollect(*body.clone())),
                     env,
                 }),

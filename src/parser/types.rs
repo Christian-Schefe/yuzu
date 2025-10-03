@@ -15,6 +15,7 @@ pub enum TypeHint {
         return_type: Box<TypeHint>,
     },
     ClassInstance(String),
+    This,
     Any,
     Union(Vec<TypeHint>),
 }
