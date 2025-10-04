@@ -1,5 +1,4 @@
-{
-    class Iterator {
+class Iterator {
     fn map(map) new MapIterator(this, map);
     fn collect() {
         let res = [];
@@ -119,12 +118,11 @@ class TypedSlice {
 }
 
 return {
-    Array: Array,
-    String: String,
-    IndexIterator: IndexIterator,
-    MapIterator: MapIterator,
-    Exception: Exception,
-    File: File,
-    TypedSlice: TypedSlice,
+    Array,
+    String,
+    IndexIterator,
+    MapIterator,
+    Exception,
+    File,
+    TypedSlice,
 };
-}

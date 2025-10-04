@@ -17,10 +17,13 @@ pub enum ValueType {
     ClassInstance(ClassInstanceType),
     Any,
     Union(Vec<TypeId>),
-    Unreachable(UnreachableReason),
+    Return,
+    LoopControlFlow,
 }
 
 pub type TypeId = usize;
+
+#[derive(Debug, Clone)]
 pub struct TypeArena {
     types: Vec<ValueType>,
 }
@@ -35,10 +38,10 @@ impl TypeArena {
                 ValueType::Bool,
                 ValueType::String,
                 ValueType::Any,
-                ValueType::Unreachable(UnreachableReason::Return),
-                ValueType::Unreachable(UnreachableReason::LoopControlFlow),
                 ValueType::Object(HashMap::new()),
                 ValueType::Array(5), // Any array
+                ValueType::Return,
+                ValueType::LoopControlFlow,
             ],
         }
     }
@@ -46,6 +49,17 @@ impl TypeArena {
         self.types[id].clone()
     }
     pub fn new_type(&mut self, t: ValueType) -> TypeId {
+        match t {
+            ValueType::Any => return self.type_any(),
+            ValueType::Null => return self.type_null(),
+            ValueType::Number => return self.type_number(),
+            ValueType::Integer => return self.type_integer(),
+            ValueType::Bool => return self.type_bool(),
+            ValueType::String => return self.type_string(),
+            ValueType::Return => return self.type_return(),
+            ValueType::LoopControlFlow => return self.type_loop_control_flow(),
+            _ => {}
+        }
         let id = self.types.len();
         self.types.push(t);
         id
@@ -71,27 +85,40 @@ impl TypeArena {
     pub fn type_any(&self) -> TypeId {
         5
     }
-    pub fn type_unreachable_return(&self) -> TypeId {
+    pub fn empty_object(&self) -> TypeId {
         6
     }
-    pub fn type_unreachable_loop_control_flow(&self) -> TypeId {
+    pub fn any_array(&self) -> TypeId {
         7
     }
-    pub fn empty_object(&self) -> TypeId {
+    pub fn type_return(&self) -> TypeId {
         8
     }
-    pub fn any_array(&self) -> TypeId {
+    pub fn type_loop_control_flow(&self) -> TypeId {
         9
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum UnreachableReason {
-    Return,
-    LoopControlFlow,
-}
-
 impl ValueType {
+    pub fn filter_loop_control_flow(arena: &mut TypeArena, id: TypeId) -> Option<TypeId> {
+        let v = arena.get(id);
+        match v {
+            ValueType::LoopControlFlow => None,
+            ValueType::Union(types) => {
+                let types = types
+                    .into_iter()
+                    .filter_map(|t| ValueType::filter_loop_control_flow(arena, t))
+                    .collect::<Vec<_>>();
+                if types.is_empty() {
+                    None
+                } else {
+                    let union = ValueType::union(arena, types);
+                    Some(arena.new_type(union))
+                }
+            }
+            _ => Some(id),
+        }
+    }
     pub fn from_type_hint(
         arena: &mut TypeArena,
         hint: &TypeHint,
@@ -127,10 +154,14 @@ impl ValueType {
                 let Some(class_type) = env.borrow().get(name) else {
                     return Err(TypeError::UndefinedVariable(name.clone()));
                 };
-                let ValueType::Class(_) = arena.get(class_type) else {
-                    return Err(TypeError::NotAClass);
-                };
-                class_type
+                let class = arena.get(class_type);
+                match class {
+                    ValueType::Class(_) => class_type,
+                    ValueType::Any => arena.type_any(),
+                    _ => {
+                        return Err(TypeError::NotAClass(class));
+                    }
+                }
             }
             TypeHint::Function {
                 parameters,
@@ -140,8 +171,7 @@ impl ValueType {
                     .iter()
                     .map(|p| ValueType::from_type_hint(arena, p, env.clone()))
                     .collect::<Result<Vec<_>, _>>()?;
-                let ret_type =
-                    Box::new(ValueType::from_type_hint(arena, return_type, env.clone())?);
+                let ret_type = ValueType::from_type_hint(arena, return_type, env.clone())?;
                 let val = ValueType::Function(FunctionType {
                     parameters: param_types,
                     return_type: ret_type,
@@ -152,13 +182,13 @@ impl ValueType {
                 let Some(class_type) = env.borrow().get(name) else {
                     return Err(TypeError::UndefinedVariable(name.clone()));
                 };
-                let ValueType::Class(class) = arena.get(class_type) else {
-                    return Err(TypeError::NotAClass);
+                let class = arena.get(class_type);
+                let class = match class {
+                    ValueType::Class(class) => class,
+                    ValueType::Any => return Ok(arena.type_any()),
+                    _ => return Err(TypeError::NotAClass(class)),
                 };
-                let instance = ClassInstanceType {
-                    properties: class.instance_fields.clone(),
-                    class,
-                };
+                let instance = class.get_class_instance_type();
                 let val = ValueType::ClassInstance(instance);
                 arena.new_type(val)
             }
@@ -173,10 +203,10 @@ impl ValueType {
             }
             TypeHint::This => {
                 let env_ref = env.borrow();
-                if let Some(class_type) = env_ref.in_class {
-                    class_type
+                if let Some((_, instance_type)) = env_ref.in_class {
+                    instance_type
                 } else {
-                    return Err(TypeError::NotAClass);
+                    return Err(TypeError::NotAClass(ValueType::Any));
                 }
             }
         })
@@ -185,10 +215,11 @@ impl ValueType {
         let mut flat_types = Vec::new();
         let mut flat_type_ids = Vec::new();
         for t in types {
-            if let ValueType::Any = arena.get(t) {
+            let t_val = arena.get(t);
+            if let ValueType::Any = t_val {
                 return ValueType::Any;
             }
-            match arena.get(t) {
+            match t_val {
                 ValueType::Union(inner) => {
                     for it in inner {
                         let v = arena.get(it);
@@ -227,7 +258,7 @@ pub enum TypeError {
     UndefinedVariable(String),
     Redefinition(String),
     InvalidAssignmentTarget,
-    NotAClass,
+    NotAClass(ValueType),
     FieldNotFound(String),
     NotIndexable,
     ContinueOrBreakOutsideLoop,
@@ -251,7 +282,7 @@ impl std::fmt::Display for TypeError {
             ),
             TypeError::UndefinedVariable(name) => write!(f, "Unknown identifier: {}", name),
             TypeError::InvalidAssignmentTarget => write!(f, "Invalid assignment target"),
-            TypeError::NotAClass => write!(f, "Not a class type"),
+            TypeError::NotAClass(class) => write!(f, "Not a class type: {:?}", class),
             TypeError::Redefinition(name) => write!(f, "Redefinition of variable: {}", name),
             TypeError::FieldNotFound(name) => write!(f, "Field not found: {}", name),
             TypeError::NotIndexable => write!(f, "Type is not indexable"),
@@ -272,22 +303,24 @@ pub struct ClassInstanceType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassType {
     pub instance_fields: HashMap<String, TypeId>,
-    pub constructor: Option<FunctionType>,
+    pub constructor: Option<TypeId>,
     pub static_fields: HashMap<String, TypeId>,
-    pub methods: HashMap<String, FunctionType>,
-    pub static_methods: HashMap<String, FunctionType>,
+    pub methods: HashMap<String, TypeId>,
+    pub static_methods: HashMap<String, TypeId>,
     pub parent: Option<Box<ClassType>>,
 }
 
 impl ClassType {
     pub fn get_class_instance_type(&self) -> ClassInstanceType {
         let mut properties = self.instance_fields.clone();
-        if let Some(parent) = &self.parent {
+        let mut cur = self.parent.as_ref();
+        while let Some(parent) = cur {
             for (k, v) in &parent.instance_fields {
                 if !properties.contains_key(k) {
                     properties.insert(k.clone(), v.clone());
                 }
             }
+            cur = parent.parent.as_ref();
         }
         ClassInstanceType {
             properties,
@@ -299,7 +332,7 @@ impl ClassType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionType {
     pub parameters: Vec<TypeId>,
-    pub return_type: Box<TypeId>,
+    pub return_type: TypeId,
 }
 
 #[derive(Debug)]
@@ -309,7 +342,7 @@ pub struct Environment {
     pub module_path: String,
     pub in_loop: bool,
     pub return_type: Option<TypeId>,
-    pub in_class: Option<TypeId>,
+    pub in_class: Option<(TypeId, TypeId)>,
 }
 
 impl Environment {
@@ -369,7 +402,11 @@ impl Environment {
         }
     }
 
-    pub fn new_class(parent: Rc<RefCell<Environment>>, placeholder: usize) -> Self {
+    pub fn new_class(
+        parent: Rc<RefCell<Environment>>,
+        class_placeholder: usize,
+        instance_placeholder: usize,
+    ) -> Self {
         let p_ref = parent.borrow();
         let mod_path = p_ref.module_path.clone();
         let return_type = p_ref.return_type.clone();
@@ -379,7 +416,7 @@ impl Environment {
             module_path: mod_path,
             in_loop: false,
             return_type,
-            in_class: Some(placeholder),
+            in_class: Some((class_placeholder, instance_placeholder)),
             parent: Some(parent),
         }
     }

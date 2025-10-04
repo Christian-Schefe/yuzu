@@ -19,7 +19,7 @@ pub enum Expression {
     },
     ClassLiteral {
         parent: Option<Box<LocatedExpression>>,
-        properties: Vec<(String, MemberKind, LocatedExpression)>,
+        properties: Vec<(String, MemberKind, Option<TypeHint>, LocatedExpression)>,
     },
     ObjectLiteral(Vec<(String, LocatedExpression)>),
     Null,
@@ -247,7 +247,7 @@ impl LocatedExpression {
                 }
                 properties
                     .iter_mut()
-                    .for_each(|(_, _, expr)| expr.set_module(module_path))
+                    .for_each(|(_, _, _, expr)| expr.set_module(module_path))
             }
             Expression::Null => {}
             Expression::Assign {

@@ -43,11 +43,13 @@ fn main() {
     }
     let input = String::from_utf8_lossy(&buf);
     let file_location_str = args.input.path().to_string_lossy().to_string();
+    println!("Parsing...");
     let Ok(mut parsed) = parse_string(&input, Some(&file_location_str)) else {
         std::process::exit(1);
     };
     parsed.set_module(&file_location_str);
 
+    println!("Type Checking...");
     let errors = type_checker::check_types(&parsed, "root".to_string());
     if !errors.is_empty() {
         for err in errors {

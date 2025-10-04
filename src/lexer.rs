@@ -76,6 +76,8 @@ pub enum Token<'a> {
     Star,
     #[token("/")]
     Slash,
+    #[token("%")]
+    Percent,
 
     #[token("~")]
     Tilde,
@@ -220,6 +222,7 @@ impl fmt::Display for Token<'_> {
             Self::Minus => write!(f, "-"),
             Self::Star => write!(f, "*"),
             Self::Slash => write!(f, "/"),
+            Self::Percent => write!(f, "%"),
             Self::Tilde => write!(f, "~"),
             Self::PlusAssign => write!(f, "+="),
             Self::MinusAssign => write!(f, "-="),

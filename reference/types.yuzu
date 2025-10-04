@@ -1,10 +1,70 @@
-let a: int = 5;
-let obj: any = {a: 5, extra: 10};
-let b = obj.a;
-let int_arr: int[] = [1, 2, 3];
-let c = int_arr[0];
-obj.extra;
-obj.unknown;
-b + a;
-c+c;
-5;
+// Global definitions
+{
+let x = 42;
+let y = { a: 1, b: [2, 3, 4], c: { nested: true } };
+
+fn factorial(n: int): int {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+    0
+}
+
+let makeAdder = (x) => (y) => x + y;
+
+class Counter {
+    let count = 0;
+
+    fn inc() {
+        this.count += 1;
+        return this.count;
+    }
+
+    constructor(start: int) {
+        this.count = start;
+    }
+}
+
+fn useCounter() {
+    let c = new Counter(5);
+    while (c.inc() < 10) {
+        if (c.count % 2 == 0) {
+            let obj = ({even: true, value: c.count});
+            print(obj.value);
+        } else {
+            print({odd: true, value: c.count});
+        }
+    }
+}
+
+try {
+    let adder = makeAdder(10);
+    print(adder(5));
+    useCounter();
+} catch (e) {
+    print("Caught error: " + e.message);
+}
+
+for (let i = 0; i < 3; i = i + 1) {
+    if (i == 2) break;
+    print(i);
+}
+
+for (item in [1, 2, 3, 4]) {
+    print(item);
+}
+
+fn complex_logic(a, b) {
+    let sum = (a + b) * (a - b);
+    let res = {
+        nested: {
+            deeper: {
+                compute: (x) => x * sum
+            }
+        }
+    };
+    return res.nested.deeper.compute(10);
+}
+
+let final_value = complex_logic(8, 3);
+print(final_value);
+}

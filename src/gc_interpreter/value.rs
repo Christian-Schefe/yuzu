@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Debug};
 
 use gc_arena::{
     Collect, Gc, Mutation, StaticCollect,
@@ -33,12 +33,22 @@ pub enum Value<'a> {
     },
 }
 
-#[derive(Clone, Collect, Debug)]
+#[derive(Clone, Collect)]
 #[collect(no_drop)]
 pub enum StringVariant {
     Ascii(Vec<u8>),
     Utf16(Vec<u16>),
     Utf32(Vec<char>),
+}
+
+impl Debug for StringVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StringVariant::Ascii(_) => write!(f, "Ascii({})", self.to_string()),
+            StringVariant::Utf16(_) => write!(f, "Utf16({})", self.to_string()),
+            StringVariant::Utf32(_) => write!(f, "Utf32({})", self.to_string()),
+        }
+    }
 }
 
 impl StringVariant {

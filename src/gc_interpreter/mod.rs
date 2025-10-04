@@ -387,7 +387,7 @@ fn interpret_frame_eval<'a>(
             } else {
                 let mut entries_remaining = properties
                     .iter()
-                    .map(|(k, kind, v)| ((k.to_string(), kind), v))
+                    .map(|(k, kind, _, v)| ((k.to_string(), kind), v))
                     .rev()
                     .collect::<Vec<_>>();
                 let class_env = Gc::new(mc, Environment::new(mc, env));
@@ -613,6 +613,8 @@ fn interpret_frame_eval<'a>(
             ));
             if let Some(exception_prototype) = exception_prototype {
                 stack.push(Frame::eval(exception_prototype, env));
+            } else {
+                stack.push(Frame::eval(try_block, env));
             }
         }
     }
@@ -1569,6 +1571,11 @@ fn interpret_simple_binary_op<'a>(
         (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => Value::Integer(l / r),
         (BinaryOp::Divide, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 / r),
         (BinaryOp::Divide, Value::Number(l), Value::Integer(r)) => Value::Number(l / r as f64),
+
+        (BinaryOp::Modulo, Value::Number(l), Value::Number(r)) => Value::Number(l % r),
+        (BinaryOp::Modulo, Value::Integer(l), Value::Integer(r)) => Value::Integer(l % r),
+        (BinaryOp::Modulo, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 % r),
+        (BinaryOp::Modulo, Value::Number(l), Value::Integer(r)) => Value::Number(l % r as f64),
 
         (BinaryOp::And, Value::Bool(l), Value::Bool(r)) => Value::Bool(l && r),
         (BinaryOp::Or, Value::Bool(l), Value::Bool(r)) => Value::Bool(l || r),
