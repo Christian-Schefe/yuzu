@@ -1,0 +1,6 @@
+use root::module::test_fn;
+
+
+fn test_fn2() {
+    return test_fn() + 4;
+}

@@ -1,4 +1,5 @@
 use crate::{
+    ModulePath,
     location::Located,
     parser::{BinaryOp, UnaryOp, types::TypeHint},
 };
@@ -7,10 +8,15 @@ pub type LocatedExpression = Located<Expression>;
 
 #[derive(Debug, Clone)]
 pub enum Expression {
+    Null,
     Number(f64),
     Integer(i64),
     Bool(bool),
     String(String),
+    Ident(Identifier),
+    Break,
+    Continue,
+    Return(Option<Box<LocatedExpression>>),
     ArrayLiteral(Vec<LocatedExpression>),
     FunctionLiteral {
         parameters: Vec<(String, Option<TypeHint>)>,
@@ -18,11 +24,14 @@ pub enum Expression {
         body: Box<LocatedExpression>,
     },
     ClassLiteral {
-        parent: Option<Box<LocatedExpression>>,
-        properties: Vec<(String, MemberKind, Option<TypeHint>, LocatedExpression)>,
+        parent: Option<Identifier>,
+        fields: Vec<(String, Box<LocatedExpression>, Option<TypeHint>)>,
+        static_fields: Vec<(String, Box<LocatedExpression>, Option<TypeHint>)>,
+        constructor: Option<Box<LocatedExpression>>,
+        methods: Vec<(String, Box<LocatedExpression>)>,
+        static_methods: Vec<(String, Box<LocatedExpression>)>,
     },
     ObjectLiteral(Vec<(String, LocatedExpression)>),
-    Null,
     Assign {
         target: Box<LocatedExpression>,
         value: Box<LocatedExpression>,
@@ -61,7 +70,6 @@ pub enum Expression {
         increment: Option<Box<LocatedExpression>>,
         body: Box<LocatedExpression>,
     },
-    Ident(String),
     ArrayIndex {
         array: Box<LocatedExpression>,
         index: Box<LocatedExpression>,
@@ -79,14 +87,95 @@ pub enum Expression {
         function: String,
         arguments: Vec<LocatedExpression>,
     },
-    Break,
-    Continue,
-    Return(Option<Box<LocatedExpression>>),
     Raise(Box<LocatedExpression>),
     New {
         expr: Box<LocatedExpression>,
         arguments: Vec<LocatedExpression>,
     },
+}
+
+pub enum ClassMember {
+    Field {
+        name: String,
+        value: LocatedExpression,
+        type_hint: Option<TypeHint>,
+        is_static: bool,
+    },
+    Method {
+        name: String,
+        value: LocatedExpression,
+        is_static: bool,
+    },
+    Constructor {
+        value: LocatedExpression,
+    },
+}
+
+impl ClassMember {
+    pub fn expr(&self) -> &LocatedExpression {
+        match self {
+            ClassMember::Field { value, .. } => value,
+            ClassMember::Method { value, .. } => value,
+            ClassMember::Constructor { value } => value,
+        }
+    }
+    pub fn make_class_expr(members: Vec<ClassMember>, parent: Option<Identifier>) -> Expression {
+        let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
+        let mut methods = Vec::new();
+        let mut static_methods = Vec::new();
+        let mut constructor = None;
+        for member in members {
+            match member {
+                ClassMember::Field {
+                    name,
+                    value,
+                    type_hint,
+                    is_static,
+                } => {
+                    if is_static {
+                        static_fields.push((name, Box::new(value), type_hint));
+                    } else {
+                        fields.push((name, Box::new(value), type_hint));
+                    }
+                }
+                ClassMember::Method {
+                    name,
+                    value,
+                    is_static,
+                } => {
+                    if is_static {
+                        static_methods.push((name, Box::new(value)));
+                    } else {
+                        methods.push((name, Box::new(value)));
+                    }
+                }
+                ClassMember::Constructor { value } => {
+                    constructor = Some(Box::new(value));
+                }
+            }
+        }
+        Expression::ClassLiteral {
+            parent,
+            fields,
+            static_fields,
+            constructor,
+            methods,
+            static_methods,
+        }
+    }
+}
+
+pub struct ParsedModule {
+    pub imports: Vec<Located<ModulePath>>,
+    pub expressions: Vec<LocatedExpression>,
+    pub children: Vec<Located<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Identifier {
+    Simple(String),
+    Scoped(ModulePath, String),
 }
 
 /// Desugars:
@@ -130,7 +219,7 @@ pub fn desugar_iter_loop(
     let get_item_call = LocatedExpression::new(
         Expression::PropertyFunctionCall {
             object: Box::new(LocatedExpression::new(
-                Expression::Ident("$iterable".to_string()),
+                Expression::Ident(Identifier::Simple("$iterable".to_string())),
                 iterable.location.clone(),
             )),
             function: "next".to_string(),
@@ -151,7 +240,7 @@ pub fn desugar_iter_loop(
         Expression::BinaryOp {
             op: BinaryOp::NotEqual,
             left: Box::new(LocatedExpression::new(
-                Expression::Ident("$item".to_string()),
+                Expression::Ident(Identifier::Simple("$item".to_string())),
                 iterable.location.clone(),
             )),
             right: Box::new(LocatedExpression::new(
@@ -165,7 +254,7 @@ pub fn desugar_iter_loop(
     let get_inner_item_value = LocatedExpression::new(
         Expression::FieldAccess {
             object: Box::new(LocatedExpression::new(
-                Expression::Ident("$item".to_string()),
+                Expression::Ident(Identifier::Simple("$item".to_string())),
                 iterable.location.clone(),
             )),
             field: "value".to_string(),
@@ -183,7 +272,7 @@ pub fn desugar_iter_loop(
     let outer_item_update = LocatedExpression::new(
         Expression::Assign {
             target: Box::new(LocatedExpression::new(
-                Expression::Ident("$item".to_string()),
+                Expression::Ident(Identifier::Simple("$item".to_string())),
                 iterable.location.clone(),
             )),
             value: Box::new(get_item_call),
@@ -209,15 +298,6 @@ pub fn desugar_iter_loop(
     Expression::Block(vec![iter_init, outer_item_init, loop_expr], None)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum MemberKind {
-    Field,
-    StaticField,
-    Method,
-    StaticMethod,
-    Constructor,
-}
-
 impl LocatedExpression {
     pub fn set_module(&mut self, module_path: &str) {
         self.location.module = module_path.to_string();
@@ -239,15 +319,28 @@ impl LocatedExpression {
                 return_type: _,
             } => body.set_module(module_path),
             Expression::ClassLiteral {
-                parent: superclass,
-                properties,
+                parent: _,
+                fields,
+                static_fields,
+                constructor,
+                methods,
+                static_methods,
             } => {
-                if let Some(superclass) = superclass {
-                    superclass.set_module(module_path);
-                }
-                properties
+                fields
                     .iter_mut()
-                    .for_each(|(_, _, _, expr)| expr.set_module(module_path))
+                    .for_each(|(_, v, _)| v.set_module(module_path));
+                static_fields
+                    .iter_mut()
+                    .for_each(|(_, v, _)| v.set_module(module_path));
+                if let Some(constructor) = constructor {
+                    constructor.set_module(module_path);
+                }
+                methods
+                    .iter_mut()
+                    .for_each(|(_, v)| v.set_module(module_path));
+                static_methods
+                    .iter_mut()
+                    .for_each(|(_, v)| v.set_module(module_path));
             }
             Expression::Null => {}
             Expression::Assign {

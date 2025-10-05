@@ -1,0 +1,10 @@
+mod module;
+mod module2;
+
+use module::test_fn;
+
+fn main() {
+    print("Hello, world!");
+    print(test_fn());
+    print(module2::test_fn2());
+}

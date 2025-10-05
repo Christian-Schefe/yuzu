@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Read, vec};
+use std::{collections::HashMap, vec};
 
 use gc_arena::{
     Arena, Collect, Gc, Mutation, Rootable, StaticCollect,
@@ -6,23 +6,25 @@ use gc_arena::{
 };
 
 use crate::{
+    ParsedModuleTree,
     gc_interpreter::{
         exception::{
             array_index_out_of_bounds, duplicate_variable_definition, field_access_error,
-            import_error, type_error, undefined_variable, unhandled_control_flow,
+            type_error, undefined_variable, unhandled_control_flow,
         },
-        standard::{define_globals, root_prototypes},
+        resolver::resolve_canonical_paths,
+        standard::root_prototypes,
         value::{
-            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError,
+            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError, ModuleTree,
             StringVariant, Value, ValueClasses, variable_to_string,
         },
     },
     location::{Located, Location},
-    parse_string,
-    parser::{BinaryOp, Expression, LocatedExpression, MemberKind, UnaryOp},
+    parser::{BinaryOp, Expression, Identifier, LocatedExpression, UnaryOp},
 };
 
 mod exception;
+mod resolver;
 mod resource;
 pub mod standard;
 mod value;
@@ -30,59 +32,42 @@ mod value;
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MyRoot<'a> {
-    modules: GcRefLock<'a, HashMap<String, ModuleRoot<'a>>>,
-    module_values: GcRefLock<'a, HashMap<String, Option<Value<'a>>>>,
+    root_module: GcRefLock<'a, ModuleTree<'a>>,
     value_classes: ValueClasses<'a>,
-    std_export: GcRefLock<'a, Option<GcRefLock<'a, HashMap<String, Value<'a>>>>>,
     pwd: std::path::PathBuf,
 }
 
-#[derive(Collect)]
-#[collect(no_drop)]
-pub struct ModuleRoot<'a> {
-    env: Environment<'a>,
-    expr: Gc<'a, StaticCollect<LocatedExpression>>,
+#[derive(Copy, Clone)]
+pub struct Context<'a> {
+    pub mc: &'a Mutation<'a>,
+    pub root: &'a MyRoot<'a>,
 }
 
 pub fn interpret_global(
-    expr: LocatedExpression,
-    module_path: String,
+    tree: ParsedModuleTree,
     pwd: std::path::PathBuf,
 ) -> Result<(), Located<String>> {
-    let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| MyRoot {
-        modules: Gc::new(mc, RefLock::new(HashMap::new())),
-        module_values: Gc::new(mc, RefLock::new(HashMap::new())),
-        value_classes: root_prototypes(mc),
-        std_export: Gc::new(mc, RefLock::new(None)),
-        pwd,
+    let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
+        let root_module = ModuleTree::new(mc);
+
+        MyRoot {
+            root_module: Gc::new(mc, RefLock::new(root_module)),
+            value_classes: root_prototypes(mc),
+            pwd,
+        }
     });
-    arena.mutate(
-        |mc, root| match interpret(mc, root, expr, module_path, false) {
+    arena.mutate(|mc, root| {
+        resolve_canonical_paths(mc, root, &tree);
+        let env = root.root_module.borrow().env;
+        match interpret(mc, root, &tree.expressions[0], env) {
             Ok(_) => Ok(()),
             Err(e) => Err(Located {
                 data: format!("Uncaught exception: {:?}", variable_to_string(&e.data)),
                 location: e.location,
             }),
-        },
-    )?;
-    Ok(())
-}
-
-fn interpret_string<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    input: &str,
-    span: &Location,
-    module_path: String,
-    file_path: Option<&str>,
-    env: Gc<'a, Environment<'a>>,
-    no_std: bool,
-) -> Result<Value<'a>, LocatedError<'a>> {
-    let mut parsed = parse_string(input, file_path).map_err(|_| {
-        import_error::<()>(mc, root, "Failed to parse input", &env, span).unwrap_err()
+        }
     })?;
-    parsed.set_module(&module_path);
-    interpret(mc, root, parsed, module_path, no_std)
+    Ok(())
 }
 
 pub enum Frame<'a> {
@@ -145,12 +130,6 @@ pub enum Kont<'a> {
     ArrayLiteral {
         entries_remaining: Vec<&'a LocatedExpression>,
         elements: Vec<Value<'a>>,
-    },
-    ClassLiteral {
-        properties_remaining: Vec<((String, &'a MemberKind), &'a LocatedExpression)>,
-        map: HashMap<String, (&'a MemberKind, Value<'a>)>,
-        current_key: Option<(String, &'a MemberKind)>,
-        parent: Option<Value<'a>>,
     },
     FieldAccess {
         field: String,
@@ -233,20 +212,10 @@ fn convert_err<'a>(val: Result<Value<'a>, LocatedError<'a>>) -> ExecResult<'a> {
 pub fn interpret<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
-    expr: LocatedExpression,
-    module_path: String,
-    no_std: bool,
+    expr: &'a LocatedExpression,
+    env: Gc<'a, Environment<'a>>,
 ) -> Result<Value<'a>, LocatedError<'a>> {
-    let env = Gc::new(mc, Environment::new_global(mc, module_path.clone()));
-    define_globals(mc, root, env, no_std);
-    let expr = Gc::new(mc, StaticCollect(expr));
-    let module_root = ModuleRoot {
-        env: env.as_ref().clone(),
-        expr,
-    };
-    let mut modules = root.modules.borrow_mut(mc);
-    modules.insert(module_path.clone(), module_root);
-    let mut stack: Vec<EnvFrame<'a>> = vec![Frame::eval(expr.as_ref(), env)];
+    let mut stack: Vec<EnvFrame<'a>> = vec![Frame::eval(expr, env)];
     let mut last: ExecResult<'a> = ExecResult::Value(Value::Null);
     while let Some(frame) = stack.pop() {
         match frame.frame {
@@ -326,13 +295,7 @@ fn interpret_frame_eval<'a>(
             ));
             stack.push(Frame::eval(expr, env));
         }
-        Expression::Ident(name) => {
-            if let Some(val) = env.get(name) {
-                *last = ExecResult::Value(val);
-            } else {
-                *last = convert_err(undefined_variable(mc, root, name, &env, expr));
-            }
-        }
+        Expression::Ident(name) => *last = eval_identifier(mc, root, name, env, &expr.location),
         Expression::FunctionLiteral {
             parameters,
             body,
@@ -371,55 +334,20 @@ fn interpret_frame_eval<'a>(
                 stack.push(Frame::eval(first_entry, env));
             }
         }
-        Expression::ClassLiteral { parent, properties } => {
-            if properties.is_empty() && parent.is_none() {
-                *last = ExecResult::Value(Value::Class(Gc::new(
-                    mc,
-                    RefLock::new(ClassValue {
-                        static_fields: HashMap::new(),
-                        instance_fields: HashMap::new(),
-                        methods: HashMap::new(),
-                        static_methods: HashMap::new(),
-                        constructor: None,
-                        parent: None,
-                    }),
-                )));
-            } else {
-                let mut entries_remaining = properties
-                    .iter()
-                    .map(|(k, kind, _, v)| ((k.to_string(), kind), v))
-                    .rev()
-                    .collect::<Vec<_>>();
-                let class_env = Gc::new(mc, Environment::new(mc, env));
-                if let Some(parent) = parent {
-                    stack.push(Frame::kont(
-                        Kont::ClassLiteral {
-                            properties_remaining: entries_remaining,
-                            map: HashMap::new(),
-                            current_key: None,
-                            parent: None,
-                        },
-                        class_env,
-                        location.clone(),
-                    ));
-                    stack.push(Frame::eval(parent, class_env));
-                } else {
-                    let (first_key, first_entry) = entries_remaining
-                        .pop()
-                        .expect("Entries should never be empty");
-                    stack.push(Frame::kont(
-                        Kont::ClassLiteral {
-                            properties_remaining: entries_remaining,
-                            map: HashMap::new(),
-                            current_key: Some(first_key),
-                            parent: None,
-                        },
-                        class_env,
-                        location.clone(),
-                    ));
-                    stack.push(Frame::eval(first_entry, class_env));
-                }
-            }
+        Expression::ClassLiteral { parent, .. } => {
+            let parent_val = match parent {
+                None => None,
+                Some(p) => match eval_identifier(mc, root, p, env, &expr.location) {
+                    ExecResult::Value(v) => Some(v),
+                    other => {
+                        *last = other;
+                        return;
+                    }
+                },
+            };
+            *last = ExecResult::Value(Value::Class(make_class_literal(
+                mc, root, expr, env, parent_val,
+            )));
         }
         Expression::Block(exprs, last_expr) => {
             if exprs.is_empty() && last_expr.is_none() {
@@ -719,66 +647,6 @@ fn interpret_frame_kont<'a>(
                 *last = ExecResult::Value(Value::Object(Gc::new(mc, RefLock::new(map))));
             }
         }
-        Kont::ClassLiteral {
-            mut properties_remaining,
-            mut map,
-            current_key,
-            parent,
-        } => {
-            let Some(last_value) = maybe_take_last_value(last) else {
-                return;
-            };
-            let parent = if let Some((current_key, kind)) = current_key {
-                map.insert(current_key, (kind, last_value));
-                parent
-            } else {
-                let Value::Class(_) = last_value else {
-                    *last = convert_err(type_error(
-                        mc,
-                        root,
-                        "Superclass must be a prototype",
-                        &env,
-                        &location,
-                    ));
-                    return;
-                };
-                Some(last_value)
-            };
-
-            if let Some((next_key, next_expr)) = properties_remaining.pop() {
-                stack.push(Frame::kont(
-                    Kont::ClassLiteral {
-                        properties_remaining,
-                        map,
-                        current_key: Some(next_key),
-                        parent,
-                    },
-                    env,
-                    location,
-                ));
-                stack.push(Frame::eval(next_expr, env));
-            } else {
-                let prototype = Gc::new(
-                    mc,
-                    RefLock::new(ClassValue {
-                        static_fields: HashMap::new(),
-                        instance_fields: HashMap::new(),
-                        constructor: None,
-                        methods: HashMap::new(),
-                        static_methods: HashMap::new(),
-                        parent: parent.map(|x| {
-                            if let Value::Class(p) = x {
-                                p
-                            } else {
-                                unreachable!();
-                            }
-                        }),
-                    }),
-                );
-                map_prototype_functions(mc, map, prototype);
-                *last = ExecResult::Value(Value::Class(prototype));
-            }
-        }
         Kont::ArrayLiteral {
             mut entries_remaining,
             mut elements,
@@ -948,7 +816,7 @@ fn interpret_frame_kont<'a>(
                 ));
                 stack.push(Frame::eval(next_arg, env));
             } else {
-                let Some((func, kind)) = get_property(root, &target, &function_field) else {
+                let Some((func, is_method)) = get_property(root, &target, &function_field) else {
                     *last = convert_err(field_access_error(
                         mc,
                         root,
@@ -958,7 +826,7 @@ fn interpret_frame_kont<'a>(
                     ));
                     return;
                 };
-                if let MemberKind::Method = kind {
+                if is_method {
                     args.insert(0, target);
                 }
                 call_function(mc, root, stack, last, &location, env, args, &func);
@@ -1436,93 +1304,6 @@ fn call_function<'a>(
     }
 }
 
-fn import_module<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    module_relative_path: &str,
-    span: &Location,
-    env: Gc<'a, Environment<'a>>,
-) -> Result<Value<'a>, LocatedError<'a>> {
-    let parts = module_relative_path.split('/').collect::<Vec<_>>();
-    let mut module_path = env
-        .module_path
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-    module_path.pop();
-    for part in parts.into_iter() {
-        match part {
-            "." => continue,
-            ".." => {
-                module_path.pop();
-                continue;
-            }
-            "" => continue,
-            _ => module_path.push(part),
-        }
-    }
-    let module_path = module_path.join("/");
-
-    let prev_val = {
-        let mut state = root.module_values.borrow_mut(mc);
-        match state.get(&module_path) {
-            Some(Some(v)) => Some(v.clone()),
-            Some(None) => {
-                return import_error(
-                    mc,
-                    root,
-                    &format!("Cyclic import detected for module '{}'", module_path),
-                    &env,
-                    span,
-                );
-            }
-            None => {
-                state.insert(module_path.clone(), None);
-                None
-            }
-        }
-    };
-
-    if let Some(v) = prev_val {
-        return Ok(v);
-    }
-
-    let path = root.pwd.join(format!("{}.yuzu", module_path));
-    let mut file = match std::fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            return import_error(
-                mc,
-                root,
-                &format!("Failed to open file {}: {}", path.display(), e),
-                &env,
-                span,
-            );
-        }
-    };
-    let mut buf = String::new();
-    if let Err(e) = file.read_to_string(&mut buf) {
-        return import_error(mc, root, &format!("Failed to read file: {}", e), &env, span);
-    }
-    let file_path = path.to_string_lossy().to_string();
-
-    let val = interpret_string(
-        mc,
-        root,
-        &buf,
-        span,
-        module_path.clone(),
-        Some(&file_path),
-        env,
-        false,
-    )?;
-
-    let mut state = root.module_values.borrow_mut(mc);
-    state.insert(module_path, Some(val.clone()));
-
-    Ok(val)
-}
-
 fn interpret_short_circuit<'a>(
     op: &BinaryOp,
     left: Value<'a>,
@@ -1635,18 +1416,18 @@ fn get_property<'a>(
     root: &MyRoot<'a>,
     target: &Value<'a>,
     field: &str,
-) -> Option<(Value<'a>, MemberKind)> {
+) -> Option<(Value<'a>, bool)> {
     match target {
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             if let Some(val) = obj_ref.get(field).cloned() {
-                return Some((val, MemberKind::Field));
+                return Some((val, false));
             }
         }
         Value::ClassInstance(obj) => {
             let obj_ref = obj.borrow();
             if let Some(val) = obj_ref.fields.get(field).cloned() {
-                return Some((val, MemberKind::Field));
+                return Some((val, false));
             }
         }
         _ => {}
@@ -1657,15 +1438,15 @@ fn get_property<'a>(
     fn look_for_property_in_class<'a>(
         mut class: GcRefLock<'a, ClassValue<'a>>,
         field: &str,
-    ) -> Option<(Value<'a>, MemberKind)> {
+    ) -> Option<(Value<'a>, bool)> {
         loop {
             let cur_ref = class.borrow();
             if let Some(val) = cur_ref.static_fields.get(field).cloned() {
-                return Some((val, MemberKind::StaticField));
+                return Some((val, false));
             } else if let Some(val) = cur_ref.methods.get(field) {
-                return Some((Value::Function(*val), MemberKind::Method));
+                return Some((Value::Function(*val), true));
             } else if let Some(val) = cur_ref.static_methods.get(field) {
-                return Some((Value::Function(*val), MemberKind::StaticMethod));
+                return Some((Value::Function(*val), false));
             }
 
             if let Some(parent) = &cur_ref.parent {
@@ -1685,50 +1466,6 @@ fn get_property<'a>(
         look_for_property_in_class(root.value_classes.class, field)
     } else {
         None
-    }
-}
-
-fn map_prototype_functions<'a>(
-    mc: &Mutation<'a>,
-    map: HashMap<String, (&'a MemberKind, Value<'a>)>,
-    prototype: GcRefLock<'a, ClassValue<'a>>,
-) {
-    let mut prot_ref = prototype.borrow_mut(mc);
-    for (key, (kind, v)) in map.into_iter() {
-        match kind {
-            MemberKind::Field => {
-                prot_ref.instance_fields.insert(key, v);
-            }
-            MemberKind::StaticField => {
-                prot_ref.static_fields.insert(key, v);
-            }
-            MemberKind::Method => {
-                let Value::Function(f) = v else {
-                    //This shouldn't be possible because the parser only assigns functions as methods
-                    eprintln!("Warning: Attempted to add non-function as method to prototype");
-                    continue;
-                };
-                prot_ref.methods.insert(key.clone(), f);
-            }
-            MemberKind::StaticMethod => {
-                let Value::Function(f) = v else {
-                    //This shouldn't be possible because the parser only assigns functions as static methods
-                    eprintln!(
-                        "Warning: Attempted to add non-function as static method to prototype"
-                    );
-                    continue;
-                };
-                prot_ref.static_methods.insert(key.clone(), f);
-            }
-            MemberKind::Constructor => {
-                let Value::Function(f) = v else {
-                    //This shouldn't be possible because the parser only assigns functions as constructors
-                    eprintln!("Warning: Attempted to add non-function as constructor to prototype");
-                    continue;
-                };
-                prot_ref.constructor = Some(f);
-            }
-        }
     }
 }
 
@@ -1876,4 +1613,123 @@ fn is_instance_of<'a>(object: &Value<'a>, class: GcRefLock<'a, ClassValue<'a>>) 
         current_class = class_ref.borrow().parent;
     }
     false
+}
+
+fn expression_to_function<'a>(
+    mc: &Mutation<'a>,
+    expr: &'a LocatedExpression,
+    env: Gc<'a, Environment<'a>>,
+) -> GcRefLock<'a, FunctionValue<'a>> {
+    if let Expression::FunctionLiteral {
+        parameters,
+        return_type: _,
+        body,
+    } = &expr.data
+    {
+        let func_env = Gc::new(mc, Environment::new(mc, env));
+        Gc::new(
+            mc,
+            RefLock::new(FunctionValue::Function {
+                parameters: parameters.iter().map(|(n, _)| n.clone()).collect(),
+                body: Gc::new(mc, StaticCollect(*body.clone())),
+                env: func_env,
+            }),
+        )
+    } else {
+        panic!("Expected function literal");
+    }
+}
+
+fn make_class_literal<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    expr: &'a LocatedExpression,
+    env: Gc<'a, Environment<'a>>,
+    parent_val: Option<Value<'a>>,
+) -> GcRefLock<'a, ClassValue<'a>> {
+    match &expr.data {
+        Expression::ClassLiteral {
+            parent,
+            fields,
+            static_fields,
+            methods,
+            static_methods,
+            constructor,
+        } => {
+            let parent_class = match &parent_val {
+                Some(Value::Class(c)) => Some(c.clone()),
+                Some(other) => panic!("Parent is not a class: {:?}", other),
+                None => None,
+            };
+            let instance_fields = fields
+                .iter()
+                .map(|(name, expr, _)| (name.clone(), expression_to_function(mc, expr, env)))
+                .collect();
+            let methods = methods
+                .iter()
+                .map(|(name, expr)| (name.clone(), expression_to_function(mc, expr, env)))
+                .collect();
+            let static_methods = static_methods
+                .iter()
+                .map(|(name, expr)| (name.clone(), expression_to_function(mc, expr, env)))
+                .collect();
+            let constructor = constructor
+                .as_ref()
+                .map(|expr| expression_to_function(mc, expr, env));
+            let static_fields = static_fields
+                .iter()
+                .map(|(name, expr, _)| (name.clone(), Err(expression_to_function(mc, expr, env))))
+                .collect();
+            let class_val = Gc::new(
+                mc,
+                RefLock::new(ClassValue {
+                    parent: parent_class,
+                    instance_fields,
+                    constructor,
+                    static_fields,
+                    static_methods,
+                    methods,
+                }),
+            );
+            class_val
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn eval_identifier<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    ident: &Identifier,
+    env: Gc<'a, Environment<'a>>,
+    location: &Location,
+) -> ExecResult<'a> {
+    match ident {
+        Identifier::Simple(name) => {
+            if let Some(val) = env.get(name) {
+                ExecResult::Value(val)
+            } else {
+                convert_err(undefined_variable(mc, root, name, &env, location))
+            }
+        }
+        Identifier::Scoped(path, name) => {
+            let module_tree = ModuleTree::get(root.root_module, path);
+            if let Some(module_tree) = module_tree {
+                let env = module_tree.borrow().env;
+                if let Some(val) = env.get(name) {
+                    ExecResult::Value(val)
+                } else {
+                    convert_err(undefined_variable(mc, root, name, &env, location))
+                }
+            } else {
+                convert_err(undefined_variable(
+                    mc,
+                    root,
+                    &path.to_string(),
+                    &env,
+                    location,
+                ))
+            }
+        }
+    }
 }

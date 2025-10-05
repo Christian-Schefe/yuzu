@@ -6,6 +6,7 @@ use gc_arena::{
 };
 
 use crate::{
+    ModulePath,
     gc_interpreter::{LocatedExpression, MyRoot},
     location::{Located, Location},
 };
@@ -314,9 +315,9 @@ pub struct ClassInstanceValue<'a> {
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct ClassValue<'a> {
-    pub instance_fields: HashMap<String, Value<'a>>,
+    pub instance_fields: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub constructor: Option<GcRefLock<'a, FunctionValue<'a>>>,
-    pub static_fields: HashMap<String, Value<'a>>,
+    pub static_fields: HashMap<String, Result<Value<'a>, GcRefLock<'a, FunctionValue<'a>>>>, // value or lazy initializer
     pub methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub static_methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub parent: Option<GcRefLock<'a, ClassValue<'a>>>,
@@ -325,17 +326,15 @@ pub struct ClassValue<'a> {
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
 pub struct Environment<'a> {
-    values: GcRefLock<'a, HashMap<String, Value<'a>>>,
+    values: GcRefLock<'a, HashMap<String, (Value<'a>, bool)>>,
     parent: Option<Gc<'a, Environment<'a>>>,
-    pub module_path: String,
 }
 
 impl<'a> Environment<'a> {
-    pub fn new_global(mutation: &Mutation<'a>, module_path: String) -> Self {
+    pub fn new_global(mutation: &Mutation<'a>) -> Self {
         Self {
             values: Gc::new(mutation, RefLock::new(HashMap::new())),
             parent: None,
-            module_path,
         }
     }
 
@@ -350,13 +349,12 @@ impl<'a> Environment<'a> {
     pub fn new(mutation: &Mutation<'a>, parent: Gc<'a, Environment<'a>>) -> Self {
         Self {
             values: Gc::new(mutation, RefLock::new(HashMap::new())),
-            module_path: parent.module_path.clone(),
             parent: Some(parent),
         }
     }
 
     pub fn get(&self, name: &str) -> Option<Value<'a>> {
-        if let Some(val) = self.values.borrow().get(name) {
+        if let Some((val, _)) = self.values.borrow().get(name) {
             Some(val.clone())
         } else if let Some(parent) = &self.parent {
             parent.get(name)
@@ -366,10 +364,10 @@ impl<'a> Environment<'a> {
     }
 
     pub fn set(&self, mutation: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
-        if self.values.borrow().contains_key(name) {
+        if matches!(self.values.borrow().get(name), Some((_, false))) {
             self.values
                 .borrow_mut(mutation)
-                .insert(name.to_string(), value);
+                .insert(name.to_string(), (value, false));
             true
         } else if let Some(parent) = &self.parent {
             parent.set(mutation, name, value)
@@ -383,7 +381,16 @@ impl<'a> Environment<'a> {
         if map.contains_key(name) {
             return false;
         }
-        map.insert(name.to_string(), value);
+        map.insert(name.to_string(), (value, false));
+        true
+    }
+
+    pub fn define_const(&self, mutation: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
+        let mut map = self.values.borrow_mut(mutation);
+        if map.contains_key(name) {
+            return false;
+        }
+        map.insert(name.to_string(), (value, true));
         true
     }
 }
@@ -459,7 +466,17 @@ pub fn variable_to_string(var: &Value) -> String {
                 .borrow()
                 .static_fields
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {} {}",
+                        k,
+                        v.is_ok(),
+                        match v {
+                            Ok(val) => variable_to_string(&val),
+                            Err(func) => variable_to_string(&Value::Function(*func)),
+                        }
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let static_methods = p
@@ -480,7 +497,7 @@ pub fn variable_to_string(var: &Value) -> String {
                 .borrow()
                 .instance_fields
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&v)))
+                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&Value::Function(*v))))
                 .collect::<Vec<_>>()
                 .join(", ");
             let constructor = p.borrow().constructor.map_or("none".to_string(), |c| {
@@ -566,4 +583,49 @@ pub struct ValueClasses<'a> {
     pub resource: GcRefLock<'a, ClassValue<'a>>,
     pub buffer: GcRefLock<'a, ClassValue<'a>>,
     pub typed_slice: GcRefLock<'a, ClassValue<'a>>,
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub struct ModuleTree<'a> {
+    pub env: Gc<'a, Environment<'a>>,
+    children: HashMap<String, GcRefLock<'a, ModuleTree<'a>>>,
+}
+
+impl<'a> ModuleTree<'a> {
+    pub fn new(mc: &Mutation<'a>) -> Self {
+        Self {
+            env: Gc::new(mc, Environment::new_global(mc)),
+            children: HashMap::new(),
+        }
+    }
+    pub fn get_or_insert(
+        mc: &Mutation<'a>,
+        tree: GcRefLock<'a, ModuleTree<'a>>,
+        module_path: &ModulePath,
+    ) -> GcRefLock<'a, ModuleTree<'a>> {
+        let mut current = tree;
+        for segment in &module_path.path {
+            current = *current
+                .borrow_mut(mc)
+                .children
+                .entry(segment.clone())
+                .or_insert_with(|| Gc::new(mc, RefLock::new(ModuleTree::new(mc))))
+        }
+        current
+    }
+    pub fn get(
+        tree: GcRefLock<'a, ModuleTree<'a>>,
+        module_path: &ModulePath,
+    ) -> Option<GcRefLock<'a, ModuleTree<'a>>> {
+        let mut current = tree;
+        for segment in &module_path.path {
+            if let Some(child) = current.borrow().children.get(segment) {
+                current = *child;
+            } else {
+                return None;
+            }
+        }
+        Some(current)
+    }
 }

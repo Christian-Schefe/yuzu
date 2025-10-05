@@ -8,6 +8,7 @@ use chumsky::{
 };
 
 use crate::{
+    ModulePath,
     lexer::{LocatedToken, Token},
     location::{Located, Location},
 };
@@ -183,7 +184,7 @@ fn statements_to_block(
 }
 
 fn parser<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, LocatedExpression, extra::Err<Rich<'tokens, Token<'src>>>>
+-> impl Parser<'tokens, I, ParsedModule, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -197,7 +198,7 @@ where
         .allow_trailing()
         .collect::<Vec<_>>();
 
-    let expr = recursive(|expr| {
+    let expr = recursive(move |expr| {
         let function_literal = type_hint_list
             .clone()
             .delimited_by(just(Token::LParen), just(Token::RParen))
@@ -235,6 +236,21 @@ where
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .map_with(|expr, extra| located(expr.data, extra.span()));
 
+        let identifier = ident
+            .clone()
+            .separated_by(just(Token::DoubleColon))
+            .at_least(1)
+            .collect::<Vec<_>>()
+            .map_with(|mut parts, extra| {
+                let ident = if parts.len() == 1 {
+                    Identifier::Simple(parts[0].clone())
+                } else {
+                    let name = parts.pop().unwrap();
+                    Identifier::Scoped(ModulePath::new(parts), name)
+                };
+                located(ident, extra.span())
+            });
+
         let inline_expr = {
             let val = select! {
                 Token::Number(n) => Expression::Number(n),
@@ -242,7 +258,6 @@ where
                 Token::Bool(b) => Expression::Bool(b),
                 Token::String(s) => Expression::String(s),
                 Token::Char(c) => Expression::String(c.to_string()),
-                Token::Ident(name) => Expression::Ident(name.to_string()),
                 Token::Null => Expression::Null,
                 Token::Break => Expression::Break,
                 Token::Continue => Expression::Continue,
@@ -262,12 +277,12 @@ where
                 .allow_trailing()
                 .collect::<Vec<_>>();
 
+            let identifier_expr = identifier
+                .clone()
+                .map_with(|id, extra| located(Expression::Ident(id.data), extra.span()));
+
             let new_expr = just(Token::New)
-                .ignore_then(choice((
-                    parenthesized.clone(),
-                    select! { Token::Ident(name) => Expression::Ident(name.to_string()) }
-                        .map_with(|expr, extra| located(expr, extra.span())),
-                )))
+                .ignore_then(choice((parenthesized.clone(), identifier_expr.clone())))
                 .then(
                     expr.clone()
                         .separated_by(just(Token::Comma))
@@ -285,6 +300,7 @@ where
                 });
 
             let atom = choice((
+                identifier_expr,
                 val,
                 new_expr,
                 just(Token::Return)
@@ -605,7 +621,7 @@ where
 
         let class = just(Token::Class)
             .ignore_then(select! { Token::Ident(name) => name.to_string() })
-            .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
+            .then(just(Token::Colon).ignore_then(identifier.clone()).or_not())
             .then(
                 choice((
                     just(Token::Fn)
@@ -617,7 +633,11 @@ where
                                 panic!("Expected function definition in class body")
                             };
                             parameters.insert(0, ("this".to_string(), Some(TypeHint::This)));
-                            (name, MemberKind::Method, None, *func)
+                            ClassMember::Method {
+                                name,
+                                value: *func,
+                                is_static: false,
+                            }
                         }),
                     just(Token::Static)
                         .ignore_then(ident.clone())
@@ -626,7 +646,11 @@ where
                             let Expression::FunctionLiteral { .. } = &func.data else {
                                 panic!("Expected function definition in class body")
                             };
-                            (name, MemberKind::StaticMethod, None, *func)
+                            ClassMember::Method {
+                                name,
+                                value: *func,
+                                is_static: true,
+                            }
                         }),
                     just(Token::Constructor)
                         .ignore_then(function_literal.clone())
@@ -636,12 +660,7 @@ where
                                 panic!("Expected function definition in class body")
                             };
                             parameters.insert(0, ("this".to_string(), Some(TypeHint::This)));
-                            (
-                                "$constructor".to_string(),
-                                MemberKind::Constructor,
-                                None,
-                                *func,
-                            )
+                            ClassMember::Constructor { value: *func }
                         }),
                     let_.clone().map(|lf| {
                         if let Expression::Define {
@@ -650,7 +669,12 @@ where
                             type_hint,
                         } = lf.data
                         {
-                            (name, MemberKind::Field, type_hint, *expr)
+                            ClassMember::Field {
+                                name,
+                                value: *expr,
+                                type_hint,
+                                is_static: false,
+                            }
                         } else {
                             panic!("Expected field definition in class body")
                         }
@@ -658,7 +682,7 @@ where
                 ))
                 .then(just(Token::Semicolon).or_not())
                 .try_map_with(|(data, semicolon), extra| {
-                    if needs_semi(&data.3.data) && semicolon.is_none() {
+                    if needs_semi(&data.expr().data) && semicolon.is_none() {
                         return Err(chumsky::error::Rich::custom(
                             extra.span(),
                             "Expected ';' after expression in block",
@@ -670,15 +694,12 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
             )
-            .try_map_with(|((name, superclass), body), extra| {
+            .try_map_with(|((name, parent), body), extra| {
                 Ok(located(
                     Expression::Define {
                         name,
                         value: Box::new(located(
-                            Expression::ClassLiteral {
-                                properties: body,
-                                parent: superclass.map(Box::new),
-                            },
+                            ClassMember::make_class_expr(body, parent.map(|p| p.data)),
                             extra.span(),
                         )),
                         type_hint: None,
@@ -720,32 +741,85 @@ where
                 })
         });
 
-        choice((inline_expr, block)).boxed()
+        choice((
+            function,
+            class,
+            if_else,
+            try_catch,
+            for_loop,
+            for_iter_loop,
+            while_loop,
+            inline_expr,
+            block,
+        ))
+        .boxed()
     });
 
-    expr.then(just(Token::Semicolon).or_not())
-        .try_map_with(|(data, semicolon), extra| {
-            if needs_semi(&data.data) && semicolon.is_none() {
-                return Err(chumsky::error::Rich::custom(
-                    extra.span(),
-                    "Expected ';' after expression in block",
-                ));
-            };
-            Ok(data)
-        })
+    let module = just(Token::Mod)
+        .ignore_then(ident.clone())
+        .then_ignore(just(Token::Semicolon))
+        .map_with(|name, extra| located(name.to_string(), extra.span()));
+
+    let import = just(Token::Use)
+        .ignore_then(select! { Token::Ident(name) => name.to_string() })
+        .then_ignore(just(Token::DoubleColon))
+        .then(
+            ident
+                .clone()
+                .separated_by(just(Token::DoubleColon))
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(just(Token::Semicolon))
+        .map_with(|(root, parts), extra| {
+            let path = ModulePath::from_root(&root, parts);
+            located(path, extra.span())
+        });
+
+    module
         .repeated()
         .collect::<Vec<_>>()
-        .map_with(|exprs, extra| located(Expression::Block(exprs, None), extra.span()))
+        .then(import.repeated().collect::<Vec<_>>())
+        .then(
+            expr.then(just(Token::Semicolon).or_not())
+                .try_map_with(|(data, semicolon), extra| {
+                    if needs_semi(&data.data) && semicolon.is_none() {
+                        return Err(chumsky::error::Rich::custom(
+                            extra.span(),
+                            "Expected ';' after expression in block",
+                        ));
+                    };
+                    Ok(data)
+                })
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map(|((modules, imports), exprs)| ParsedModule {
+            expressions: exprs,
+            children: modules,
+            imports,
+        })
 }
 
 pub fn parse<'a>(
     source: &str,
+    file_path: &str,
     tokens: Vec<LocatedToken<'a>>,
-) -> Result<LocatedExpression, Vec<Rich<'a, Token<'a>>>> {
+) -> Result<ParsedModule, Vec<Rich<'a, Token<'a>>>> {
     let token_iter = tokens.into_iter().map(|lt| (lt.token, lt.span.into()));
     let token_stream =
         Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
-    parser().parse(token_stream).into_result()
+    parser().parse(token_stream).into_result().map(|mut pm| {
+        for expr in &mut pm.expressions {
+            expr.set_module(file_path);
+        }
+        for child in &mut pm.children {
+            child.location.module = file_path.to_string();
+        }
+        for import in &mut pm.imports {
+            import.location.module = file_path.to_string();
+        }
+        pm
+    })
 }
 
 fn needs_semi(expr: &Expression) -> bool {

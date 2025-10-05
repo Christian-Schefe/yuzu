@@ -1,0 +1,4 @@
+fn test_fn() {
+    print("test");
+    return 6;
+}

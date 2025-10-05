@@ -113,6 +113,9 @@ pub enum Token<'a> {
     #[token("=>")]
     DoubleArrow,
 
+    #[token("::")]
+    DoubleColon,
+
     #[token("null")]
     Null,
 
@@ -124,6 +127,11 @@ pub enum Token<'a> {
     Class,
     #[token("constructor")]
     Constructor,
+
+    #[token("use")]
+    Use,
+    #[token("mod")]
+    Mod,
 
     #[token("if")]
     If,
@@ -237,6 +245,7 @@ impl fmt::Display for Token<'_> {
             Self::NullCoalesce => write!(f, "??"),
             Self::Assign => write!(f, "="),
             Self::DoubleArrow => write!(f, "=>"),
+            Self::DoubleColon => write!(f, "::"),
             Self::Null => write!(f, "null"),
             Self::Let => write!(f, "let"),
             Self::Fn => write!(f, "fn"),
@@ -259,6 +268,8 @@ impl fmt::Display for Token<'_> {
             Self::Catch => write!(f, "catch"),
             Self::As => write!(f, "as"),
             Self::In => write!(f, "in"),
+            Self::Use => write!(f, "use"),
+            Self::Mod => write!(f, "mod"),
             Self::Constructor => write!(f, "constructor"),
             Self::Ident(s) => write!(f, "Ident({})", s),
             Self::Number(n) => write!(f, "Number({})", n),

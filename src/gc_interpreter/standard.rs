@@ -9,7 +9,6 @@ use crate::{
     gc_interpreter::{
         MyRoot, ValueClasses,
         exception::{function_argument_error, io_error, type_error},
-        import_module, interpret_string,
         resource::{FileResource, SocketResource},
         value::{
             ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError,
@@ -139,18 +138,6 @@ pub fn define_globals<'a>(
                 .join(" ");
             println!("{}", str);
             Ok(Value::Null)
-        })),
-    );
-    env.define(
-        mc,
-        "import",
-        Value::Function(make_builtin_function(mc, |mc, root, args, span, env| {
-            expect_arg_len(mc, root, &args, 1, &env, span)?;
-            let path = match &args[0] {
-                Value::String(s) => s.to_string(),
-                _ => return type_error(mc, root, "Import argument must be a string", &env, span),
-            };
-            import_module(mc, root, &path, &span, env)
         })),
     );
 
