@@ -2,3 +2,20 @@ fn test_fn() {
     print("test");
     return 6;
 }
+
+class TestClass {
+    fn method() {
+        print("method");
+        return 5;
+    }
+}
+
+class TestClass2 : TestClass {
+    constructor() {
+        print("constructor");
+    }
+    fn method() {
+        print("method");
+        return 5;
+    }
+}

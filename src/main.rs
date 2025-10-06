@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    vec,
+};
 
 use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
@@ -44,9 +47,24 @@ fn main() {
     else {
         std::process::exit(1);
     };
-    println!("Parsed successfully: {:#?}", parsed);
-    /*
-    let interpreted = gc_interpreter::interpret_global(parsed, "root".to_string(), path);
+    let Ok(parsed_std) = parse_module_tree(
+        &mut visited_files,
+        ModulePath::from_root("std"),
+        "./data/std/std.yuzu",
+    ) else {
+        std::process::exit(1);
+    };
+
+    let parsed = ParsedProgram {
+        children: HashMap::from([
+            ("root".to_string(), parsed),
+            ("std".to_string(), parsed_std),
+        ]),
+    };
+
+    let sources = parsed.get_sources();
+
+    let interpreted = gc_interpreter::interpret_global(parsed, pwd);
     if let Err(err) = interpreted {
         let err_message = err.data;
         Report::build(
@@ -61,13 +79,10 @@ fn main() {
                 .with_color(Color::Red),
         )
         .finish()
-        .eprint(ariadne::sources(vec![
-            (file_location_str.to_string(), input.as_ref()),
-            ("std".to_string(), gc_interpreter::standard::STD),
-        ]))
+        .eprint(ariadne::sources(sources))
         .unwrap();
         std::process::exit(1);
-    } */
+    }
 }
 
 fn parse_module_tree(
@@ -76,7 +91,7 @@ fn parse_module_tree(
     file_path: &str,
 ) -> Result<ParsedModuleTree, ()> {
     let contents = std::fs::read_to_string(&file_path).unwrap();
-    let pm = parse_string(&contents, file_path.to_string())?;
+    let pm = parse_string(&contents, path.to_string())?;
     let mut children = HashMap::new();
     let mut success = true;
     for child in pm.children {
@@ -122,6 +137,7 @@ fn parse_module_tree(
         children,
         expressions: pm.expressions,
         imports: pm.imports,
+        source: contents,
     })
 }
 
@@ -168,60 +184,92 @@ fn parse_string(input: &str, location: String) -> Result<ParsedModule, ()> {
 #[derive(Clone, Debug)]
 pub struct ModulePath {
     path: Vec<String>,
-    root: Option<String>,
 }
 
 impl std::fmt::Display for ModulePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let path_str = self
-            .path
-            .iter()
-            .map(|s| format!("::{}", s))
-            .collect::<String>();
-        if let Some(root) = &self.root {
-            write!(f, "{}{}", root, path_str)
-        } else {
-            write!(f, "root{}", path_str)
-        }
+        write!(f, "{}", self.path.join("::"))
     }
 }
 
 impl ModulePath {
     pub fn root() -> Self {
         Self {
-            path: Vec::new(),
-            root: None,
+            path: vec!["root".to_string()],
         }
     }
-    pub fn from_root(root: &str, path: Vec<String>) -> Self {
+    pub fn get_root(&self) -> &str {
+        &self.path[0]
+    }
+    pub fn from_root(root: &str) -> Self {
         Self {
-            path,
-            root: if root == "root" {
-                None
-            } else {
-                Some(root.to_string())
-            },
+            path: vec![root.to_string()],
         }
     }
     pub fn new(path: Vec<String>) -> Self {
-        let mut path = path.into_iter();
-        let root = path.next().unwrap();
-        let path = path.collect::<Vec<_>>();
-        Self::from_root(&root, path)
+        if path.is_empty() {
+            panic!("ModulePath cannot be empty");
+        }
+        Self { path }
     }
     pub fn push(&self, segment: String) -> Self {
         let mut new_path = self.path.clone();
         new_path.push(segment);
-        Self {
-            path: new_path,
-            root: self.root.clone(),
-        }
+        Self { path: new_path }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CanonicalPath {
+    pub path: ModulePath,
+    pub item: String,
+}
+
+impl std::fmt::Display for CanonicalPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}::{}", self.path, self.item)
+    }
+}
+
+impl CanonicalPath {
+    pub fn to_string(&self) -> String {
+        format!("{}::{}", self.path, self.item)
+    }
+}
+
+impl CanonicalPath {
+    pub fn new(path: ModulePath, item: String) -> Self {
+        Self { path, item }
     }
 }
 
 #[derive(Debug)]
 pub struct ParsedModuleTree {
-    children: std::collections::HashMap<String, ParsedModuleTree>,
+    source: String,
+    children: HashMap<String, ParsedModuleTree>,
     expressions: Vec<LocatedExpression>,
-    imports: Vec<Located<ModulePath>>,
+    imports: Vec<Located<CanonicalPath>>,
+}
+
+impl ParsedModuleTree {
+    pub fn get_sources(&self, path: &ModulePath, sources: &mut Vec<(String, String)>) {
+        sources.push((path.to_string(), self.source.clone()));
+        for (name, child) in &self.children {
+            child.get_sources(&path.push(name.clone()), sources);
+        }
+    }
+}
+
+pub struct ParsedProgram {
+    children: HashMap<String, ParsedModuleTree>,
+}
+
+impl ParsedProgram {
+    pub fn get_sources(&self) -> Vec<(String, String)> {
+        let mut sources = Vec::new();
+        for (name, child) in &self.children {
+            child.get_sources(&ModulePath::from_root(name), &mut sources);
+        }
+        sources
+    }
 }

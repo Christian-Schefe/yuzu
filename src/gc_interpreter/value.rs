@@ -331,10 +331,24 @@ pub struct Environment<'a> {
 }
 
 impl<'a> Environment<'a> {
-    pub fn new_global(mutation: &Mutation<'a>) -> Self {
+    pub fn new_global(mc: &Mutation<'a>) -> Self {
         Self {
-            values: Gc::new(mutation, RefLock::new(HashMap::new())),
+            values: Gc::new(mc, RefLock::new(HashMap::new())),
             parent: None,
+        }
+    }
+
+    pub fn transfer(
+        mc: &Mutation<'a>,
+        source: Gc<'a, Environment<'a>>,
+        target: Gc<'a, Environment<'a>>,
+    ) {
+        for (k, (v, is_const)) in source.values.borrow().iter() {
+            if *is_const {
+                target.define_const(mc, k, v.clone());
+            } else {
+                target.define(mc, k, v.clone());
+            }
         }
     }
 

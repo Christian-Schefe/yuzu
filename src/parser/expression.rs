@@ -1,5 +1,5 @@
 use crate::{
-    ModulePath,
+    CanonicalPath,
     location::Located,
     parser::{BinaryOp, UnaryOp, types::TypeHint},
 };
@@ -167,7 +167,7 @@ impl ClassMember {
 }
 
 pub struct ParsedModule {
-    pub imports: Vec<Located<ModulePath>>,
+    pub imports: Vec<Located<CanonicalPath>>,
     pub expressions: Vec<LocatedExpression>,
     pub children: Vec<Located<String>>,
 }
@@ -175,7 +175,7 @@ pub struct ParsedModule {
 #[derive(Debug, Clone)]
 pub enum Identifier {
     Simple(String),
-    Scoped(ModulePath, String),
+    Scoped(CanonicalPath),
 }
 
 /// Desugars:

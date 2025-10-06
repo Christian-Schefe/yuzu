@@ -1,10 +1,24 @@
 mod module;
 mod module2;
 
-use module::test_fn;
+use root::module::test_fn;
+use std::Array;
 
 fn main() {
     print("Hello, world!");
     print(test_fn());
-    print(module2::test_fn2());
+    print(root::module2::test_fn2());
+
+    let i = new root::module::TestClass2();
+    print(i.method());
+    let j = new root::module2::TestClass4();
+    print(j.method());
+    let k = new root::module2::TestClass3();
+    print(k.method());
+
+    for (i in [1,2,3]) {
+        print(i);
+    }
 }
+
+main();

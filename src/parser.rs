@@ -8,7 +8,7 @@ use chumsky::{
 };
 
 use crate::{
-    ModulePath,
+    CanonicalPath, ModulePath,
     lexer::{LocatedToken, Token},
     location::{Located, Location},
 };
@@ -20,13 +20,7 @@ pub use expression::*;
 pub use types::*;
 
 fn located<T>(expr: T, span: SimpleSpan) -> Located<T> {
-    Located::new(
-        expr,
-        Location {
-            span: span.into_range(),
-            module: "".to_string(),
-        },
-    )
+    Located::new(expr, Location::new(span.into_range(), "".to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,7 +143,8 @@ where
         class_type,
         obj_type,
         simple_type,
-    ));
+    ))
+    .boxed();
 
     let operators = basic.pratt((
         postfix(
@@ -246,7 +241,7 @@ where
                     Identifier::Simple(parts[0].clone())
                 } else {
                     let name = parts.pop().unwrap();
-                    Identifier::Scoped(ModulePath::new(parts), name)
+                    Identifier::Scoped(CanonicalPath::new(ModulePath::new(parts), name))
                 };
                 located(ident, extra.span())
             });
@@ -669,9 +664,15 @@ where
                             type_hint,
                         } = lf.data
                         {
+                            let location = expr.location.clone();
+                            let func = Expression::FunctionLiteral {
+                                parameters: vec![],
+                                return_type: None,
+                                body: expr,
+                            };
                             ClassMember::Field {
                                 name,
-                                value: *expr,
+                                value: Located::new(func, location),
                                 type_hint,
                                 is_static: false,
                             }
@@ -739,7 +740,8 @@ where
                         extra.span(),
                     )
                 })
-        });
+        })
+        .boxed();
 
         choice((
             function,
@@ -753,27 +755,29 @@ where
             block,
         ))
         .boxed()
-    });
+    })
+    .boxed();
 
     let module = just(Token::Mod)
         .ignore_then(ident.clone())
         .then_ignore(just(Token::Semicolon))
         .map_with(|name, extra| located(name.to_string(), extra.span()));
 
-    let import = just(Token::Use)
-        .ignore_then(select! { Token::Ident(name) => name.to_string() })
-        .then_ignore(just(Token::DoubleColon))
-        .then(
-            ident
-                .clone()
-                .separated_by(just(Token::DoubleColon))
-                .collect::<Vec<_>>(),
-        )
-        .then_ignore(just(Token::Semicolon))
-        .map_with(|(root, parts), extra| {
-            let path = ModulePath::from_root(&root, parts);
-            located(path, extra.span())
-        });
+    let import = just(Token::Use).ignore_then(
+        ident
+            .clone()
+            .separated_by(just(Token::DoubleColon))
+            .at_least(2)
+            .collect::<Vec<_>>()
+            .then_ignore(just(Token::Semicolon))
+            .map_with(|mut parts, extra| {
+                let name = parts.pop().unwrap();
+                located(
+                    CanonicalPath::new(ModulePath::new(parts), name),
+                    extra.span(),
+                )
+            }),
+    );
 
     module
         .repeated()

@@ -4,23 +4,21 @@ use gc_arena::{Gc, Mutation, lock::RefLock};
 
 use crate::{
     gc_interpreter::{
-        Environment, MyRoot, Value,
+        MyRoot, Value, get_std_env,
         value::{ClassInstanceValue, LocatedError, StringVariant},
     },
     location::HasLocation,
 };
 
-fn make_exception<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    msg: &str,
-    variant: &str,
-    env: &Environment<'a>,
-) -> Value<'a> {
-    let p = if let Some(Value::Class(p)) = env.root().get(variant) {
+fn make_exception<'a>(mc: &Mutation<'a>, root: &MyRoot<'a>, msg: &str, variant: &str) -> Value<'a> {
+    let std_env = get_std_env(root);
+    let p = if let Some(Value::Class(p)) = std_env.get(variant) {
         p
     } else {
-        root.value_classes.exception
+        let Some(Value::Class(p)) = std_env.get("Exception") else {
+            panic!("Exception class not found");
+        };
+        p
     };
 
     let mut map = HashMap::new();
@@ -42,10 +40,9 @@ pub fn runtime_error<'a, T>(
     root: &MyRoot<'a>,
     msg: &str,
     variant: &str,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
-    let exception = make_exception(mc, root, msg, variant, env);
+    let exception = make_exception(mc, root, msg, variant);
     Err(LocatedError {
         data: exception,
         location: expr.location().clone(),
@@ -56,17 +53,15 @@ pub fn type_error<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     msg: &str,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
-    runtime_error(mc, root, msg, "TypeError", env, expr)
+    runtime_error(mc, root, msg, "TypeError", expr)
 }
 
 pub fn array_index_out_of_bounds<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     index: i64,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
     runtime_error(
@@ -74,7 +69,6 @@ pub fn array_index_out_of_bounds<'a, T>(
         root,
         &format!("Array index out of bounds: {}", index),
         "ArrayIndexOutOfBounds",
-        env,
         expr,
     )
 }
@@ -83,43 +77,32 @@ pub fn function_argument_error<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     msg: &str,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
-    runtime_error(mc, root, msg, "FunctionArgumentError", env, expr)
+    runtime_error(mc, root, msg, "FunctionArgumentError", expr)
 }
 
 pub fn io_error<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     msg: &str,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
-    runtime_error(mc, root, msg, "IOError", env, expr)
+    runtime_error(mc, root, msg, "IOError", expr)
 }
 
 pub fn unhandled_control_flow<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
-    runtime_error(
-        mc,
-        root,
-        "Unhandled control flow",
-        "RuntimeError",
-        env,
-        expr,
-    )
+    runtime_error(mc, root, "Unhandled control flow", "RuntimeError", expr)
 }
 
 pub fn field_access_error<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     field: String,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
     runtime_error(
@@ -127,7 +110,6 @@ pub fn field_access_error<'a, T>(
         root,
         &format!("Field access error: {}", field),
         "FieldAccessError",
-        env,
         expr,
     )
 }
@@ -136,7 +118,6 @@ pub fn undefined_variable<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     name: &str,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
     runtime_error(
@@ -144,7 +125,6 @@ pub fn undefined_variable<'a, T>(
         root,
         &format!("Undefined variable: {}", name),
         "UndefinedVariable",
-        env,
         expr,
     )
 }
@@ -153,7 +133,6 @@ pub fn duplicate_variable_definition<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     name: &str,
-    env: &Environment<'a>,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
     runtime_error(
@@ -161,17 +140,6 @@ pub fn duplicate_variable_definition<'a, T>(
         root,
         &format!("Duplicate variable definition: {}", name),
         "DuplicateVariableDefinition",
-        env,
         expr,
     )
-}
-
-pub fn import_error<'a, T>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    msg: &str,
-    env: &Environment<'a>,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(mc, root, msg, "ImportError", env, expr)
 }

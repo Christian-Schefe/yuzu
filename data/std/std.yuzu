@@ -73,12 +73,11 @@ class Exception {
     }
 }
 
-let IntrinsicFile = File;
 class File {
     let file = null;
     constructor(path) {
-        print(IntrinsicFile);
-        this.file = IntrinsicFile.open(path);
+        print(File);
+        this.file = File.open(path);
     }
     fn close() {
         if (this.file == null) return;
@@ -116,13 +115,3 @@ class File {
 class TypedSlice {
     fn iter() new IndexIterator(this);
 }
-
-return {
-    Array: Array,
-    String: String,
-    IndexIterator: IndexIterator,
-    MapIterator: MapIterator,
-    Exception: Exception,
-    File: File,
-    TypedSlice: TypedSlice,
-};

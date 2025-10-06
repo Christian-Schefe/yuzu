@@ -6,17 +6,16 @@ use gc_arena::{
 };
 
 use crate::{
-    ParsedModuleTree,
+    ModulePath, ParsedProgram,
     gc_interpreter::{
         exception::{
             array_index_out_of_bounds, duplicate_variable_definition, field_access_error,
             type_error, undefined_variable, unhandled_control_flow,
         },
         resolver::resolve_canonical_paths,
-        standard::root_prototypes,
         value::{
             ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError, ModuleTree,
-            StringVariant, Value, ValueClasses, variable_to_string,
+            StringVariant, Value, variable_to_string,
         },
     },
     location::{Located, Location},
@@ -33,18 +32,12 @@ mod value;
 #[collect(no_drop)]
 pub struct MyRoot<'a> {
     root_module: GcRefLock<'a, ModuleTree<'a>>,
-    value_classes: ValueClasses<'a>,
     pwd: std::path::PathBuf,
-}
-
-#[derive(Copy, Clone)]
-pub struct Context<'a> {
-    pub mc: &'a Mutation<'a>,
-    pub root: &'a MyRoot<'a>,
+    program: StaticCollect<ParsedProgram>,
 }
 
 pub fn interpret_global(
-    tree: ParsedModuleTree,
+    program: ParsedProgram,
     pwd: std::path::PathBuf,
 ) -> Result<(), Located<String>> {
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
@@ -52,20 +45,27 @@ pub fn interpret_global(
 
         MyRoot {
             root_module: Gc::new(mc, RefLock::new(root_module)),
-            value_classes: root_prototypes(mc),
             pwd,
+            program: StaticCollect(program),
         }
     });
-    arena.mutate(|mc, root| {
-        resolve_canonical_paths(mc, root, &tree);
-        let env = root.root_module.borrow().env;
-        match interpret(mc, root, &tree.expressions[0], env) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Located {
-                data: format!("Uncaught exception: {:?}", variable_to_string(&e.data)),
-                location: e.location,
-            }),
+    arena.mutate(move |mc, root| {
+        resolve_canonical_paths(mc, root);
+        let root_module = ModuleTree::get(root.root_module, &ModulePath::root()).unwrap();
+        let env = root_module.borrow().env;
+        let root_tree = &root.program.children["root"];
+        for expr in &root_tree.expressions {
+            if let Expression::Define { .. } = expr.data {
+                continue; // handled in resolver
+            }
+            if let Err(e) = interpret(mc, root, expr, env) {
+                return Err(Located {
+                    data: format!("Uncaught exception: {:?}", variable_to_string(&e.data)),
+                    location: e.location,
+                });
+            }
         }
+        Ok(())
     })?;
     Ok(())
 }
@@ -239,8 +239,8 @@ pub fn interpret<'a>(
         ExecResult::Value(v) => Ok(v),
         ExecResult::Return(v) => Ok(v),
         ExecResult::Error(v, location) => Err(LocatedError { data: v, location }),
-        ExecResult::Break(location) => unhandled_control_flow(mc, root, &env, location),
-        ExecResult::Continue(location) => unhandled_control_flow(mc, root, &env, location),
+        ExecResult::Break(location) => unhandled_control_flow(mc, root, location),
+        ExecResult::Continue(location) => unhandled_control_flow(mc, root, location),
     }
 }
 
@@ -334,20 +334,8 @@ fn interpret_frame_eval<'a>(
                 stack.push(Frame::eval(first_entry, env));
             }
         }
-        Expression::ClassLiteral { parent, .. } => {
-            let parent_val = match parent {
-                None => None,
-                Some(p) => match eval_identifier(mc, root, p, env, &expr.location) {
-                    ExecResult::Value(v) => Some(v),
-                    other => {
-                        *last = other;
-                        return;
-                    }
-                },
-            };
-            *last = ExecResult::Value(Value::Class(make_class_literal(
-                mc, root, expr, env, parent_val,
-            )));
+        Expression::ClassLiteral { .. } => {
+            *last = make_class_literal(mc, root, expr, env);
         }
         Expression::Block(exprs, last_expr) => {
             if exprs.is_empty() && last_expr.is_none() {
@@ -678,9 +666,7 @@ fn interpret_frame_kont<'a>(
             *last = if env.define(mc, &name, last_value) {
                 ExecResult::Value(Value::Null)
             } else {
-                convert_err(duplicate_variable_definition(
-                    mc, root, &name, &env, location,
-                ))
+                convert_err(duplicate_variable_definition(mc, root, &name, location))
             };
         }
         Kont::Binary { op, right } => {
@@ -708,7 +694,6 @@ fn interpret_frame_kont<'a>(
                     mc,
                     root,
                     &format!("Invalid operand types for binary operator {:?}", op),
-                    &env,
                     location,
                 ));
             }
@@ -724,7 +709,6 @@ fn interpret_frame_kont<'a>(
                     mc,
                     root,
                     &format!("Invalid operand type for unary operator {:?}", op),
-                    &env,
                     location,
                 ));
             }
@@ -766,7 +750,7 @@ fn interpret_frame_kont<'a>(
             *last = if let Some((value, _)) = get_property(root, &object, &field) {
                 ExecResult::Value(value)
             } else {
-                convert_err(field_access_error(mc, root, field, &env, location))
+                convert_err(field_access_error(mc, root, field, location))
             };
         }
         Kont::ArrayAccess { index, array } => {
@@ -785,7 +769,7 @@ fn interpret_frame_kont<'a>(
                 stack.push(Frame::eval(index, env));
                 return;
             };
-            *last = get_at_index(mc, root, env, &location, array, val);
+            *last = get_at_index(mc, root, &location, array, val);
         }
         Kont::PropertyFunctionCall {
             mut args_remaining,
@@ -817,13 +801,7 @@ fn interpret_frame_kont<'a>(
                 stack.push(Frame::eval(next_arg, env));
             } else {
                 let Some((func, is_method)) = get_property(root, &target, &function_field) else {
-                    *last = convert_err(field_access_error(
-                        mc,
-                        root,
-                        function_field,
-                        &env,
-                        &location,
-                    ));
+                    *last = convert_err(field_access_error(mc, root, function_field, &location));
                     return;
                 };
                 if is_method {
@@ -864,7 +842,6 @@ fn interpret_frame_kont<'a>(
                         mc,
                         root,
                         "Attempted to call a non-prototype value with 'new'",
-                        &env,
                         &location,
                     ));
                     return;
@@ -877,7 +854,6 @@ fn interpret_frame_kont<'a>(
                         mc,
                         root,
                         "Attempted to call a prototype without a constructor with 'new'",
-                        &env,
                         &location,
                     ));
                     return;
@@ -901,17 +877,18 @@ fn interpret_frame_kont<'a>(
             match &target.data {
                 Expression::Ident(name) => {
                     let result = if let Some(op) = op {
-                        let Some(left_val) = env.get(name) else {
-                            *last =
-                                convert_err(undefined_variable(mc, root, name, &env, &location));
-                            return;
+                        let left_val = match eval_identifier(mc, root, name, env, &location) {
+                            ExecResult::Value(v) => v,
+                            other => {
+                                *last = other;
+                                return;
+                            }
                         };
                         let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
                             *last = convert_err(type_error(
                                 mc,
                                 root,
                                 &format!("Invalid operand types for binary operator {:?}", op),
-                                &env,
                                 location,
                             ));
                             return;
@@ -920,11 +897,11 @@ fn interpret_frame_kont<'a>(
                     } else {
                         value
                     };
-                    if env.set(mc, &name, result.clone()) {
-                        *last = ExecResult::Value(result);
-                    } else {
-                        *last = convert_err(undefined_variable(mc, root, &name, &env, &location));
-                    }
+                    *last = match assign_identifier(mc, root, name, env, &location, result.clone())
+                    {
+                        Ok(_) => ExecResult::Value(result),
+                        Err(e) => e,
+                    };
                 }
                 Expression::FieldAccess { object, field } => {
                     stack.push(Frame::kont(
@@ -948,13 +925,8 @@ fn interpret_frame_kont<'a>(
                     stack.push(Frame::eval(array, env));
                 }
                 _ => {
-                    *last = convert_err(type_error(
-                        mc,
-                        root,
-                        "Invalid assignment target",
-                        &env,
-                        &location,
-                    ));
+                    *last =
+                        convert_err(type_error(mc, root, "Invalid assignment target", &location));
                 }
             }
         }
@@ -964,7 +936,7 @@ fn interpret_frame_kont<'a>(
             };
             let result = if let Some(op) = op {
                 let Some((left_val, _)) = get_property(root, &object, &field) else {
-                    *last = convert_err(field_access_error(mc, root, field, &env, &location));
+                    *last = convert_err(field_access_error(mc, root, field, &location));
                     return;
                 };
                 let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
@@ -972,7 +944,6 @@ fn interpret_frame_kont<'a>(
                         mc,
                         root,
                         &format!("Invalid operand types for binary operator {:?}", op),
-                        &env,
                         location,
                     ));
                     return;
@@ -981,7 +952,7 @@ fn interpret_frame_kont<'a>(
             } else {
                 value
             };
-            *last = set_property(root, mc, env, &location, object, field, result);
+            *last = set_property(root, mc, &location, object, field, result);
         }
         Kont::ArrayAssign {
             value,
@@ -1008,20 +979,18 @@ fn interpret_frame_kont<'a>(
             };
 
             let result = if let Some(op) = op {
-                let left_val =
-                    match get_at_index(mc, root, env, &location, array.clone(), val.clone()) {
-                        ExecResult::Value(v) => v,
-                        other => {
-                            *last = other;
-                            return;
-                        }
-                    };
+                let left_val = match get_at_index(mc, root, &location, array.clone(), val.clone()) {
+                    ExecResult::Value(v) => v,
+                    other => {
+                        *last = other;
+                        return;
+                    }
+                };
                 let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
                     *last = convert_err(type_error(
                         mc,
                         root,
                         &format!("Invalid operand types for binary operator {:?}", op),
-                        &env,
                         location,
                     ));
                     return;
@@ -1030,7 +999,7 @@ fn interpret_frame_kont<'a>(
             } else {
                 value
             };
-            *last = set_at_index(mc, root, &location, env, val, array, result);
+            *last = set_at_index(mc, root, &location, val, array, result);
         }
         Kont::IfElse {
             then_branch,
@@ -1055,7 +1024,6 @@ fn interpret_frame_kont<'a>(
                         mc,
                         root,
                         "Condition in if expression must be a boolean",
-                        &env,
                         &location,
                     ));
                 }
@@ -1093,7 +1061,6 @@ fn interpret_frame_kont<'a>(
                                 mc,
                                 root,
                                 "Condition in loop expression must be a boolean",
-                                &env,
                                 &location,
                             ));
                             return;
@@ -1175,7 +1142,6 @@ fn set_at_index<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     location: &Location,
-    env: Gc<'a, Environment<'a>>,
     index: Value<'a>,
     array: Value<'a>,
     result: Value<'a>,
@@ -1187,7 +1153,6 @@ fn set_at_index<'a>(
                     mc,
                     root,
                     "Array index must be an integer",
-                    &env,
                     location,
                 ));
             };
@@ -1198,7 +1163,7 @@ fn set_at_index<'a>(
                 arr_ref[index] = result.clone();
                 ExecResult::Value(result)
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, &env, location))
+                convert_err(array_index_out_of_bounds(mc, root, i, location))
             }
         }
         Value::TypedSlice {
@@ -1212,7 +1177,6 @@ fn set_at_index<'a>(
                     mc,
                     root,
                     "Array index must be an integer",
-                    &env,
                     location,
                 ));
             };
@@ -1230,19 +1194,17 @@ fn set_at_index<'a>(
                         mc,
                         root,
                         "Failed to write value to typed slice",
-                        &env,
                         location,
                     ))
                 }
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, &env, location))
+                convert_err(array_index_out_of_bounds(mc, root, i, location))
             }
         }
         _ => convert_err(type_error(
             mc,
             root,
             "Attempted to index a non-array value",
-            &env,
             location,
         )),
     }
@@ -1263,7 +1225,6 @@ fn call_function<'a>(
             mc,
             root,
             "Attempted to call a non-function value",
-            &env,
             location,
         ));
         return;
@@ -1284,7 +1245,6 @@ fn call_function<'a>(
                     mc,
                     root,
                     &format!("Expected {} arguments, got {}", parameters.len(), args_len),
-                    &env,
                     location,
                 ));
             } else {
@@ -1386,30 +1346,33 @@ fn interpret_simple_binary_op<'a>(
     })
 }
 
-fn get_class<'a>(root: &MyRoot<'a>, target: &Value<'a>) -> GcRefLock<'a, ClassValue<'a>> {
-    if let Value::ClassInstance(instance) = target {
-        instance.borrow().class
+pub fn get_std_env<'a>(root: &MyRoot<'a>) -> Gc<'a, Environment<'a>> {
+    let std_tree = ModuleTree::get(root.root_module, &ModulePath::from_root("std")).unwrap();
+    let std_env = std_tree.borrow().env;
+    std_env
+}
+
+fn get_classes<'a>(
+    root: &MyRoot<'a>,
+    target: &Value<'a>,
+) -> (
+    Option<GcRefLock<'a, ClassValue<'a>>>,
+    GcRefLock<'a, ClassValue<'a>>,
+) {
+    let class_name = target.get_type();
+    let std_env = get_std_env(root);
+    let Value::Class(value_class) = std_env.get(class_name).unwrap() else {
+        panic!("Standard class {} not found", class_name);
+    };
+
+    let extra_class = if let Value::ClassInstance(instance) = target {
+        Some(instance.borrow().class)
     } else if let Value::Class(class) = target {
-        *class
+        Some(*class)
     } else {
-        let classes = &root.value_classes;
-        let value_class = match target {
-            Value::Number(_) => classes.number,
-            Value::Integer(_) => classes.integer,
-            Value::Bool(_) => classes.bool,
-            Value::String(_) => classes.string,
-            Value::Null => classes.null,
-            Value::Function { .. } => classes.function,
-            Value::Array { .. } => classes.array,
-            Value::Object { .. } => classes.object,
-            Value::ClassInstance { .. } => classes.class_instance,
-            Value::Class { .. } => classes.class,
-            Value::Resource(_) => classes.resource,
-            Value::Buffer(_) => classes.buffer,
-            Value::TypedSlice { .. } => classes.typed_slice,
-        };
-        value_class
-    }
+        None
+    };
+    (extra_class, value_class)
 }
 
 fn get_property<'a>(
@@ -1433,7 +1396,7 @@ fn get_property<'a>(
         _ => {}
     }
 
-    let class = get_class(root, target);
+    let (extra_class, value_class) = get_classes(root, target);
 
     fn look_for_property_in_class<'a>(
         mut class: GcRefLock<'a, ClassValue<'a>>,
@@ -1442,7 +1405,7 @@ fn get_property<'a>(
         loop {
             let cur_ref = class.borrow();
             if let Some(val) = cur_ref.static_fields.get(field).cloned() {
-                return Some((val, false));
+                return todo!("Static fields not supported yet");
             } else if let Some(val) = cur_ref.methods.get(field) {
                 return Some((Value::Function(*val), true));
             } else if let Some(val) = cur_ref.static_methods.get(field) {
@@ -1458,14 +1421,12 @@ fn get_property<'a>(
             }
         }
     }
-    if let Some(res) = look_for_property_in_class(class, field) {
+    if let Some(extra_class) = extra_class
+        && let Some(res) = look_for_property_in_class(extra_class, field)
+    {
         Some(res)
-    } else if let Value::ClassInstance(_) = target {
-        look_for_property_in_class(root.value_classes.class_instance, field)
-    } else if let Value::Class(_) = target {
-        look_for_property_in_class(root.value_classes.class, field)
     } else {
-        None
+        look_for_property_in_class(value_class, field)
     }
 }
 
@@ -1476,7 +1437,8 @@ fn create_class_instance<'a>(mc: &Mutation<'a>, class: GcRefLock<'a, ClassValue<
         let class_ref = class.borrow();
         for (key, value) in class_ref.instance_fields.iter() {
             if !fields.contains_key(key) {
-                fields.insert(key.clone(), value.clone());
+                println!("TODO: Insert key: {}", key);
+                //fields.insert(key.clone(), value.clone());
             }
         }
         current_class = class_ref.parent.clone();
@@ -1490,7 +1452,6 @@ fn create_class_instance<'a>(mc: &Mutation<'a>, class: GcRefLock<'a, ClassValue<
 fn get_at_index<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
-    env: Gc<'a, Environment<'a>>,
     location: &Location,
     array: Value<'a>,
     index: Value<'a>,
@@ -1502,7 +1463,6 @@ fn get_at_index<'a>(
                     mc,
                     root,
                     "Array index must be an integer",
-                    &env,
                     location,
                 ));
             };
@@ -1513,7 +1473,7 @@ fn get_at_index<'a>(
                 let value = arr_ref[index].clone();
                 ExecResult::Value(value)
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, &env, location))
+                convert_err(array_index_out_of_bounds(mc, root, i, location))
             }
         }
         Value::TypedSlice {
@@ -1527,7 +1487,6 @@ fn get_at_index<'a>(
                     mc,
                     root,
                     "Array index must be an integer",
-                    &env,
                     location,
                 ));
             };
@@ -1544,20 +1503,18 @@ fn get_at_index<'a>(
                         mc,
                         root,
                         "Failed to read value from typed slice",
-                        &env,
                         &location,
                     ));
                 };
                 ExecResult::Value(value)
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, &env, &location))
+                convert_err(array_index_out_of_bounds(mc, root, i, &location))
             }
         }
         _ => convert_err(type_error(
             mc,
             root,
             "Attempted to index a non-array value",
-            &env,
             &location,
         )),
     }
@@ -1566,7 +1523,6 @@ fn get_at_index<'a>(
 fn set_property<'a>(
     root: &MyRoot<'a>,
     mc: &Mutation<'a>,
-    env: Gc<'a, Environment<'a>>,
     location: &Location,
     object: Value<'a>,
     field: String,
@@ -1586,7 +1542,6 @@ fn set_property<'a>(
                     mc,
                     root,
                     &format!("Field '{}' does not exist on class instance", field),
-                    &env,
                     &location,
                 ))
             }
@@ -1595,7 +1550,6 @@ fn set_property<'a>(
             mc,
             root,
             "Attempted to assign field on non-object value",
-            &env,
             &location,
         )),
     }
@@ -1645,8 +1599,7 @@ fn make_class_literal<'a>(
     root: &MyRoot<'a>,
     expr: &'a LocatedExpression,
     env: Gc<'a, Environment<'a>>,
-    parent_val: Option<Value<'a>>,
-) -> GcRefLock<'a, ClassValue<'a>> {
+) -> ExecResult<'a> {
     match &expr.data {
         Expression::ClassLiteral {
             parent,
@@ -1656,9 +1609,25 @@ fn make_class_literal<'a>(
             static_methods,
             constructor,
         } => {
+            let parent_val = match parent {
+                None => None,
+                Some(p) => match eval_identifier(mc, root, p, env, &expr.location) {
+                    ExecResult::Value(v) => Some(v),
+                    other => {
+                        return other;
+                    }
+                },
+            };
             let parent_class = match &parent_val {
                 Some(Value::Class(c)) => Some(c.clone()),
-                Some(other) => panic!("Parent is not a class: {:?}", other),
+                Some(other) => {
+                    return convert_err(type_error(
+                        mc,
+                        root,
+                        &format!("Expected class as parent, got {:?}", other),
+                        &expr.location,
+                    ));
+                }
                 None => None,
             };
             let instance_fields = fields
@@ -1691,7 +1660,7 @@ fn make_class_literal<'a>(
                     methods,
                 }),
             );
-            class_val
+            ExecResult::Value(Value::Class(class_val))
         }
         _ => unreachable!(),
     }
@@ -1709,26 +1678,59 @@ fn eval_identifier<'a>(
             if let Some(val) = env.get(name) {
                 ExecResult::Value(val)
             } else {
-                convert_err(undefined_variable(mc, root, name, &env, location))
+                convert_err(undefined_variable(mc, root, name, location))
             }
         }
-        Identifier::Scoped(path, name) => {
-            let module_tree = ModuleTree::get(root.root_module, path);
+        Identifier::Scoped(path) => {
+            let module_tree = ModuleTree::get(root.root_module, &path.path);
             if let Some(module_tree) = module_tree {
                 let env = module_tree.borrow().env;
-                if let Some(val) = env.get(name) {
+                if let Some(val) = env.get(&path.item) {
                     ExecResult::Value(val)
                 } else {
-                    convert_err(undefined_variable(mc, root, name, &env, location))
+                    convert_err(undefined_variable(mc, root, &path.item, location))
                 }
             } else {
-                convert_err(undefined_variable(
+                convert_err(undefined_variable(mc, root, &path.to_string(), location))
+            }
+        }
+    }
+}
+
+fn assign_identifier<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    ident: &Identifier,
+    env: Gc<'a, Environment<'a>>,
+    location: &Location,
+    value: Value<'a>,
+) -> Result<(), ExecResult<'a>> {
+    match ident {
+        Identifier::Simple(name) => {
+            if env.set(mc, name, value) {
+                Ok(())
+            } else {
+                Err(convert_err(undefined_variable(mc, root, name, location)))
+            }
+        }
+        Identifier::Scoped(path) => {
+            let module_tree = ModuleTree::get(root.root_module, &path.path);
+            if let Some(module_tree) = module_tree {
+                let env = module_tree.borrow().env;
+                if env.set(mc, &path.item, value) {
+                    Ok(())
+                } else {
+                    Err(convert_err(undefined_variable(
+                        mc, root, &path.item, location,
+                    )))
+                }
+            } else {
+                Err(convert_err(undefined_variable(
                     mc,
                     root,
                     &path.to_string(),
-                    &env,
                     location,
-                ))
+                )))
             }
         }
     }

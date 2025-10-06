@@ -7,7 +7,7 @@ use gc_arena::{
 
 use crate::{
     gc_interpreter::{
-        MyRoot, ValueClasses,
+        MyRoot,
         exception::{function_argument_error, io_error, type_error},
         resource::{FileResource, SocketResource},
         value::{
@@ -23,7 +23,6 @@ fn expect_arg_len<'a>(
     root: &MyRoot<'a>,
     args: &Vec<Value<'a>>,
     expected: usize,
-    env: &Environment<'a>,
     expr: &Location,
 ) -> Result<(), LocatedError<'a>> {
     if args.len() != expected {
@@ -31,7 +30,6 @@ fn expect_arg_len<'a>(
             mc,
             root,
             &format!("Expected {} arguments, got {}", expected, args.len()),
-            env,
             expr,
         )
     } else {
@@ -43,7 +41,6 @@ fn expect_class_arg<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     value: &Value<'a>,
-    env: &Environment<'a>,
     expr: &Location,
 ) -> Result<GcRefLock<'a, ClassValue<'a>>, LocatedError<'a>> {
     if let Value::Class(c) = value {
@@ -53,7 +50,6 @@ fn expect_class_arg<'a>(
             mc,
             root,
             &format!("Expected argument to be a Class, got {}", value.get_type()),
-            env,
             expr,
         )
     }
@@ -63,7 +59,6 @@ fn expect_class_instance_arg<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     value: &Value<'a>,
-    env: &Environment<'a>,
     expr: &Location,
 ) -> Result<GcRefLock<'a, ClassInstanceValue<'a>>, LocatedError<'a>> {
     if let Value::ClassInstance(c) = value {
@@ -76,7 +71,6 @@ fn expect_class_instance_arg<'a>(
                 "Expected argument to be a ClassInstance, got {}",
                 value.get_type()
             ),
-            env,
             expr,
         )
     }
@@ -86,7 +80,6 @@ fn exprect_buffer_arg<'a>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
     value: &Value<'a>,
-    env: &Environment<'a>,
     expr: &Location,
 ) -> Result<GcRefLock<'a, Vec<u8>>, LocatedError<'a>> {
     if let Value::Buffer(b) = value {
@@ -96,7 +89,6 @@ fn exprect_buffer_arg<'a>(
             mc,
             root,
             &format!("Expected argument to be a Buffer, got {}", value.get_type()),
-            env,
             expr,
         )
     }
@@ -121,12 +113,7 @@ fn make_builtin_function<'a>(
     )
 }
 
-pub fn define_globals<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    env: Gc<'a, Environment<'a>>,
-    no_std: bool,
-) {
+pub fn define_globals<'a>(mc: &Mutation<'a>, env: Gc<'a, Environment<'a>>) {
     env.define(
         mc,
         "print",
@@ -155,8 +142,8 @@ pub fn define_globals<'a>(
                     let mut map = HashMap::new();
                     map.insert(
                         "open".to_string(),
-                        make_builtin_function(mc, |mc, root, args, span, env| {
-                            expect_arg_len(mc, root, &args, 1, &env, span)?;
+                        make_builtin_function(mc, |mc, root, args, span, _| {
+                            expect_arg_len(mc, root, &args, 1, span)?;
                             let path = match &args[0] {
                                 Value::String(s) => s.to_string(),
                                 _ => {
@@ -164,7 +151,6 @@ pub fn define_globals<'a>(
                                         mc,
                                         root,
                                         "Open argument must be a string",
-                                        &env,
                                         span,
                                     );
                                 }
@@ -174,7 +160,6 @@ pub fn define_globals<'a>(
                                     mc,
                                     root,
                                     &format!("Failed to open file {}: {}", path, e),
-                                    &env,
                                     span,
                                 )
                                 .unwrap_err()
@@ -203,8 +188,8 @@ pub fn define_globals<'a>(
                     let mut map = HashMap::new();
                     map.insert(
                         "connect".to_string(),
-                        make_builtin_function(mc, |mc, root, args, span, env| {
-                            expect_arg_len(mc, root, &args, 2, &env, span)?;
+                        make_builtin_function(mc, |mc, root, args, span, _| {
+                            expect_arg_len(mc, root, &args, 2, span)?;
                             let host = match &args[0] {
                                 Value::String(s) => s.to_string(),
                                 _ => {
@@ -212,7 +197,6 @@ pub fn define_globals<'a>(
                                         mc,
                                         root,
                                         "Host argument must be a string",
-                                        &env,
                                         span,
                                     );
                                 }
@@ -224,7 +208,6 @@ pub fn define_globals<'a>(
                                         mc,
                                         root,
                                         "Port argument must be an integer",
-                                        &env,
                                         span,
                                     );
                                 }
@@ -236,7 +219,6 @@ pub fn define_globals<'a>(
                                     mc,
                                     root,
                                     "Port argument must be a valid u16",
-                                    &env,
                                     span,
                                 );
                             };
@@ -245,7 +227,6 @@ pub fn define_globals<'a>(
                                     mc,
                                     root,
                                     &format!("Failed to connect to {}:{}: {}", host, port, e),
-                                    &env,
                                     span,
                                 )
                                 .unwrap_err()
@@ -263,8 +244,8 @@ pub fn define_globals<'a>(
     env.define(
         mc,
         "typeof",
-        Value::Function(make_builtin_function(mc, |mc, root, args, span, env| {
-            expect_arg_len(mc, root, &args, 1, &env, span)?;
+        Value::Function(make_builtin_function(mc, |mc, root, args, span, _| {
+            expect_arg_len(mc, root, &args, 1, span)?;
             let type_str = args[0].get_type();
             Ok(Value::String(Gc::new(
                 mc,
@@ -273,25 +254,13 @@ pub fn define_globals<'a>(
         })),
     );
 
-    let root_prototypes = &root.value_classes;
-    env.define(mc, "Integer", Value::Class(root_prototypes.integer));
-    env.define(mc, "String", Value::Class(root_prototypes.string));
-    env.define(mc, "Array", Value::Class(root_prototypes.array));
-    env.define(mc, "Object", Value::Class(root_prototypes.object));
-    env.define(mc, "Bool", Value::Class(root_prototypes.bool));
-    env.define(mc, "Number", Value::Class(root_prototypes.number));
-    env.define(mc, "Null", Value::Class(root_prototypes.null));
-    env.define(mc, "Function", Value::Class(root_prototypes.function));
-    env.define(
-        mc,
-        "ClassInstance",
-        Value::Class(root_prototypes.class_instance),
-    );
-    env.define(mc, "Prototype", Value::Class(root_prototypes.class));
-    env.define(mc, "Exception", Value::Class(root_prototypes.exception));
-    env.define(mc, "Resource", Value::Class(root_prototypes.resource));
-    env.define(mc, "Buffer", Value::Class(root_prototypes.buffer));
-    env.define(mc, "TypedSlice", Value::Class(root_prototypes.typed_slice));
+    let root_prototypes = root_prototypes(mc);
+    for (name, class) in root_prototypes {
+        env.define(mc, &name, Value::Class(class));
+    }
+    let Some(Value::Class(typed_slice_prototype)) = env.get("TypedSlice") else {
+        panic!("TypedSlice prototype not found");
+    };
 
     let typed_slice_variants = [
         TypedBufferType::Uint8,
@@ -322,9 +291,9 @@ pub fn define_globals<'a>(
         let mut static_methods = HashMap::new();
         static_methods.insert(
             "of".to_string(),
-            make_builtin_function(mc, move |mc, root, args, span, env| {
-                expect_arg_len(mc, root, &args, 1, &env, span)?;
-                let buf = exprect_buffer_arg(mc, root, &args[0], &env, span)?;
+            make_builtin_function(mc, move |mc, root, args, span, _| {
+                expect_arg_len(mc, root, &args, 1, span)?;
+                let buf = exprect_buffer_arg(mc, root, &args[0], span)?;
                 let length = buf.borrow().len() / buffer_type.byte_size();
                 Ok(Value::TypedSlice {
                     buffer: buf.clone(),
@@ -345,75 +314,14 @@ pub fn define_globals<'a>(
                     static_fields: HashMap::new(),
                     methods: HashMap::new(),
                     static_methods,
-                    parent: Some(root_prototypes.typed_slice),
+                    parent: Some(typed_slice_prototype),
                 }),
             )),
         );
     }
-
-    if no_std {
-        return;
-    }
-
-    let std_ref = root.std_export.borrow_mut(mc);
-    let std_val = if let Some(&v) = std_ref.as_ref() {
-        v
-    } else {
-        let std_val = interpret_string(
-            mc,
-            root,
-            STD,
-            &Location::new(0..STD.len(), "std".to_string()),
-            "std".to_string(),
-            Some("std"),
-            env,
-            true,
-        )
-        .expect("Failed to interpret standard library");
-
-        let Value::Object(std) = std_val else {
-            panic!(
-                "Failed to interpret standard library: not an object: {:?}",
-                std_val
-            );
-        };
-        std
-    };
-
-    for (key, value) in std_val.borrow().iter() {
-        if !env.define(mc, key, value.clone()) {
-            let prev = env.get(key).unwrap();
-            let Value::Class(real_p) = prev else {
-                panic!("Global {} in std is not a prototype, cannot merge", key);
-            };
-            let Value::Class(new_p) = value else {
-                panic!("Global {} in std is not a prototype, cannot merge", key);
-            };
-            let mut real_p_ref = real_p.borrow_mut(mc);
-            let new_p = new_p.borrow();
-            for (k, v) in new_p.static_fields.iter() {
-                real_p_ref.static_fields.insert(k.clone(), v.clone());
-            }
-            for (k, v) in new_p.instance_fields.iter() {
-                real_p_ref.instance_fields.insert(k.clone(), v.clone());
-            }
-            for (k, v) in new_p.static_methods.iter() {
-                real_p_ref.static_methods.insert(k.clone(), v.clone());
-            }
-            for (k, v) in new_p.methods.iter() {
-                real_p_ref.methods.insert(k.clone(), v.clone());
-            }
-            real_p_ref.constructor = new_p.constructor.clone();
-            if let Some(parent) = new_p.parent
-                && !Gc::ptr_eq(parent, real_p)
-            {
-                real_p_ref.parent = Some(parent.clone());
-            }
-        }
-    }
 }
 
-pub fn root_prototypes<'a>(mc: &Mutation<'a>) -> ValueClasses<'a> {
+pub fn root_prototypes<'a>(mc: &Mutation<'a>) -> Vec<(String, GcRefLock<'a, ClassValue<'a>>)> {
     let empty_class = || {
         Gc::new(
             mc,
@@ -427,48 +335,41 @@ pub fn root_prototypes<'a>(mc: &Mutation<'a>) -> ValueClasses<'a> {
             }),
         )
     };
-    ValueClasses {
-        integer: integer_prototype(mc),
-        string: string_prototype(mc),
-        array: array_prototype(mc),
-        object: object_prototype(mc),
-        bool: empty_class(),
-        number: empty_class(),
-        null: empty_class(),
-        function: empty_class(),
-        class_instance: class_instance_prototype(mc),
-        class: class_prototype(mc),
-        exception: exception_prototype(mc),
-        resource: resource_prototype(mc),
-        buffer: buffer_prototype(mc),
-        typed_slice: typed_slice_prototype(mc),
-    }
+    vec![
+        ("Integer".to_string(), integer_prototype(mc)),
+        ("String".to_string(), string_prototype(mc)),
+        ("Array".to_string(), array_prototype(mc)),
+        ("Object".to_string(), object_prototype(mc)),
+        ("Bool".to_string(), empty_class()),
+        ("Number".to_string(), empty_class()),
+        ("Null".to_string(), empty_class()),
+        ("Function".to_string(), empty_class()),
+        ("Class".to_string(), class_prototype(mc)),
+        ("ClassInstance".to_string(), class_instance_prototype(mc)),
+        ("Exception".to_string(), exception_prototype(mc)),
+        ("Resource".to_string(), resource_prototype(mc)),
+        ("Buffer".to_string(), buffer_prototype(mc)),
+        ("TypedSlice".to_string(), typed_slice_prototype(mc)),
+    ]
 }
 
 fn typed_slice_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut methods = HashMap::new();
     methods.insert(
         "length".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
             match &args[0] {
                 Value::TypedSlice { length, .. } => Ok(Value::Integer((*length) as i64)),
                 _ => {
-                    return type_error(
-                        mc,
-                        root,
-                        "length can only be called on TypedSlice",
-                        &env,
-                        expr,
-                    );
+                    return type_error(mc, root, "length can only be called on TypedSlice", expr);
                 }
             }
         }),
@@ -490,17 +391,16 @@ fn class_instance_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'
     let mut methods = HashMap::new();
     methods.insert(
         "get_class".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
-            let obj = expect_class_instance_arg(mc, root, &args[0], &env, expr)?;
+            let obj = expect_class_instance_arg(mc, root, &args[0], expr)?;
             Ok(Value::Class(obj.borrow().class))
         }),
     );
@@ -522,33 +422,31 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut static_methods = HashMap::new();
     methods.insert(
         "length".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
             match &args[0] {
                 Value::Buffer(buf) => Ok(Value::Integer(buf.borrow().len() as i64)),
                 _ => {
-                    return type_error(mc, root, "length can only be called on Buffer", &env, expr);
+                    return type_error(mc, root, "length can only be called on Buffer", expr);
                 }
             }
         }),
     );
     methods.insert(
         "to_string".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
@@ -559,26 +457,19 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                     Ok(Value::String(Gc::new(mc, StringVariant::from_string(&s))))
                 }
                 _ => {
-                    return type_error(
-                        mc,
-                        root,
-                        "to_string can only be called on Buffer",
-                        &env,
-                        expr,
-                    );
+                    return type_error(mc, root, "to_string can only be called on Buffer", expr);
                 }
             }
         }),
     );
     static_methods.insert(
         "from_string".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
@@ -588,26 +479,19 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                     Ok(Value::Buffer(Gc::new(mc, RefLock::new(bytes))))
                 }
                 _ => {
-                    return type_error(
-                        mc,
-                        root,
-                        "from_string can only be called on String",
-                        &env,
-                        expr,
-                    );
+                    return type_error(mc, root, "from_string can only be called on String", expr);
                 }
             }
         }),
     );
     static_methods.insert(
         "with_size".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
@@ -621,7 +505,6 @@ fn buffer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                         mc,
                         root,
                         "with_size argument must be a non-negative integer",
-                        &env,
                         expr,
                     );
                 }
@@ -645,13 +528,12 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "close".to_string(),
-        make_builtin_function(mc, |mc, root, args, span, env| {
+        make_builtin_function(mc, |mc, root, args, span, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     span,
                 );
             }
@@ -659,30 +541,23 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                 Value::Resource(res) => {
                     let mut res_ref = res.borrow_mut(mc);
                     res_ref.close().map_err(|e| {
-                        io_error::<()>(
-                            mc,
-                            root,
-                            &format!("Failed to close resource: {}", e),
-                            &env,
-                            span,
-                        )
-                        .unwrap_err()
+                        io_error::<()>(mc, root, &format!("Failed to close resource: {}", e), span)
+                            .unwrap_err()
                     })?;
                     Ok(Value::Null)
                 }
-                _ => return type_error(mc, root, "Close argument must be a resource", &env, span),
+                _ => return type_error(mc, root, "Close argument must be a resource", span),
             }
         }),
     );
     map.insert(
         "read".to_string(),
-        make_builtin_function(mc, |mc, root, args, span, env| {
+        make_builtin_function(mc, |mc, root, args, span, _| {
             if args.len() != 4 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 4 arguments, got {}", args.len()),
-                    &env,
                     span,
                 );
             }
@@ -696,7 +571,6 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                                 mc,
                                 root,
                                 "Read size argument must be a positive integer",
-                                &env,
                                 span,
                             );
                         }
@@ -708,7 +582,6 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                                 mc,
                                 root,
                                 "Read offset argument must be a non-negative integer",
-                                &env,
                                 span,
                             );
                         }
@@ -722,7 +595,6 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                                 mc,
                                 root,
                                 "Read buffer argument must be a buffer",
-                                &env,
                                 span,
                             );
                         }
@@ -732,26 +604,24 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                             mc,
                             root,
                             &format!("Failed to read from resource: {}", e),
-                            &env,
                             span,
                         )
                         .unwrap_err()
                     })?;
                     Ok(Value::Integer(bytes_read as i64))
                 }
-                _ => return type_error(mc, root, "Read argument must be a resource", &env, span),
+                _ => return type_error(mc, root, "Read argument must be a resource", span),
             }
         }),
     );
     map.insert(
         "write".to_string(),
-        make_builtin_function(mc, |mc, root, args, span, env| {
+        make_builtin_function(mc, |mc, root, args, span, _| {
             if args.len() != 4 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 4 arguments, got {}", args.len()),
-                    &env,
                     span,
                 );
             }
@@ -765,7 +635,6 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                                 mc,
                                 root,
                                 "Write size argument must be a positive integer",
-                                &env,
                                 span,
                             );
                         }
@@ -777,7 +646,6 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                                 mc,
                                 root,
                                 "Write offset argument must be a non-negative integer",
-                                &env,
                                 span,
                             );
                         }
@@ -789,7 +657,6 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                                 mc,
                                 root,
                                 "Write buffer argument must be a buffer",
-                                &env,
                                 span,
                             );
                         }
@@ -800,14 +667,13 @@ fn resource_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                             mc,
                             root,
                             &format!("Failed to write to resource: {}", e),
-                            &env,
                             span,
                         )
                         .unwrap_err()
                     })?;
                     Ok(Value::Integer(bytes_written as i64))
                 }
-                _ => return type_error(mc, root, "Write argument must be a resource", &env, span),
+                _ => return type_error(mc, root, "Write argument must be a resource", span),
             }
         }),
     );
@@ -858,22 +724,21 @@ fn class_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "super".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
-            let class = expect_class_arg(mc, root, &args[0], &env, expr)?;
+            let class = expect_class_arg(mc, root, &args[0], expr)?;
             let Some(parent) = class.borrow().parent else {
-                return type_error(mc, root, "Class has no parent", &env, expr);
+                return type_error(mc, root, "Class has no parent", expr);
             };
             let Some(ctor) = parent.borrow().constructor else {
-                return type_error(mc, root, "Parent class has no constructor", &env, expr);
+                return type_error(mc, root, "Parent class has no constructor", expr);
             };
             Ok(Value::Function(ctor))
         }),
@@ -895,13 +760,12 @@ fn integer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "to_string".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
@@ -911,13 +775,7 @@ fn integer_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                     StringVariant::from_string(&i.to_string()),
                 ))),
                 _ => {
-                    return type_error(
-                        mc,
-                        root,
-                        "to_string can only be called on Integer",
-                        &env,
-                        expr,
-                    );
+                    return type_error(mc, root, "to_string can only be called on Integer", expr);
                 }
             }
         }),
@@ -939,33 +797,31 @@ fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "length".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
             match &args[0] {
                 Value::String(arr) => Ok(Value::Integer(arr.len() as i64)),
                 _ => {
-                    return type_error(mc, root, "length can only be called on String", &env, expr);
+                    return type_error(mc, root, "length can only be called on String", expr);
                 }
             }
         }),
     );
     map.insert(
         "concat".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() < 2 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected at least 2 arguments, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
@@ -974,13 +830,7 @@ fn string_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                 .map(|arg| match arg {
                     Value::String(s) => Ok(s.to_string()),
                     _ => {
-                        return type_error(
-                            mc,
-                            root,
-                            "concat arguments must be strings",
-                            &env,
-                            expr,
-                        );
+                        return type_error(mc, root, "concat arguments must be strings", expr);
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1007,31 +857,29 @@ fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
     let mut map = HashMap::new();
     map.insert(
         "length".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    &env,
                     expr,
                 );
             }
             match &args[0] {
                 Value::Array(arr) => Ok(Value::Integer(arr.borrow().len() as i64)),
-                _ => return type_error(mc, root, "length can only be called on Array", &env, expr),
+                _ => return type_error(mc, root, "length can only be called on Array", expr),
             }
         }),
     );
     map.insert(
         "push".to_string(),
-        make_builtin_function(mc, |mc, root, args, expr, env| {
+        make_builtin_function(mc, |mc, root, args, expr, _| {
             if args.len() < 2 {
                 return function_argument_error(
                     mc,
                     root,
                     &format!("Expected at least 1 argument, got {}", args.len() - 1),
-                    &env,
                     expr,
                 );
             }
@@ -1043,7 +891,7 @@ fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
                     }
                     Ok(Value::Null)
                 }
-                _ => return type_error(mc, root, "push can only be called on Array", &env, expr),
+                _ => return type_error(mc, root, "push can only be called on Array", expr),
             }
         }),
     );
@@ -1059,5 +907,3 @@ fn array_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
         }),
     )
 }
-
-pub const STD: &str = include_str!("../../reference/std.yuzu");
