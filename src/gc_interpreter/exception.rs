@@ -5,9 +5,10 @@ use gc_arena::{Gc, Mutation, lock::RefLock};
 use crate::{
     gc_interpreter::{
         MyRoot, Value, get_std_env,
-        value::{ClassInstanceValue, LocatedError, StringVariant},
+        value::{ClassInstanceValue, IntVariant, LocatedError, StringVariant},
     },
     location::HasLocation,
+    parser::BinaryOp,
 };
 
 fn make_exception<'a>(mc: &Mutation<'a>, root: &MyRoot<'a>, msg: &str, variant: &str) -> Value<'a> {
@@ -61,7 +62,7 @@ pub fn type_error<'a, T>(
 pub fn array_index_out_of_bounds<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
-    index: i64,
+    index: IntVariant,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
     runtime_error(
@@ -140,6 +141,36 @@ pub fn duplicate_variable_definition<'a, T>(
         root,
         &format!("Duplicate variable definition: {}", name),
         "DuplicateVariableDefinition",
+        expr,
+    )
+}
+
+pub fn division_by_zero<'a, T>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    expr: impl HasLocation,
+) -> Result<T, LocatedError<'a>> {
+    runtime_error(mc, root, "Division by zero", "DivisionByZero", expr)
+}
+
+pub fn unsupported_binary_operation<'a, T>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    op: &BinaryOp,
+    left: &Value<'a>,
+    right: &Value<'a>,
+    expr: impl HasLocation,
+) -> Result<T, LocatedError<'a>> {
+    runtime_error(
+        mc,
+        root,
+        &format!(
+            "Unsupported operation: {} between {} and {}",
+            op,
+            left.get_type(),
+            right.get_type()
+        ),
+        "UnsupportedOperation",
         expr,
     )
 }

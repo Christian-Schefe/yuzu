@@ -180,8 +180,8 @@ pub enum Token<'a> {
     #[regex(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", |lex| lex.slice().parse::<f64>().map_err(|_| LexingError::InvalidChar(lex.slice().to_string()).at(lex.span())), priority = 3)]
     Number(f64),
 
-    #[regex(r"-?(?:0|[1-9]\d*)", |lex| lex.slice().parse::<i64>().map_err(|_| LexingError::InvalidChar(lex.slice().to_string()).at(lex.span())), priority = 4)]
-    Integer(i64),
+    #[regex(r"-?(?:0|[1-9]\d*)", |lex| lex.slice(), priority = 4)]
+    Integer(&'a str),
 
     #[regex(r"'([^'\\]|\\.)*'", |lex| {
         let slice = lex.slice();

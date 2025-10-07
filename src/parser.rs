@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use chumsky::{
     Parser,
@@ -199,15 +202,26 @@ where
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .then(colon_type_hint.clone())
             .then(expr.clone())
-            .map_with(|((params, return_type), body), extra| {
-                Box::new(located(
+            .try_map_with(|((params, return_type), body), extra| {
+                let duplicate_params =
+                    get_duplicates(params.iter().map(|(name, _)| name.to_string()));
+                if !duplicate_params.is_empty() {
+                    return Err(chumsky::error::Rich::custom(
+                        extra.span(),
+                        format!(
+                            "Duplicate function parameter names: {}",
+                            duplicate_params.into_iter().collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
+                }
+                Ok(Box::new(located(
                     Expression::FunctionLiteral {
                         parameters: params,
                         return_type,
                         body: Box::new(body),
                     },
                     extra.span(),
-                ))
+                )))
             });
 
         let let_ = just(Token::Let)
@@ -249,7 +263,7 @@ where
         let inline_expr = {
             let val = select! {
                 Token::Number(n) => Expression::Number(n),
-                Token::Integer(i) => Expression::Integer(i),
+                Token::Integer(i) => Expression::Integer(i.to_string()),
                 Token::Bool(b) => Expression::Bool(b),
                 Token::String(s) => Expression::String(s),
                 Token::Char(c) => Expression::String(c.to_string()),
@@ -660,19 +674,13 @@ where
                     let_.clone().map(|lf| {
                         if let Expression::Define {
                             name,
-                            value: expr,
+                            value,
                             type_hint,
                         } = lf.data
                         {
-                            let location = expr.location.clone();
-                            let func = Expression::FunctionLiteral {
-                                parameters: vec![],
-                                return_type: None,
-                                body: expr,
-                            };
                             ClassMember::Field {
                                 name,
-                                value: Located::new(func, location),
+                                value: *value,
                                 type_hint,
                                 is_static: false,
                             }
@@ -696,6 +704,21 @@ where
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
             )
             .try_map_with(|((name, parent), body), extra| {
+                let duplicates = get_duplicates(body.iter().map(|member| match member {
+                    ClassMember::Field { name, .. } | ClassMember::Method { name, .. } => {
+                        name.clone()
+                    }
+                    ClassMember::Constructor { .. } => "$constructor".to_string(),
+                }));
+                if !duplicates.is_empty() {
+                    return Err(chumsky::error::Rich::custom(
+                        extra.span(),
+                        format!(
+                            "Duplicate class member names: {}",
+                            duplicates.into_iter().collect::<Vec<_>>().join(", ")
+                        ),
+                    ));
+                }
                 Ok(located(
                     Expression::Define {
                         name,
@@ -840,4 +863,15 @@ fn needs_semi(expr: &Expression) -> bool {
         Expression::ClassLiteral { .. } => false,
         _ => true,
     }
+}
+
+fn get_duplicates(items: impl Iterator<Item = String>) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for item in items {
+        if !seen.insert(item.clone()) {
+            duplicates.insert(item);
+        }
+    }
+    duplicates
 }

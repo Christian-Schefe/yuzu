@@ -9,13 +9,14 @@ use crate::{
     ModulePath, ParsedProgram,
     gc_interpreter::{
         exception::{
-            array_index_out_of_bounds, duplicate_variable_definition, field_access_error,
-            type_error, undefined_variable, unhandled_control_flow,
+            array_index_out_of_bounds, division_by_zero, duplicate_variable_definition,
+            field_access_error, type_error, undefined_variable, unhandled_control_flow,
+            unsupported_binary_operation,
         },
         resolver::resolve_canonical_paths,
         value::{
-            ClassInstanceValue, ClassValue, Environment, FunctionValue, LocatedError, ModuleTree,
-            StringVariant, Value, variable_to_string,
+            ClassInstanceValue, ClassValue, Environment, FunctionValue, IntVariant, LocatedError,
+            ModuleTree, StringVariant, Value, variable_to_string,
         },
     },
     location::{Located, Location},
@@ -149,6 +150,14 @@ pub enum Kont<'a> {
         args: Vec<Value<'a>>,
         function: Option<Value<'a>>,
     },
+    ConstructorMakeInstance {
+        args: Vec<Value<'a>>,
+        class: GcRefLock<'a, ClassValue<'a>>,
+        function: Value<'a>,
+        fields_remaining: Vec<(String, &'a LocatedExpression)>,
+        fields: HashMap<String, Value<'a>>,
+        current_field: Option<String>,
+    },
     ReturnBarrier,
     Assign {
         target: &'a LocatedExpression,
@@ -264,7 +273,7 @@ fn interpret_frame_eval<'a>(
             *last = ExecResult::Value(Value::Number(*n));
         }
         Expression::Integer(i) => {
-            *last = ExecResult::Value(Value::Integer(*i));
+            *last = ExecResult::Value(Value::Integer(IntVariant::from_digit_string(i)));
         }
         Expression::String(s) => {
             *last = ExecResult::Value(Value::String(Gc::new(mc, StringVariant::from_string(s))));
@@ -687,16 +696,14 @@ fn interpret_frame_kont<'a>(
             let Some(right) = maybe_take_last_value(last) else {
                 return;
             };
-            if let Some(result) = interpret_simple_binary_op(op, left, right) {
-                *last = ExecResult::Value(result);
-            } else {
-                *last = convert_err(type_error(
-                    mc,
-                    root,
-                    &format!("Invalid operand types for binary operator {:?}", op),
-                    location,
-                ));
-            }
+            let result = match interpret_simple_binary_op(mc, root, op, left, right, &location) {
+                Ok(v) => v,
+                Err(e) => {
+                    *last = ExecResult::Error(e.data, e.location);
+                    return;
+                }
+            };
+            *last = ExecResult::Value(result);
         }
         Kont::Unary { op } => {
             let Some(value) = maybe_take_last_value(last) else {
@@ -858,17 +865,72 @@ fn interpret_frame_kont<'a>(
                     ));
                     return;
                 };
-
-                let instance = create_class_instance(mc, class);
-                args.insert(0, instance.clone());
-
+                let fields = get_class_fields(class);
                 stack.push(Frame::kont(
-                    Kont::Set(ExecResult::Value(instance)),
-                    env.clone(),
+                    Kont::ConstructorMakeInstance {
+                        args,
+                        class,
+                        fields_remaining: fields
+                            .into_iter()
+                            .map::<(String, &'a LocatedExpression), _>(|(k, v)| {
+                                (k.clone(), v.as_ref())
+                            })
+                            .rev()
+                            .collect(),
+                        fields: HashMap::new(),
+                        function,
+                        current_field: None,
+                    },
+                    env,
                     location.clone(),
                 ));
-                call_function(mc, root, stack, last, &location, env, args, &function);
             }
+        }
+        Kont::ConstructorMakeInstance {
+            mut args,
+            class,
+            mut fields_remaining,
+            mut fields,
+            function,
+            current_field,
+        } => {
+            if let Some(current_field) = current_field {
+                let Some(last_value) = maybe_take_last_value(last) else {
+                    return;
+                };
+                fields.insert(current_field, last_value);
+            }
+            if let Some((next_field, next_expr)) = fields_remaining.pop() {
+                stack.push(Frame::kont(
+                    Kont::ConstructorMakeInstance {
+                        args,
+                        class,
+                        fields_remaining,
+                        fields,
+                        function,
+                        current_field: Some(next_field),
+                    },
+                    env,
+                    location.clone(),
+                ));
+                stack.push(Frame::eval(next_expr, env));
+                return;
+            }
+            let instance = Value::ClassInstance(Gc::new(
+                mc,
+                RefLock::new(ClassInstanceValue {
+                    class: class.clone(),
+                    fields,
+                }),
+            ));
+            args.insert(0, instance.clone());
+
+            stack.push(Frame::kont(
+                Kont::Set(ExecResult::Value(instance)),
+                env.clone(),
+                location.clone(),
+            ));
+            call_function(mc, root, stack, last, &location, env, args, &function);
         }
         Kont::Assign { target, op } => {
             let Some(value) = maybe_take_last_value(last) else {
@@ -884,16 +946,13 @@ fn interpret_frame_kont<'a>(
                                 return;
                             }
                         };
-                        let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
-                            *last = convert_err(type_error(
-                                mc,
-                                root,
-                                &format!("Invalid operand types for binary operator {:?}", op),
-                                location,
-                            ));
-                            return;
-                        };
-                        result
+                        match interpret_simple_binary_op(mc, root, op, left_val, value, &location) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                *last = ExecResult::Error(e.data, e.location);
+                                return;
+                            }
+                        }
                     } else {
                         value
                     };
@@ -939,16 +998,13 @@ fn interpret_frame_kont<'a>(
                     *last = convert_err(field_access_error(mc, root, field, &location));
                     return;
                 };
-                let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
-                    *last = convert_err(type_error(
-                        mc,
-                        root,
-                        &format!("Invalid operand types for binary operator {:?}", op),
-                        location,
-                    ));
-                    return;
-                };
-                result
+                match interpret_simple_binary_op(mc, root, op, left_val, value, &location) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        *last = ExecResult::Error(e.data, e.location);
+                        return;
+                    }
+                }
             } else {
                 value
             };
@@ -986,16 +1042,13 @@ fn interpret_frame_kont<'a>(
                         return;
                     }
                 };
-                let Some(result) = interpret_simple_binary_op(op, left_val, value) else {
-                    *last = convert_err(type_error(
-                        mc,
-                        root,
-                        &format!("Invalid operand types for binary operator {:?}", op),
-                        location,
-                    ));
-                    return;
-                };
-                result
+                match interpret_simple_binary_op(mc, root, op, left_val, value, &location) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        *last = ExecResult::Error(e.data, e.location);
+                        return;
+                    }
+                }
             } else {
                 value
             };
@@ -1157,7 +1210,7 @@ fn set_at_index<'a>(
                 ));
             };
             let mut arr_ref = arr.borrow_mut(mc);
-            if let Ok(index) = TryInto::<usize>::try_into(i)
+            if let Some(index) = i.try_to_usize()
                 && index < arr_ref.len()
             {
                 arr_ref[index] = result.clone();
@@ -1166,6 +1219,12 @@ fn set_at_index<'a>(
                 convert_err(array_index_out_of_bounds(mc, root, i, location))
             }
         }
+        Value::String(_) => convert_err(type_error(
+            mc,
+            root,
+            "Strings are immutable; cannot assign to index",
+            location,
+        )),
         Value::TypedSlice {
             buffer,
             start,
@@ -1183,11 +1242,14 @@ fn set_at_index<'a>(
             let mut buf_ref = buffer.borrow_mut(mc);
             let byte_start = start * buffer_type.byte_size();
             let byte_end = byte_start + length * buffer_type.byte_size();
-            if let Ok(index) = TryInto::<usize>::try_into(i)
+            if let Some(index) = i.try_to_usize()
                 && index < buf_ref.len()
             {
                 let byte_offset = byte_start + index * buffer_type.byte_size();
-                if buffer_type.try_write_value(&mut buf_ref[byte_offset..byte_end], &result) {
+                if buffer_type
+                    .try_write_value(&mut buf_ref[byte_offset..byte_end], &result)
+                    .is_some()
+                {
                     ExecResult::Value(result)
                 } else {
                     convert_err(type_error(
@@ -1280,43 +1342,52 @@ fn interpret_short_circuit<'a>(
 fn interpret_simple_unary_op<'a>(op: &UnaryOp, value: Value<'a>) -> Option<Value<'a>> {
     Some(match (op, value) {
         (UnaryOp::Negate, Value::Number(v)) => Value::Number(-v),
-        (UnaryOp::Negate, Value::Integer(v)) => Value::Integer(-v),
-        (UnaryOp::Not, Value::Integer(v)) => Value::Integer(!v),
+        (UnaryOp::Negate, Value::Integer(v)) => Value::Integer(v.neg()),
+        (UnaryOp::Not, Value::Integer(v)) => Value::Integer(v.invert()),
         (UnaryOp::Not, Value::Bool(v)) => Value::Bool(!v),
         _ => return None,
     })
 }
 
 fn interpret_simple_binary_op<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
     op: &BinaryOp,
     left: Value<'a>,
     right: Value<'a>,
-) -> Option<Value<'a>> {
-    Some(match (op, left, right) {
+    location: &Location,
+) -> Result<Value<'a>, LocatedError<'a>> {
+    Ok(match (op, left, right) {
         (BinaryOp::Add, Value::Number(l), Value::Number(r)) => Value::Number(l + r),
-        (BinaryOp::Add, Value::Integer(l), Value::Integer(r)) => Value::Integer(l + r),
-        (BinaryOp::Add, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 + r),
-        (BinaryOp::Add, Value::Number(l), Value::Integer(r)) => Value::Number(l + r as f64),
+        (BinaryOp::Add, Value::Integer(l), Value::Integer(r)) => Value::Integer(l.add(r)),
+        (BinaryOp::Add, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() + r),
+        (BinaryOp::Add, Value::Number(l), Value::Integer(r)) => Value::Number(l + r.to_f64()),
 
         (BinaryOp::Subtract, Value::Number(l), Value::Number(r)) => Value::Number(l - r),
-        (BinaryOp::Subtract, Value::Integer(l), Value::Integer(r)) => Value::Integer(l - r),
-        (BinaryOp::Subtract, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 - r),
-        (BinaryOp::Subtract, Value::Number(l), Value::Integer(r)) => Value::Number(l - r as f64),
+        (BinaryOp::Subtract, Value::Integer(l), Value::Integer(r)) => Value::Integer(l.sub(r)),
+        (BinaryOp::Subtract, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() - r),
+        (BinaryOp::Subtract, Value::Number(l), Value::Integer(r)) => Value::Number(l - r.to_f64()),
 
         (BinaryOp::Multiply, Value::Number(l), Value::Number(r)) => Value::Number(l * r),
-        (BinaryOp::Multiply, Value::Integer(l), Value::Integer(r)) => Value::Integer(l * r),
-        (BinaryOp::Multiply, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 * r),
-        (BinaryOp::Multiply, Value::Number(l), Value::Integer(r)) => Value::Number(l * r as f64),
+        (BinaryOp::Multiply, Value::Integer(l), Value::Integer(r)) => Value::Integer(l.mul(r)),
+        (BinaryOp::Multiply, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() * r),
+        (BinaryOp::Multiply, Value::Number(l), Value::Integer(r)) => Value::Number(l * r.to_f64()),
 
         (BinaryOp::Divide, Value::Number(l), Value::Number(r)) => Value::Number(l / r),
-        (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => Value::Integer(l / r),
-        (BinaryOp::Divide, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 / r),
-        (BinaryOp::Divide, Value::Number(l), Value::Integer(r)) => Value::Number(l / r as f64),
+        (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => Value::Integer(
+            l.div(r)
+                .ok_or_else(|| division_by_zero::<Value<'a>>(mc, root, location).unwrap_err())?,
+        ),
+        (BinaryOp::Divide, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() / r),
+        (BinaryOp::Divide, Value::Number(l), Value::Integer(r)) => Value::Number(l / r.to_f64()),
 
         (BinaryOp::Modulo, Value::Number(l), Value::Number(r)) => Value::Number(l % r),
-        (BinaryOp::Modulo, Value::Integer(l), Value::Integer(r)) => Value::Integer(l % r),
-        (BinaryOp::Modulo, Value::Integer(l), Value::Number(r)) => Value::Number(l as f64 % r),
-        (BinaryOp::Modulo, Value::Number(l), Value::Integer(r)) => Value::Number(l % r as f64),
+        (BinaryOp::Modulo, Value::Integer(l), Value::Integer(r)) => Value::Integer(
+            l.rem(r)
+                .ok_or_else(|| division_by_zero::<Value<'a>>(mc, root, location).unwrap_err())?,
+        ),
+        (BinaryOp::Modulo, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() % r),
+        (BinaryOp::Modulo, Value::Number(l), Value::Integer(r)) => Value::Number(l % r.to_f64()),
 
         (BinaryOp::And, Value::Bool(l), Value::Bool(r)) => Value::Bool(l && r),
         (BinaryOp::Or, Value::Bool(l), Value::Bool(r)) => Value::Bool(l || r),
@@ -1333,16 +1404,22 @@ fn interpret_simple_binary_op<'a>(
         (BinaryOp::NotEqual, l, r) => Value::Bool(l != r),
 
         (BinaryOp::Less, Value::Number(l), Value::Number(r)) => Value::Bool(l < r),
-        (BinaryOp::Less, Value::Integer(l), Value::Integer(r)) => Value::Bool(l < r),
+        (BinaryOp::Less, Value::Integer(l), Value::Integer(r)) => Value::Bool(l.less(&r)),
         (BinaryOp::LessEqual, Value::Number(l), Value::Number(r)) => Value::Bool(l <= r),
-        (BinaryOp::LessEqual, Value::Integer(l), Value::Integer(r)) => Value::Bool(l <= r),
+        (BinaryOp::LessEqual, Value::Integer(l), Value::Integer(r)) => {
+            Value::Bool(l.less_equal(&r))
+        }
 
         (BinaryOp::Greater, Value::Number(l), Value::Number(r)) => Value::Bool(l > r),
-        (BinaryOp::Greater, Value::Integer(l), Value::Integer(r)) => Value::Bool(l > r),
+        (BinaryOp::Greater, Value::Integer(l), Value::Integer(r)) => Value::Bool(l.greater(&r)),
         (BinaryOp::GreaterEqual, Value::Number(l), Value::Number(r)) => Value::Bool(l >= r),
-        (BinaryOp::GreaterEqual, Value::Integer(l), Value::Integer(r)) => Value::Bool(l >= r),
+        (BinaryOp::GreaterEqual, Value::Integer(l), Value::Integer(r)) => {
+            Value::Bool(l.greater_equal(&r))
+        }
 
-        _ => return None,
+        (_, left, right) => {
+            return unsupported_binary_operation(mc, root, op, &left, &right, location);
+        }
     })
 }
 
@@ -1430,23 +1507,20 @@ fn get_property<'a>(
     }
 }
 
-fn create_class_instance<'a>(mc: &Mutation<'a>, class: GcRefLock<'a, ClassValue<'a>>) -> Value<'a> {
-    let mut fields = HashMap::new();
+fn get_class_fields<'a>(
+    class: GcRefLock<'a, ClassValue<'a>>,
+) -> Vec<(String, Gc<'a, StaticCollect<LocatedExpression>>)> {
+    let mut fields = Vec::new();
     let mut current_class = Some(class);
     while let Some(class) = current_class {
         let class_ref = class.borrow();
-        for (key, value) in class_ref.instance_fields.iter() {
-            if !fields.contains_key(key) {
-                println!("TODO: Insert key: {}", key);
-                //fields.insert(key.clone(), value.clone());
-            }
+        for (key, value) in class_ref.instance_fields.iter().rev() {
+            fields.push((key.clone(), *value));
         }
         current_class = class_ref.parent.clone();
     }
-    Value::ClassInstance(Gc::new(
-        mc,
-        RefLock::new(ClassInstanceValue { class, fields }),
-    ))
+    fields.reverse();
+    fields
 }
 
 fn get_at_index<'a>(
@@ -1467,11 +1541,29 @@ fn get_at_index<'a>(
                 ));
             };
             let arr_ref = arr.borrow();
-            if let Ok(index) = TryInto::<usize>::try_into(i)
+            if let Some(index) = i.try_to_usize()
                 && index < arr_ref.len()
             {
                 let value = arr_ref[index].clone();
                 ExecResult::Value(value)
+            } else {
+                convert_err(array_index_out_of_bounds(mc, root, i, location))
+            }
+        }
+        Value::String(s) => {
+            let Value::Integer(i) = index else {
+                return convert_err(type_error(
+                    mc,
+                    root,
+                    "String index must be an integer",
+                    location,
+                ));
+            };
+            if let Some(index) = i.try_to_usize() {
+                let Some(value) = StringVariant::slice(mc, s, index, 1) else {
+                    return convert_err(array_index_out_of_bounds(mc, root, i, location));
+                };
+                ExecResult::Value(Value::String(value))
             } else {
                 convert_err(array_index_out_of_bounds(mc, root, i, location))
             }
@@ -1493,7 +1585,7 @@ fn get_at_index<'a>(
             let byte_start = start * buffer_type.byte_size();
             let byte_end = byte_start + length * buffer_type.byte_size();
             let arr_ref = buffer.borrow();
-            if let Ok(index) = TryInto::<usize>::try_into(i)
+            if let Some(index) = i.try_to_usize()
                 && index < arr_ref.len()
             {
                 let byte_offset = byte_start + index * buffer_type.byte_size();
@@ -1632,7 +1724,7 @@ fn make_class_literal<'a>(
             };
             let instance_fields = fields
                 .iter()
-                .map(|(name, expr, _)| (name.clone(), expression_to_function(mc, expr, env)))
+                .map(|(name, expr, _)| (name.clone(), Gc::new(mc, StaticCollect(*expr.clone()))))
                 .collect();
             let methods = methods
                 .iter()

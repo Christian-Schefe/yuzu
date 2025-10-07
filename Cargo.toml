@@ -10,3 +10,6 @@ clap = { version = "4.5.48", features = ["derive"] }
 clio = { version = "0.3.5", features = ["clap-parse"] }
 gc-arena = "0.5.3"
 logos = "0.15.1"
+num-bigint = { version = "0.4.6", features = ["rand"] }
+num-traits = "0.2.19"
+rand = "0.8.5"

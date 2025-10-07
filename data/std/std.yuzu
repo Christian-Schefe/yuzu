@@ -1,3 +1,5 @@
+mod fs;
+
 class Iterator {
     fn map(map) new MapIterator(this, map);
     fn collect() {
@@ -64,51 +66,13 @@ class Array {
 
 class String {
     fn iter() new IndexIterator(this);
+    fn is_empty() this.length() == 0;
 }
 
 class Exception {
     let message = "";
     constructor(message) {
         this.message = message;
-    }
-}
-
-class File {
-    let file = null;
-    constructor(path) {
-        print(File);
-        this.file = File.open(path);
-    }
-    fn close() {
-        if (this.file == null) return;
-        this.file.close();
-        this.file = null;
-    }
-    fn read(n) {
-        if (this.file == null) raise new Exception("File is closed");
-        let bytes = this.file.read(n);
-        bytes.to_string()
-    }
-    fn read_to_end() {
-        if (this.file == null) raise new Exception("File is closed");
-        let str = "";
-        while (true) {
-            let buffer = Buffer.with_size(8192);
-            let read = this.file.read(buffer, buffer.length(), 0);
-            if (read == 0) break;
-            str = str.concat(buffer.to_string());
-        }
-        str
-    }
-    fn write_string(string) {
-        if (this.file == null) raise new Exception("File is closed");
-        let buffer = Buffer.from_string(string);
-        let offset = 0;
-        let len = buffer.length();
-        while (offset < len) {
-            let written = this.file.write(buffer, len - offset, offset);
-            offset += written;
-        }
     }
 }
 

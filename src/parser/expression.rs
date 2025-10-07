@@ -10,7 +10,7 @@ pub type LocatedExpression = Located<Expression>;
 pub enum Expression {
     Null,
     Number(f64),
-    Integer(i64),
+    Integer(String),
     Bool(bool),
     String(String),
     Ident(Identifier),
