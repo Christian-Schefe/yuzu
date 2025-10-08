@@ -13,10 +13,10 @@ use crate::{
 
 fn make_exception<'a>(mc: &Mutation<'a>, root: &MyRoot<'a>, msg: &str, variant: &str) -> Value<'a> {
     let std_env = get_std_env(root);
-    let p = if let Some(Value::Class(p)) = std_env.get(variant) {
+    let p = if let Some(Value::Class(p)) = std_env.get_simple(variant) {
         p
     } else {
-        let Some(Value::Class(p)) = std_env.get("Exception") else {
+        let Some(Value::Class(p)) = std_env.get_simple("Exception") else {
             panic!("Exception class not found");
         };
         p
@@ -103,7 +103,7 @@ pub fn unhandled_control_flow<'a, T>(
 pub fn field_access_error<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,
-    field: String,
+    field: &str,
     expr: impl HasLocation,
 ) -> Result<T, LocatedError<'a>> {
     runtime_error(
@@ -111,6 +111,21 @@ pub fn field_access_error<'a, T>(
         root,
         &format!("Field access error: {}", field),
         "FieldAccessError",
+        expr,
+    )
+}
+
+pub fn cyclic_static_initialization<'a, T>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    name: &str,
+    expr: impl HasLocation,
+) -> Result<T, LocatedError<'a>> {
+    runtime_error(
+        mc,
+        root,
+        &format!("Cyclic static initialization: {}", name),
+        "CyclicStaticInitialization",
         expr,
     )
 }
@@ -171,6 +186,21 @@ pub fn unsupported_binary_operation<'a, T>(
             right.get_type()
         ),
         "UnsupportedOperation",
+        expr,
+    )
+}
+
+pub fn cannot_assign_to_constant<'a, T>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    name: &str,
+    expr: impl HasLocation,
+) -> Result<T, LocatedError<'a>> {
+    runtime_error(
+        mc,
+        root,
+        &format!("Cannot assign to constant: {}", name),
+        "AssignmentToConstant",
         expr,
     )
 }

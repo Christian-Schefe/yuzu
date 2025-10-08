@@ -19,3 +19,11 @@ class TestClass2 : TestClass {
         return 5;
     }
 }
+
+static my_static2 = { print("my_static2", 41); return {val: 10}; };
+static my_static = { print("my_static", my_static2); {val: 10} };
+
+static static_fn = (x) => {
+    print("static_fn", x);
+    return x * 2;
+};

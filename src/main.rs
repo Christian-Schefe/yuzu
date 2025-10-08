@@ -9,7 +9,7 @@ use clio::Input;
 
 use crate::{
     location::Located,
-    parser::{LocatedExpression, ParsedModule},
+    parser::{LocatedExpression, ParsedModuleItem},
 };
 
 mod gc_interpreter;
@@ -18,9 +18,11 @@ mod location;
 mod parser;
 
 #[derive(Debug, Parser)]
+#[clap(trailing_var_arg = true)]
 struct Args {
     #[clap(value_parser)]
     input: Input,
+    other: Vec<String>,
 }
 
 fn main() {
@@ -64,7 +66,7 @@ fn main() {
 
     let sources = parsed.get_sources();
 
-    let interpreted = gc_interpreter::interpret_global(parsed, pwd);
+    let interpreted = gc_interpreter::interpret_global(parsed, pwd, args.other);
     if let Err(err) = interpreted {
         let err_message = err.data;
         Report::build(
@@ -93,8 +95,22 @@ fn parse_module_tree(
     let contents = std::fs::read_to_string(&file_path).unwrap();
     let pm = parse_string(&contents, path.to_string())?;
     let mut children = HashMap::new();
+    let mut expressions = Vec::new();
+    let mut imports = Vec::new();
+
     let mut success = true;
-    for child in pm.children {
+    for item in pm {
+        let child = match item {
+            ParsedModuleItem::Expression(e) => {
+                expressions.push(e);
+                continue;
+            }
+            ParsedModuleItem::Import(i) => {
+                imports.push(i);
+                continue;
+            }
+            ParsedModuleItem::Module(m) => m,
+        };
         let child_module_path = path.push(child.data.clone());
         let file_parent = std::path::Path::new(&file_path).parent().unwrap();
         let child_file_path = file_parent.join(format!("{}.yuzu", child.data));
@@ -135,13 +151,13 @@ fn parse_module_tree(
     }
     Ok(ParsedModuleTree {
         children,
-        expressions: pm.expressions,
-        imports: pm.imports,
+        expressions,
+        imports,
         source: contents,
     })
 }
 
-fn parse_string(input: &str, location: String) -> Result<ParsedModule, ()> {
+fn parse_string(input: &str, location: String) -> Result<Vec<ParsedModuleItem>, ()> {
     let lexed = lexer::lex(input);
     if let Err(err) = lexed {
         Report::build(ReportKind::Error, (location.clone(), err.span.clone()))

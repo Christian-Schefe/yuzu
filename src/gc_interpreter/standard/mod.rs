@@ -10,7 +10,9 @@ use crate::{
         MyRoot,
         exception::{function_argument_error, io_error, type_error},
         resource::SocketResource,
-        standard::{fs::define_fs_globals, rand::define_rand_globals},
+        standard::{
+            fs::define_fs_globals, rand::define_rand_globals, system::define_system_globals,
+        },
         value::{
             ClassInstanceValue, ClassValue, Environment, FunctionValue, IntVariant, LocatedError,
             StringVariant, TypedBufferType, Value, variable_to_string,
@@ -21,6 +23,7 @@ use crate::{
 
 mod fs;
 mod rand;
+mod system;
 
 fn expect_arg_len<'a>(
     mc: &Mutation<'a>,
@@ -73,6 +76,27 @@ fn expect_class_instance_arg<'a>(
             root,
             &format!(
                 "Expected argument to be a ClassInstance, got {}",
+                value.get_type()
+            ),
+            expr,
+        )
+    }
+}
+
+fn expect_object_arg<'a>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    value: &Value<'a>,
+    expr: &Location,
+) -> Result<GcRefLock<'a, HashMap<String, Value<'a>>>, LocatedError<'a>> {
+    if let Value::Object(o) = value {
+        Ok(o.clone())
+    } else {
+        type_error(
+            mc,
+            root,
+            &format!(
+                "Expected argument to be an Object, got {}",
                 value.get_type()
             ),
             expr,
@@ -194,6 +218,7 @@ pub fn define_globals<'a>(mc: &Mutation<'a>, env: Gc<'a, Environment<'a>>) {
         })),
     );
 
+    define_system_globals(mc, env);
     define_fs_globals(mc, env);
     define_rand_globals(mc, env);
 
@@ -261,7 +286,7 @@ pub fn define_globals<'a>(mc: &Mutation<'a>, env: Gc<'a, Environment<'a>>) {
     for (name, class) in root_prototypes {
         env.define(mc, &name, Value::Class(class));
     }
-    let Some(Value::Class(typed_slice_prototype)) = env.get("TypedSlice") else {
+    let Some(Value::Class(typed_slice_prototype)) = env.get_simple("TypedSlice") else {
         panic!("TypedSlice prototype not found");
     };
 
@@ -641,15 +666,29 @@ fn exception_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
 }
 
 fn object_prototype<'a>(mc: &Mutation<'a>) -> GcRefLock<'a, ClassValue<'a>> {
-    let map = HashMap::new();
+    let mut map = HashMap::new();
+    map.insert(
+        "keys".to_string(),
+        make_builtin_function(mc, |mc, root, args, expr, _| {
+            expect_arg_len(mc, root, &args, 1, expr)?;
+            let obj = expect_object_arg(mc, root, &args[0], expr)?;
+            let keys = obj
+                .borrow()
+                .keys()
+                .cloned()
+                .map(|k| Value::String(Gc::new(mc, StringVariant::from_string(&k))))
+                .collect::<Vec<_>>();
+            Ok(Value::Array(Gc::new(mc, RefLock::new(keys))))
+        }),
+    );
     Gc::new(
         mc,
         RefLock::new(ClassValue {
-            static_fields: map,
+            static_fields: HashMap::new(),
             instance_fields: Vec::new(),
             constructor: None,
             methods: HashMap::new(),
-            static_methods: HashMap::new(),
+            static_methods: map,
             parent: None,
         }),
     )

@@ -11,7 +11,11 @@ use std::{
 
 use crate::{
     ModulePath,
-    gc_interpreter::{LocatedExpression, MyRoot},
+    gc_interpreter::{
+        LocatedExpression, MyRoot,
+        exception::{cannot_assign_to_constant, cyclic_static_initialization, undefined_variable},
+        interpret,
+    },
     location::{Located, Location},
 };
 
@@ -660,17 +664,33 @@ pub struct ClassInstanceValue<'a> {
 pub struct ClassValue<'a> {
     pub instance_fields: Vec<(String, Gc<'a, StaticCollect<LocatedExpression>>)>,
     pub constructor: Option<GcRefLock<'a, FunctionValue<'a>>>,
-    pub static_fields: HashMap<String, Result<Value<'a>, GcRefLock<'a, FunctionValue<'a>>>>, // value or lazy initializer
+    pub static_fields: HashMap<String, StaticValue<'a>>,
     pub methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub static_methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub parent: Option<GcRefLock<'a, ClassValue<'a>>>,
 }
 
+#[derive(Collect, Debug, Clone)]
+#[collect(no_drop)]
+pub enum StaticValue<'a> {
+    Uninitialized(Gc<'a, StaticCollect<LocatedExpression>>),
+    BeingInitialized,
+    Initialized(Value<'a>),
+}
+
 #[derive(Clone, Collect, Debug)]
 #[collect(no_drop)]
 pub struct Environment<'a> {
-    values: GcRefLock<'a, HashMap<String, (Value<'a>, bool)>>,
+    values: GcRefLock<'a, HashMap<String, EnvValue<'a>>>,
     parent: Option<Gc<'a, Environment<'a>>>,
+}
+
+#[derive(Clone, Collect, Debug)]
+#[collect(no_drop)]
+pub enum EnvValue<'a> {
+    Value(Value<'a>),
+    ConstValue(Value<'a>),
+    Static(StaticValue<'a>),
 }
 
 impl<'a> Environment<'a> {
@@ -686,12 +706,12 @@ impl<'a> Environment<'a> {
         source: Gc<'a, Environment<'a>>,
         target: Gc<'a, Environment<'a>>,
     ) {
-        for (k, (v, is_const)) in source.values.borrow().iter() {
-            if *is_const {
-                target.define_const(mc, k, v.clone());
-            } else {
-                target.define(mc, k, v.clone());
-            }
+        for (k, v) in source.values.borrow().iter() {
+            match v {
+                EnvValue::Value(val) => target.define(mc, k, val.clone()),
+                EnvValue::ConstValue(val) => target.define_const(mc, k, val.clone()),
+                EnvValue::Static(s) => target.define_static(mc, k, s.clone()),
+            };
         }
     }
 
@@ -702,44 +722,136 @@ impl<'a> Environment<'a> {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<Value<'a>> {
-        if let Some((val, _)) = self.values.borrow().get(name) {
-            Some(val.clone())
-        } else if let Some(parent) = &self.parent {
-            parent.get(name)
+    pub fn get(
+        env: Gc<'a, Environment<'a>>,
+        mc: &Mutation<'a>,
+        root: &MyRoot<'a>,
+        name: &str,
+        location: &Location,
+    ) -> Result<Value<'a>, LocatedError<'a>> {
+        let mut values = env.values.borrow_mut(mc);
+        if let Some(v) = values.get_mut(name) {
+            match v {
+                EnvValue::Value(val) | EnvValue::ConstValue(val) => Ok(val.clone()),
+                EnvValue::Static(s) => match s {
+                    StaticValue::Initialized(val) => Ok(val.clone()),
+                    StaticValue::BeingInitialized => {
+                        cyclic_static_initialization(mc, root, name, location)
+                    }
+                    StaticValue::Uninitialized(expr) => {
+                        let expr = *expr;
+                        *s = StaticValue::BeingInitialized;
+                        drop(values);
+                        let val = interpret(mc, root, expr.as_ref(), env)?;
+                        let mut values = env.values.borrow_mut(mc);
+                        let Some(v) = values.get_mut(name) else {
+                            unreachable!()
+                        };
+                        let EnvValue::Static(s) = v else {
+                            unreachable!()
+                        };
+                        *s = StaticValue::Initialized(val.clone());
+                        Ok(val)
+                    }
+                },
+            }
+        } else if let Some(parent) = env.parent {
+            Environment::get(parent, mc, root, name, location)
         } else {
-            None
+            drop(values);
+            undefined_variable(mc, root, name, location)
         }
     }
 
-    pub fn set(&self, mutation: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
-        if matches!(self.values.borrow().get(name), Some((_, false))) {
-            self.values
-                .borrow_mut(mutation)
-                .insert(name.to_string(), (value, false));
+    pub fn exists(&self, name: &str) -> bool {
+        if self.values.borrow().contains_key(name) {
             true
         } else if let Some(parent) = &self.parent {
-            parent.set(mutation, name, value)
+            parent.exists(name)
         } else {
             false
         }
     }
 
-    pub fn define(&self, mutation: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
-        let mut map = self.values.borrow_mut(mutation);
+    pub fn get_simple(&self, name: &str) -> Option<Value<'a>> {
+        if let Some(v) = self.values.borrow().get(name) {
+            match v {
+                EnvValue::Value(val) | EnvValue::ConstValue(val) => Some(val.clone()),
+                EnvValue::Static(s) => match s {
+                    StaticValue::Initialized(val) => Some(val.clone()),
+                    _ => None,
+                },
+            }
+        } else if let Some(parent) = &self.parent {
+            parent.get_simple(name)
+        } else {
+            None
+        }
+    }
+
+    pub fn set(
+        env: Gc<'a, Environment<'a>>,
+        mc: &Mutation<'a>,
+        root: &MyRoot<'a>,
+        name: &str,
+        value: Value<'a>,
+        location: &Location,
+    ) -> Result<(), LocatedError<'a>> {
+        if let Some(EnvValue::Value(v)) = env.values.borrow_mut(mc).get_mut(name) {
+            *v = value;
+            Ok(())
+        } else if let Some(_) = env.values.borrow_mut(mc).get_mut(name) {
+            cannot_assign_to_constant(mc, root, name, location)
+        } else if let Some(parent) = &env.parent {
+            Environment::set(*parent, mc, root, name, value, location)
+        } else {
+            undefined_variable(mc, root, name, location)
+        }
+    }
+
+    pub fn import_from(
+        &self,
+        mc: &Mutation<'a>,
+        from_env: Gc<'a, Environment<'a>>,
+        name: &str,
+    ) -> bool {
+        let from_ref = from_env.values.borrow();
+        if let Some(val) = from_ref.get(name) {
+            match val {
+                EnvValue::Value(v) | EnvValue::ConstValue(v) => {
+                    self.define_const(mc, name, v.clone())
+                }
+                EnvValue::Static(s) => self.define_static(mc, name, s.clone()),
+            }
+        } else {
+            false
+        }
+    }
+
+    pub fn define(&self, mc: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
+        let mut map = self.values.borrow_mut(mc);
         if map.contains_key(name) {
             return false;
         }
-        map.insert(name.to_string(), (value, false));
+        map.insert(name.to_string(), EnvValue::Value(value));
         true
     }
 
-    pub fn define_const(&self, mutation: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
-        let mut map = self.values.borrow_mut(mutation);
+    pub fn define_const(&self, mc: &Mutation<'a>, name: &str, value: Value<'a>) -> bool {
+        let mut map = self.values.borrow_mut(mc);
         if map.contains_key(name) {
             return false;
         }
-        map.insert(name.to_string(), (value, true));
+        map.insert(name.to_string(), EnvValue::ConstValue(value));
+        true
+    }
+
+    pub fn define_static(&self, mc: &Mutation<'a>, name: &str, value: StaticValue<'a>) -> bool {
+        let mut map = self.values.borrow_mut(mc);
+        if map.contains_key(name) {
+            return false;
+        }
+        map.insert(name.to_string(), EnvValue::Static(value));
         true
     }
 }
@@ -817,12 +929,12 @@ pub fn variable_to_string(var: &Value) -> String {
                 .iter()
                 .map(|(k, v)| {
                     format!(
-                        "{}: {} {}",
+                        "{}: {}",
                         k,
-                        v.is_ok(),
                         match v {
-                            Ok(val) => variable_to_string(&val),
-                            Err(func) => variable_to_string(&Value::Function(*func)),
+                            StaticValue::Uninitialized(_) => "<uninitialized>".to_string(),
+                            StaticValue::BeingInitialized => "<being initialized>".to_string(),
+                            StaticValue::Initialized(v) => variable_to_string(v),
                         }
                     )
                 })

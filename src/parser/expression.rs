@@ -1,7 +1,7 @@
 use crate::{
     CanonicalPath,
     location::Located,
-    parser::{BinaryOp, UnaryOp, types::TypeHint},
+    parser::{BinaryOp, UnaryOp},
 };
 
 pub type LocatedExpression = Located<Expression>;
@@ -18,15 +18,18 @@ pub enum Expression {
     Continue,
     Return(Option<Box<LocatedExpression>>),
     ArrayLiteral(Vec<LocatedExpression>),
+    StaticDefine {
+        name: String,
+        value: Box<LocatedExpression>,
+    },
     FunctionLiteral {
-        parameters: Vec<(String, Option<TypeHint>)>,
-        return_type: Option<TypeHint>,
+        parameters: Vec<String>,
         body: Box<LocatedExpression>,
     },
     ClassLiteral {
         parent: Option<Identifier>,
-        fields: Vec<(String, Box<LocatedExpression>, Option<TypeHint>)>,
-        static_fields: Vec<(String, Box<LocatedExpression>, Option<TypeHint>)>,
+        fields: Vec<(String, Box<LocatedExpression>)>,
+        static_fields: Vec<(String, Box<LocatedExpression>)>,
         constructor: Option<Box<LocatedExpression>>,
         methods: Vec<(String, Box<LocatedExpression>)>,
         static_methods: Vec<(String, Box<LocatedExpression>)>,
@@ -50,7 +53,6 @@ pub enum Expression {
     Define {
         name: String,
         value: Box<LocatedExpression>,
-        type_hint: Option<TypeHint>,
     },
     Block(Vec<LocatedExpression>, Option<Box<LocatedExpression>>),
     If {
@@ -98,7 +100,6 @@ pub enum ClassMember {
     Field {
         name: String,
         value: LocatedExpression,
-        type_hint: Option<TypeHint>,
         is_static: bool,
     },
     Method {
@@ -130,13 +131,12 @@ impl ClassMember {
                 ClassMember::Field {
                     name,
                     value,
-                    type_hint,
                     is_static,
                 } => {
                     if is_static {
-                        static_fields.push((name, Box::new(value), type_hint));
+                        static_fields.push((name, Box::new(value)));
                     } else {
-                        fields.push((name, Box::new(value), type_hint));
+                        fields.push((name, Box::new(value)));
                     }
                 }
                 ClassMember::Method {
@@ -166,10 +166,10 @@ impl ClassMember {
     }
 }
 
-pub struct ParsedModule {
-    pub imports: Vec<Located<CanonicalPath>>,
-    pub expressions: Vec<LocatedExpression>,
-    pub children: Vec<Located<String>>,
+pub enum ParsedModuleItem {
+    Expression(LocatedExpression),
+    Import(Located<CanonicalPath>),
+    Module(Located<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +211,6 @@ pub fn desugar_iter_loop(
         Expression::Define {
             name: "$iterable".to_string(),
             value: Box::new(get_iterable_call),
-            type_hint: None,
         },
         iterable.location.clone(),
     );
@@ -231,7 +230,6 @@ pub fn desugar_iter_loop(
         Expression::Define {
             name: "$item".to_string(),
             value: Box::new(get_item_call.clone()),
-            type_hint: None,
         },
         iterable.location.clone(),
     );
@@ -265,7 +263,6 @@ pub fn desugar_iter_loop(
         Expression::Define {
             name: item.clone(),
             value: Box::new(get_inner_item_value.clone()),
-            type_hint: None,
         },
         iterable.location.clone(),
     );
@@ -312,11 +309,10 @@ impl LocatedExpression {
             Expression::ObjectLiteral(fields) => fields
                 .iter_mut()
                 .for_each(|(_, v)| v.set_module(module_path)),
-
+            Expression::StaticDefine { value, .. } => value.set_module(module_path),
             Expression::FunctionLiteral {
                 body,
                 parameters: _,
-                return_type: _,
             } => body.set_module(module_path),
             Expression::ClassLiteral {
                 parent: _,
@@ -328,10 +324,10 @@ impl LocatedExpression {
             } => {
                 fields
                     .iter_mut()
-                    .for_each(|(_, v, _)| v.set_module(module_path));
+                    .for_each(|(_, v)| v.set_module(module_path));
                 static_fields
                     .iter_mut()
-                    .for_each(|(_, v, _)| v.set_module(module_path));
+                    .for_each(|(_, v)| v.set_module(module_path));
                 if let Some(constructor) = constructor {
                     constructor.set_module(module_path);
                 }
@@ -356,11 +352,7 @@ impl LocatedExpression {
                 right.set_module(module_path);
             }
             Expression::UnaryOp { op: _, expr } => expr.set_module(module_path),
-            Expression::Define {
-                name: _,
-                value,
-                type_hint: _,
-            } => {
+            Expression::Define { name: _, value } => {
                 value.set_module(module_path);
             }
             Expression::Block(exprs, ret) => {

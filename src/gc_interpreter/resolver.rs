@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use gc_arena::{Gc, Mutation, lock::GcRefLock};
+use gc_arena::{Gc, Mutation, StaticCollect, lock::GcRefLock};
 
 use crate::{
     CanonicalPath, ModulePath, ParsedModuleTree,
     gc_interpreter::{
         ExecResult, ModuleTree, MyRoot, expression_to_function, make_class_literal,
         standard::define_globals,
-        value::{ClassValue, Environment, Value},
+        value::{ClassValue, Environment, StaticValue, Value},
     },
     parser::{Expression, Identifier, LocatedExpression},
 };
@@ -19,6 +19,7 @@ pub struct CanonicalItem<'a> {
 
 pub enum CanonicalItemType<'a> {
     Import(CanonicalPath),
+    StaticVariable(String, &'a LocatedExpression),
     Item(CanonicalItem<'a>),
 }
 
@@ -55,7 +56,6 @@ pub fn resolve_canonical_paths<'a>(mc: &Mutation<'a>, root: &'a MyRoot<'a>) {
             panic!("Item not found for {}", path);
         };
         define_item(mc, root, path, item, true);
-        println!("Defined std item: {}", path);
     }
 
     let std_tree = ModuleTree::get(root.root_module, &std_path).unwrap();
@@ -76,7 +76,7 @@ pub fn resolve_canonical_paths<'a>(mc: &Mutation<'a>, root: &'a MyRoot<'a>) {
         let module_tree = ModuleTree::get(root.root_module, &path.path)
             .expect(&format!("Module {} not found", path.path.to_string()));
         let env = module_tree.borrow().env;
-        if env.get(&path.item).is_some() {
+        if env.exists(&path.item) {
             println!("Skipping already defined item: {}", path);
             continue;
         }
@@ -102,13 +102,8 @@ fn define_item<'a>(
             let source_module_tree = ModuleTree::get(root.root_module, &import.path);
             if let Some(source_module_tree) = source_module_tree {
                 let source_env = source_module_tree.borrow().env;
-                if let Some(val) = source_env.get(&import.item) {
-                    if !env.define(mc, &import.item, val) {
-                        panic!("Failed to define imported item: {}", import.item);
-                    }
-                    println!("Imported {} in {}", import.item, path.path.to_string());
-                } else {
-                    panic!("Imported item not found: {}", import.item);
+                if !env.import_from(mc, source_env, &import.item) {
+                    panic!("Failed to define imported item: {}", import.item);
                 }
             } else {
                 panic!("Imported module not found: {}", import.path);
@@ -130,21 +125,30 @@ fn define_item<'a>(
                 expr => unreachable!("Unexpected expression in canonical items: {:?}", expr),
             };
             let tree = module_tree.borrow();
-            if let Some(existing) = tree.env.get(&path.item) {
+            if tree.env.exists(&path.item) {
                 if !allow_merge {
                     panic!("Failed to define item: {}", path.item);
                 }
-                if let Value::Class(existing_class) = existing
-                    && let Value::Class(new_class) = value
-                {
+                let Some(Value::Class(existing_class)) = tree.env.get_simple(&path.item) else {
+                    panic!("Failed to define item: {}", path.item);
+                };
+                if let Value::Class(new_class) = value {
                     merge_std_classes(mc, new_class, existing_class);
                 } else {
                     panic!("Failed to define item: {}", path.item);
                 }
             } else {
-                tree.env.define(mc, &path.item, value);
+                tree.env.define_const(mc, &path.item, value);
             }
-            println!("Defined {} in {}", path.item, path.path.to_string());
+        }
+        CanonicalItemType::StaticVariable(name, expr) => {
+            if !env.define_static(
+                mc,
+                name,
+                StaticValue::Uninitialized(Gc::new(mc, StaticCollect((*expr).clone()))),
+            ) {
+                panic!("Failed to define static variable: {}", name);
+            }
         }
     }
 }
@@ -189,11 +193,7 @@ fn collect_canonical_items<'a>(
     }
     for expr in tree.expressions.iter() {
         match &expr.data {
-            Expression::Define {
-                name,
-                value,
-                type_hint: _,
-            } => match &value.data {
+            Expression::Define { name, value } => match &value.data {
                 Expression::FunctionLiteral { .. } => {
                     items.push((
                         CanonicalPath::new(path.clone(), name.clone()),
@@ -219,6 +219,12 @@ fn collect_canonical_items<'a>(
                 }
                 _ => {}
             },
+            Expression::StaticDefine { name, value } => {
+                items.push((
+                    CanonicalPath::new(path.clone(), name.clone()),
+                    CanonicalItemType::StaticVariable(name.clone(), value),
+                ));
+            }
             _ => {}
         }
     }
@@ -264,6 +270,7 @@ fn topo_sort<'a>(
                         visit(&key, parent, items, visited, temp_mark, output)?;
                     }
                 }
+                CanonicalItemType::StaticVariable(_, _) => {}
             }
         }
         temp_mark.remove(node);
@@ -288,7 +295,6 @@ pub fn transfer_env_recursive<'a>(
     tree: &'a ParsedModuleTree,
     std_env: Gc<'a, Environment<'a>>,
 ) {
-    println!("Loading std into {}", path);
     let current_module_tree = ModuleTree::get(root.root_module, path)
         .expect(&format!("Module {} not found", path.to_string()));
     let current_env = current_module_tree.borrow().env;

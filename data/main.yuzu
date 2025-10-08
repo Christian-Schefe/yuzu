@@ -3,9 +3,10 @@ mod module2;
 
 use root::module::test_fn;
 use std::fs::Path;
+use root::module::my_static;
 
 fn main() {
-    print("Hello, world!");
+    print("Hello, world!", System.args());
     print(test_fn());
     print(root::module2::test_fn2());
 
@@ -19,32 +20,22 @@ fn main() {
     for (i in [1,2,3]) {
         print(i);
     }
+    print(a);
+    a.val = 365;
+    print(a);
 
-    let file = new Path("data/test.txt").open();
-    file.write_string("Hello, file!\n");
-    print(file.read_to_end());
-    file.close();
+    print(root::module::my_static);
+    root::module::my_static.val = 365;
+    print(root::module::my_static);
+/*
+    print(factorial(54));
+    factorial = 56;
+    print(factorial(54));
+*/
+    print("static function", root::module::static_fn(21));
 
-    let path = new Path("data/test.txt");
-    print(path.to_string());
-
-    for (c in "hello world") {
-        print(c);
-    }
-    for (c in "hello world".slice(1, 5)) {
-        print(c);
-    }
-    let s = "hello world";
-    for (let i = 0; i < s.length(); i += 1) {
-        print(s[i], Random.int(0, 100));
-    }
-    for (let i = 0; i < 100; i += 1) {
-        print(factorial(i));
-    }
-    try {
-        raise new MyOtherException("An error occurred");
-    } catch (MyException as e) {
-        print(e.message);
+    for (key in {a: 30, b: 40}) {
+        print(key);
     }
 }
 
@@ -54,6 +45,12 @@ fn factorial(n) {
         result *= i;
     }
     result
+}
+
+static a = {val: 10};
+
+class Static {
+    static let value = null;
 }
 
 class MyException : Exception {

@@ -2,6 +2,7 @@ mod fs;
 
 class Iterator {
     fn map(map) new MapIterator(this, map);
+    fn iter() this;
     fn collect() {
         let res = [];
         let cur = this.next();
@@ -23,6 +24,24 @@ class IndexIterator : Iterator {
         this.current += 1;
         if (this.current >= this.target.length()) null
         else {value: this.target[this.current]}
+    }
+}
+
+class ObjectEntryIterator : Iterator {
+    let target = null;
+    let keys = null;
+    let current = -1;
+    constructor(target) { 
+        this.target = target;
+        this.keys = Object.keys(target);
+    }
+    fn next() {
+        this.current += 1;
+        if (this.current >= this.keys.length()) null
+        else {
+            let key = this.keys[this.current];
+            {value: [key, this.target[key]]}
+        }
     }
 }
 
@@ -67,6 +86,11 @@ class Array {
 class String {
     fn iter() new IndexIterator(this);
     fn is_empty() this.length() == 0;
+}
+
+class Object {
+    fn iter() Object.keys(this).iter();
+    fn entries() new ObjectEntryIterator(this);
 }
 
 class Exception {
