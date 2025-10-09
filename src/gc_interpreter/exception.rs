@@ -74,6 +74,21 @@ pub fn array_index_out_of_bounds<'a, T>(
     )
 }
 
+pub fn index_out_of_bounds<'a, T>(
+    mc: &Mutation<'a>,
+    root: &MyRoot<'a>,
+    index: usize,
+    expr: impl HasLocation,
+) -> Result<T, LocatedError<'a>> {
+    runtime_error(
+        mc,
+        root,
+        &format!("Array index out of bounds: {}", index),
+        "ArrayIndexOutOfBounds",
+        expr,
+    )
+}
+
 pub fn function_argument_error<'a, T>(
     mc: &Mutation<'a>,
     root: &MyRoot<'a>,

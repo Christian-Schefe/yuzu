@@ -51,6 +51,8 @@ pub enum Token<'a> {
     Colon,
     #[token(".")]
     Dot,
+    #[token("...")]
+    ThreeDots,
     #[token(",")]
     Comma,
     #[token(";")]
@@ -218,6 +220,7 @@ impl fmt::Display for Token<'_> {
             Self::Bool(b) => write!(f, "Bool({})", b),
             Self::Colon => write!(f, ":"),
             Self::Dot => write!(f, "."),
+            Self::ThreeDots => write!(f, "..."),
             Self::Comma => write!(f, ","),
             Self::Semicolon => write!(f, ";"),
             Self::LParen => write!(f, "("),

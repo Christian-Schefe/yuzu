@@ -25,6 +25,13 @@ impl<T> Located<T> {
     }
 }
 
+pub fn located<T>(data: T, location: impl HasLocation) -> Located<T> {
+    Located {
+        data,
+        location: location.location().clone(),
+    }
+}
+
 pub trait HasLocation {
     fn location(&self) -> &Location;
 }

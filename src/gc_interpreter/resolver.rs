@@ -4,12 +4,13 @@ use gc_arena::{Gc, Mutation, StaticCollect, lock::GcRefLock};
 
 use crate::{
     CanonicalPath, ModulePath, ParsedModuleTree,
+    bytecode::compile_expr,
     gc_interpreter::{
         ExecResult, ModuleTree, MyRoot, expression_to_function, make_class_literal,
         standard::define_globals,
         value::{ClassValue, Environment, StaticValue, Value},
     },
-    parser::{Expression, Identifier, LocatedExpression},
+    parser::{Expression, Identifier, LocatedExpression, Pattern},
 };
 
 pub struct CanonicalItem<'a> {
@@ -142,10 +143,11 @@ fn define_item<'a>(
             }
         }
         CanonicalItemType::StaticVariable(name, expr) => {
+            let code = compile_expr(expr);
             if !env.define_static(
                 mc,
                 name,
-                StaticValue::Uninitialized(Gc::new(mc, StaticCollect((*expr).clone()))),
+                StaticValue::Uninitialized(Gc::new(mc, StaticCollect(code))),
             ) {
                 panic!("Failed to define static variable: {}", name);
             }
@@ -193,32 +195,38 @@ fn collect_canonical_items<'a>(
     }
     for expr in tree.expressions.iter() {
         match &expr.data {
-            Expression::Define { name, value } => match &value.data {
-                Expression::FunctionLiteral { .. } => {
-                    items.push((
-                        CanonicalPath::new(path.clone(), name.clone()),
-                        CanonicalItemType::Item(CanonicalItem {
-                            expr: value,
-                            parent: None,
-                        }),
-                    ));
-                }
-                Expression::ClassLiteral { parent, .. } => {
-                    items.push((
-                        CanonicalPath::new(path.clone(), name.clone()),
-                        CanonicalItemType::Item(CanonicalItem {
-                            expr: value,
-                            parent: parent.clone().map(|p| match p {
-                                Identifier::Simple(name) => {
-                                    CanonicalPath::new(path.clone(), name.clone())
-                                }
-                                Identifier::Scoped(path) => path,
+            Expression::Define { pattern, value } => {
+                let name = match &pattern.data {
+                    Pattern::Ident(name) => name,
+                    _ => panic!("Only simple identifiers are allowed in top-level definitions"),
+                };
+                match &value.data {
+                    Expression::FunctionLiteral { .. } => {
+                        items.push((
+                            CanonicalPath::new(path.clone(), name.clone()),
+                            CanonicalItemType::Item(CanonicalItem {
+                                expr: value,
+                                parent: None,
                             }),
-                        }),
-                    ));
+                        ));
+                    }
+                    Expression::ClassLiteral { parent, .. } => {
+                        items.push((
+                            CanonicalPath::new(path.clone(), name.clone()),
+                            CanonicalItemType::Item(CanonicalItem {
+                                expr: value,
+                                parent: parent.clone().map(|p| match p {
+                                    Identifier::Simple(name) => {
+                                        CanonicalPath::new(path.clone(), name.clone())
+                                    }
+                                    Identifier::Scoped(path) => path,
+                                }),
+                            }),
+                        ));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Expression::StaticDefine { name, value } => {
                 items.push((
                     CanonicalPath::new(path.clone(), name.clone()),

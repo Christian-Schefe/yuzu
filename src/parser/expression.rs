@@ -17,7 +17,7 @@ pub enum Expression {
     Break,
     Continue,
     Return(Option<Box<LocatedExpression>>),
-    ArrayLiteral(Vec<LocatedExpression>),
+    ArrayLiteral(Vec<(LocatedExpression, bool)>), // bool indicates if the element is a spread
     StaticDefine {
         name: String,
         value: Box<LocatedExpression>,
@@ -28,13 +28,10 @@ pub enum Expression {
     },
     ClassLiteral {
         parent: Option<Identifier>,
-        fields: Vec<(String, Box<LocatedExpression>)>,
-        static_fields: Vec<(String, Box<LocatedExpression>)>,
         constructor: Option<Box<LocatedExpression>>,
-        methods: Vec<(String, Box<LocatedExpression>)>,
-        static_methods: Vec<(String, Box<LocatedExpression>)>,
+        properties: Vec<(String, Box<LocatedExpression>, ClassMemberKind)>,
     },
-    ObjectLiteral(Vec<(String, LocatedExpression)>),
+    ObjectLiteral(Vec<(Option<String>, LocatedExpression)>), // if string is None, it's a spread
     Assign {
         target: Box<LocatedExpression>,
         value: Box<LocatedExpression>,
@@ -51,7 +48,7 @@ pub enum Expression {
     },
 
     Define {
-        name: String,
+        pattern: Located<Pattern>,
         value: Box<LocatedExpression>,
     },
     Block(Vec<LocatedExpression>, Option<Box<LocatedExpression>>),
@@ -112,6 +109,14 @@ pub enum ClassMember {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum ClassMemberKind {
+    Field,
+    Method,
+    StaticField,
+    StaticMethod,
+}
+
 impl ClassMember {
     pub fn expr(&self) -> &LocatedExpression {
         match self {
@@ -121,10 +126,7 @@ impl ClassMember {
         }
     }
     pub fn make_class_expr(members: Vec<ClassMember>, parent: Option<Identifier>) -> Expression {
-        let mut fields = Vec::new();
-        let mut static_fields = Vec::new();
-        let mut methods = Vec::new();
-        let mut static_methods = Vec::new();
+        let mut properties = Vec::new();
         let mut constructor = None;
         for member in members {
             match member {
@@ -134,9 +136,9 @@ impl ClassMember {
                     is_static,
                 } => {
                     if is_static {
-                        static_fields.push((name, Box::new(value)));
+                        properties.push((name, Box::new(value), ClassMemberKind::StaticField));
                     } else {
-                        fields.push((name, Box::new(value)));
+                        properties.push((name, Box::new(value), ClassMemberKind::Field));
                     }
                 }
                 ClassMember::Method {
@@ -145,9 +147,9 @@ impl ClassMember {
                     is_static,
                 } => {
                     if is_static {
-                        static_methods.push((name, Box::new(value)));
+                        properties.push((name, Box::new(value), ClassMemberKind::StaticMethod));
                     } else {
-                        methods.push((name, Box::new(value)));
+                        properties.push((name, Box::new(value), ClassMemberKind::Method));
                     }
                 }
                 ClassMember::Constructor { value } => {
@@ -157,11 +159,8 @@ impl ClassMember {
         }
         Expression::ClassLiteral {
             parent,
-            fields,
-            static_fields,
             constructor,
-            methods,
-            static_methods,
+            properties,
         }
     }
 }
@@ -176,6 +175,30 @@ pub enum ParsedModuleItem {
 pub enum Identifier {
     Simple(String),
     Scoped(CanonicalPath),
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Wildcard,
+    Ident(String),
+    Object {
+        entries: Vec<(String, Located<Pattern>)>,
+        rest: Option<String>,
+    },
+    Array {
+        items: Vec<Located<Pattern>>,
+        rest: Option<String>,
+    },
+}
+
+pub enum PatternObjectItem {
+    Pattern(String, Located<Pattern>),
+    Rest(String),
+}
+
+pub enum PatternArrayItem {
+    Pattern(Located<Pattern>),
+    Rest(String),
 }
 
 /// Desugars:
@@ -209,7 +232,10 @@ pub fn desugar_iter_loop(
     );
     let iter_init = LocatedExpression::new(
         Expression::Define {
-            name: "$iterable".to_string(),
+            pattern: Located::new(
+                Pattern::Ident("$iterable".to_string()),
+                iterable.location.clone(),
+            ),
             value: Box::new(get_iterable_call),
         },
         iterable.location.clone(),
@@ -228,7 +254,10 @@ pub fn desugar_iter_loop(
     );
     let outer_item_init = LocatedExpression::new(
         Expression::Define {
-            name: "$item".to_string(),
+            pattern: Located::new(
+                Pattern::Ident("$item".to_string()),
+                iterable.location.clone(),
+            ),
             value: Box::new(get_item_call.clone()),
         },
         iterable.location.clone(),
@@ -261,7 +290,7 @@ pub fn desugar_iter_loop(
     );
     let inner_item_init = LocatedExpression::new(
         Expression::Define {
-            name: item.clone(),
+            pattern: Located::new(Pattern::Ident(item.clone()), iterable.location.clone()),
             value: Box::new(get_inner_item_value.clone()),
         },
         iterable.location.clone(),
@@ -295,6 +324,22 @@ pub fn desugar_iter_loop(
     Expression::Block(vec![iter_init, outer_item_init, loop_expr], None)
 }
 
+impl Located<Pattern> {
+    pub fn set_module(&mut self, module_path: &str) {
+        self.location.module = module_path.to_string();
+        match &mut self.data {
+            Pattern::Wildcard => {}
+            Pattern::Ident(_) => {}
+            Pattern::Object { entries, rest: _ } => entries
+                .iter_mut()
+                .for_each(|(_, p)| p.set_module(module_path)),
+            Pattern::Array { items, rest: _ } => {
+                items.iter_mut().for_each(|e| e.set_module(module_path))
+            }
+        }
+    }
+}
+
 impl LocatedExpression {
     pub fn set_module(&mut self, module_path: &str) {
         self.location.module = module_path.to_string();
@@ -303,9 +348,9 @@ impl LocatedExpression {
             Expression::Integer(_) => {}
             Expression::Bool(_) => {}
             Expression::String(_) => {}
-            Expression::ArrayLiteral(elements) => {
-                elements.iter_mut().for_each(|e| e.set_module(module_path))
-            }
+            Expression::ArrayLiteral(elements) => elements
+                .iter_mut()
+                .for_each(|e| e.0.set_module(module_path)),
             Expression::ObjectLiteral(fields) => fields
                 .iter_mut()
                 .for_each(|(_, v)| v.set_module(module_path)),
@@ -316,27 +361,15 @@ impl LocatedExpression {
             } => body.set_module(module_path),
             Expression::ClassLiteral {
                 parent: _,
-                fields,
-                static_fields,
                 constructor,
-                methods,
-                static_methods,
+                properties,
             } => {
-                fields
+                properties
                     .iter_mut()
-                    .for_each(|(_, v)| v.set_module(module_path));
-                static_fields
-                    .iter_mut()
-                    .for_each(|(_, v)| v.set_module(module_path));
+                    .for_each(|(_, v, _)| v.set_module(module_path));
                 if let Some(constructor) = constructor {
                     constructor.set_module(module_path);
                 }
-                methods
-                    .iter_mut()
-                    .for_each(|(_, v)| v.set_module(module_path));
-                static_methods
-                    .iter_mut()
-                    .for_each(|(_, v)| v.set_module(module_path));
             }
             Expression::Null => {}
             Expression::Assign {
@@ -352,7 +385,8 @@ impl LocatedExpression {
                 right.set_module(module_path);
             }
             Expression::UnaryOp { op: _, expr } => expr.set_module(module_path),
-            Expression::Define { name: _, value } => {
+            Expression::Define { pattern, value } => {
+                pattern.set_module(module_path);
                 value.set_module(module_path);
             }
             Expression::Block(exprs, ret) => {

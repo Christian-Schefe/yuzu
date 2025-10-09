@@ -24,6 +24,19 @@ fn main() {
     a.val = 365;
     print(a);
 
+    let {a, b: [v1, v2, ...rest], ...obj_rest} = {a: 30, b: [1, 2, 3, 4, 5], c: 50};
+    print(a, v1, v2, rest, obj_rest);
+
+    
+    let obj1 = {a: 30, b: [1, 2, 3, 4, 5], c: 50};
+    let {...obj2} = obj1;
+    obj1.a = 40;
+    obj1.b[0] = 99;
+    print(obj1, obj2);
+
+    let spread_test = {x: 10, ...{y: 20, z: 30}, w: 40, ...{a: 50, b: 60}};
+    print(spread_test);
+
     print(root::module::my_static);
     root::module::my_static.val = 365;
     print(root::module::my_static);

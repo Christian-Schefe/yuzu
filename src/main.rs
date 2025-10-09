@@ -16,6 +16,7 @@ mod gc_interpreter;
 mod lexer;
 mod location;
 mod parser;
+mod bytecode;
 
 #[derive(Debug, Parser)]
 #[clap(trailing_var_arg = true)]

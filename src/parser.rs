@@ -94,12 +94,106 @@ fn statements_to_block(
     Expression::Block(statements, last)
 }
 
+fn pattern_parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Located<Pattern>, extra::Err<Rich<'tokens, Token<'src>>>>
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
+{
+    let pattern = recursive(|pattern| {
+        let ident = select! { Token::Ident(name) => match name {
+            "_" => Pattern::Wildcard,
+            s => Pattern::Ident(s.to_string())
+        }}
+        .map_with(|p, extra| located(p, extra.span()))
+        .boxed();
+
+        let object = select! { Token::Ident(name) => name.to_string() }
+            .clone()
+            .then(just(Token::Colon).ignore_then(pattern.clone()).or_not())
+            .map_with(|(name, pattern), extra| {
+                let pattern =
+                    pattern.unwrap_or_else(|| located(Pattern::Ident(name.clone()), extra.span()));
+                PatternObjectItem::Pattern(name, pattern)
+            })
+            .or(just(Token::ThreeDots)
+                .ignore_then(select! { Token::Ident(name) => name.to_string() })
+                .map(PatternObjectItem::Rest))
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBrace), just(Token::RBrace))
+            .try_map_with(|pattern_items, extra| {
+                let mut entries = Vec::new();
+                let mut rest = None;
+                for item in pattern_items {
+                    if rest.is_some() {
+                        return Err(chumsky::error::Rich::custom(
+                            extra.span(),
+                            "Rest pattern must be the last item in array pattern",
+                        ));
+                    }
+                    match item {
+                        PatternObjectItem::Pattern(name, pattern) => {
+                            entries.push((name, pattern));
+                        }
+                        PatternObjectItem::Rest(name) => {
+                            rest = Some(name);
+                        }
+                    }
+                }
+                Ok(located(
+                    Pattern::Object {
+                        entries: entries,
+                        rest,
+                    },
+                    extra.span(),
+                ))
+            })
+            .boxed();
+
+        let array = pattern
+            .clone()
+            .map(PatternArrayItem::Pattern)
+            .or(just(Token::ThreeDots)
+                .ignore_then(select! { Token::Ident(name) => name.to_string() })
+                .map(PatternArrayItem::Rest))
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LBracket), just(Token::RBracket))
+            .try_map_with(|pattern_items, extra| {
+                let mut items = Vec::new();
+                let mut rest = None;
+                for item in pattern_items {
+                    if rest.is_some() {
+                        return Err(chumsky::error::Rich::custom(
+                            extra.span(),
+                            "Rest pattern must be the last item in array pattern",
+                        ));
+                    }
+                    match item {
+                        PatternArrayItem::Pattern(p) => items.push(p),
+                        PatternArrayItem::Rest(name) => {
+                            rest = Some(name);
+                        }
+                    }
+                }
+                Ok(located(Pattern::Array { items, rest }, extra.span()))
+            })
+            .boxed();
+
+        choice((object, array, ident))
+    });
+    pattern
+}
+
 fn parser<'tokens, 'src: 'tokens, I>()
 -> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
     let ident = select! { Token::Ident(name) => name.to_string() };
+    let pattern = pattern_parser().boxed();
 
     let parameter_list = ident
         .clone()
@@ -135,13 +229,13 @@ where
             .boxed();
 
         let let_ = just(Token::Let)
-            .ignore_then(ident.clone())
+            .ignore_then(pattern.clone())
             .then_ignore(just(Token::Assign))
             .then(expr.clone())
-            .map_with(|(name, value), extra| {
+            .map_with(|(pattern, value), extra| {
                 located(
                     Expression::Define {
-                        name,
+                        pattern,
                         value: Box::new(value),
                     },
                     extra.span(),
@@ -198,19 +292,27 @@ where
             }
             .map_with(|expr, extra| located(expr, extra.span()));
 
-            let list = expr
+            let array = just(Token::ThreeDots)
+                .or_not()
+                .then(expr.clone())
+                .map(|(spread, expr)| (expr, spread.is_some()))
                 .clone()
                 .separated_by(just(Token::Comma))
                 .allow_trailing()
                 .collect::<Vec<_>>();
 
-            let pair_list = ident
-                .clone()
-                .then(just(Token::Colon).ignore_then(expr.clone()))
-                .separated_by(just(Token::Comma))
-                .allow_trailing()
-                .collect::<Vec<_>>()
-                .boxed();
+            let pair_list = choice((
+                ident
+                    .clone()
+                    .then_ignore(just(Token::Colon))
+                    .map(Option::Some),
+                just(Token::ThreeDots).map(|_| None),
+            ))
+            .then(expr.clone())
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .boxed();
 
             let identifier_expr = identifier
                 .clone()
@@ -264,7 +366,8 @@ where
                             extra.span(),
                         )
                     }),
-                list.clone()
+                array
+                    .clone()
                     .delimited_by(just(Token::LBracket), just(Token::RBracket))
                     .map(Expression::ArrayLiteral)
                     .map_with(|expr, extra| located(expr, extra.span())),
@@ -548,14 +651,22 @@ where
 
         let function = just(Token::Fn)
             .ignore_then(ident.clone())
+            .map_with(|name, extra| located(Pattern::Ident(name), extra.span()))
             .then(function_literal.clone())
-            .map_with(|(name, func), extra| {
-                located(Expression::Define { name, value: func }, extra.span())
+            .map_with(|(pattern, func), extra| {
+                located(
+                    Expression::Define {
+                        pattern,
+                        value: func,
+                    },
+                    extra.span(),
+                )
             })
             .boxed();
 
         let class = just(Token::Class)
             .ignore_then(select! { Token::Ident(name) => name.to_string() })
+            .map_with(|name, extra| located(Pattern::Ident(name), extra.span()))
             .then(just(Token::Colon).ignore_then(identifier.clone()).or_not())
             .then(
                 choice((
@@ -583,7 +694,12 @@ where
                         .or_not()
                         .then(let_.clone())
                         .map(|(is_static, expr)| {
-                            if let Expression::Define { name, value } = expr.data {
+                            if let Expression::Define {
+                                pattern: name,
+                                value,
+                            } = expr.data
+                                && let Pattern::Ident(name) = name.data
+                            {
                                 ClassMember::Field {
                                     name,
                                     value: *value,
@@ -618,7 +734,7 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
             )
-            .try_map_with(|((name, parent), body), extra| {
+            .try_map_with(|((pattern, parent), body), extra| {
                 let duplicates = get_duplicates(body.iter().map(|member| match member {
                     ClassMember::Field { name, .. } | ClassMember::Method { name, .. } => {
                         name.clone()
@@ -636,7 +752,7 @@ where
                 }
                 Ok(located(
                     Expression::Define {
-                        name,
+                        pattern,
                         value: Box::new(located(
                             ClassMember::make_class_expr(body, parent.map(|p| p.data)),
                             extra.span(),
