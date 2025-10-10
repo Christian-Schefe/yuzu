@@ -1,0 +1,3 @@
+fn std_test() {
+    print("Hello from std.yuzu");
+}

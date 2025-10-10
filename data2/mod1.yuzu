@@ -1,0 +1,4 @@
+fn test_fn(a, b) {
+    print("In test_fn", a, b);
+    a + b
+}

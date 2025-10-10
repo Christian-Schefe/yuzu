@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::{
     CanonicalPath,
     location::Located,
@@ -18,9 +20,13 @@ pub enum Expression {
     Continue,
     Return(Option<Box<LocatedExpression>>),
     ArrayLiteral(Vec<(LocatedExpression, bool)>), // bool indicates if the element is a spread
-    StaticDefine {
-        name: String,
+    CanonicDefine {
+        name: CanonicalPath,
         value: Box<LocatedExpression>,
+    },
+    ImportDefine {
+        name: String,
+        value: CanonicalPath,
     },
     FunctionLiteral {
         parameters: Vec<String>,
@@ -97,7 +103,6 @@ pub enum ClassMember {
     Field {
         name: String,
         value: LocatedExpression,
-        is_static: bool,
     },
     Method {
         name: String,
@@ -113,7 +118,6 @@ pub enum ClassMember {
 pub enum ClassMemberKind {
     Field,
     Method,
-    StaticField,
     StaticMethod,
 }
 
@@ -130,16 +134,8 @@ impl ClassMember {
         let mut constructor = None;
         for member in members {
             match member {
-                ClassMember::Field {
-                    name,
-                    value,
-                    is_static,
-                } => {
-                    if is_static {
-                        properties.push((name, Box::new(value), ClassMemberKind::StaticField));
-                    } else {
-                        properties.push((name, Box::new(value), ClassMemberKind::Field));
-                    }
+                ClassMember::Field { name, value } => {
+                    properties.push((name, Box::new(value), ClassMemberKind::Field));
                 }
                 ClassMember::Method {
                     name,
@@ -167,7 +163,6 @@ impl ClassMember {
 
 pub enum ParsedModuleItem {
     Expression(LocatedExpression),
-    Import(Located<CanonicalPath>),
     Module(Located<String>),
 }
 
@@ -175,6 +170,15 @@ pub enum ParsedModuleItem {
 pub enum Identifier {
     Simple(String),
     Scoped(CanonicalPath),
+}
+
+impl Display for Identifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Identifier::Simple(name) => write!(f, "{}", name),
+            Identifier::Scoped(path) => write!(f, "{}", path),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -354,7 +358,7 @@ impl LocatedExpression {
             Expression::ObjectLiteral(fields) => fields
                 .iter_mut()
                 .for_each(|(_, v)| v.set_module(module_path)),
-            Expression::StaticDefine { value, .. } => value.set_module(module_path),
+            Expression::CanonicDefine { value, .. } => value.set_module(module_path),
             Expression::FunctionLiteral {
                 body,
                 parameters: _,
@@ -474,6 +478,7 @@ impl LocatedExpression {
                     .into_iter()
                     .for_each(|arg| arg.set_module(module_path));
             }
+            Expression::ImportDefine { .. } => {}
         }
     }
 }

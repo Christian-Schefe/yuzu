@@ -1,10 +1,18 @@
-use crate::parser::{BinaryOp, ClassMemberKind, Identifier, Pattern, UnaryOp};
+use crate::{
+    CanonicalPath,
+    parser::{BinaryOp, Identifier, Pattern, UnaryOp},
+};
+
+pub type CodePointer = usize;
 
 #[derive(Debug, Clone)]
 pub enum Instruction {
+    Exit,
     Load(Identifier),
     Store(Identifier),
-    Define(Pattern, bool), // bool indicates if it's a static define
+    InitializeLazyEnd,
+    Define(Pattern),
+    DefineCanonic(CanonicalPath),
     LoadProperty(String),
     StoreProperty(String),
     LoadIndex,
@@ -17,37 +25,38 @@ pub enum Instruction {
     PushString(String),
     PushArray(Vec<bool>), // bool indicates if the element is a spread element
     PushObject(Vec<Option<String>>), // Option indicates if the value is a spread element
+    PushLazy(CodePointer),
     Raise,
     PushFunction {
         parameters: Vec<String>,
-        body_pointer: usize,
+        body_pointer: CodePointer,
     },
     PushClass {
-        parent: Option<Identifier>,
-        initializer_pointer: usize,
-        properties: Vec<(String, ClassMemberKind)>,
-        constructor_pointer: Option<usize>,
+        parent: bool,
+        methods: Vec<(String, Vec<String>, CodePointer)>,
+        static_methods: Vec<(String, Vec<String>, CodePointer)>,
+        constructor: Option<(Vec<String>, CodePointer)>,
     },
     Break,
     Continue,
     Return,
-    Jump(usize),
-    JumpIfFalse(usize),
+    Jump(CodePointer),
+    JumpIfFalse(CodePointer),
     EnterBlock,
     EnterLoop {
-        break_target: usize,
-        continue_target: usize,
+        break_target: CodePointer,
+        continue_target: CodePointer,
     },
     EnterTryCatch {
-        catch_target: usize,
+        catch_target: CodePointer,
     },
     ExitFrame,
-    CallFunction(usize),                 // number of arguments
-    CallPropertyFunction(String, usize), // number of arguments
-    TryShortCircuit(BinaryOp, usize),    // jump target
+    CallFunction(usize),                    // number of arguments
+    CallPropertyFunction(String, usize),    // number of arguments
+    TryShortCircuit(BinaryOp, CodePointer), // jump target
     BinaryOp(BinaryOp),
     UnaryOp(UnaryOp),
-    MakeInstance(Vec<String>), // field names
-    CallInitializer,
-    CheckCatch(usize), // jump target
+    CallConstructor(usize),    // number of arguments
+    MakeInstance(Vec<String>), // list of property names
+    CheckCatch(CodePointer),   // jump target
 }

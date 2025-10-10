@@ -7,16 +7,13 @@ use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
 use clio::Input;
 
-use crate::{
-    location::Located,
-    parser::{LocatedExpression, ParsedModuleItem},
-};
+use crate::parser::{LocatedExpression, ParsedModuleItem};
 
+mod bytecode;
 mod gc_interpreter;
 mod lexer;
 mod location;
 mod parser;
-mod bytecode;
 
 #[derive(Debug, Parser)]
 #[clap(trailing_var_arg = true)]
@@ -53,7 +50,7 @@ fn main() {
     let Ok(parsed_std) = parse_module_tree(
         &mut visited_files,
         ModulePath::from_root("std"),
-        "./data/std/std.yuzu",
+        "./data2/std.yuzu",
     ) else {
         std::process::exit(1);
     };
@@ -94,20 +91,15 @@ fn parse_module_tree(
     file_path: &str,
 ) -> Result<ParsedModuleTree, ()> {
     let contents = std::fs::read_to_string(&file_path).unwrap();
-    let pm = parse_string(&contents, path.to_string())?;
+    let pm = parse_string(&contents, path.clone(), path.to_string())?;
     let mut children = HashMap::new();
     let mut expressions = Vec::new();
-    let mut imports = Vec::new();
 
     let mut success = true;
     for item in pm {
         let child = match item {
             ParsedModuleItem::Expression(e) => {
                 expressions.push(e);
-                continue;
-            }
-            ParsedModuleItem::Import(i) => {
-                imports.push(i);
                 continue;
             }
             ParsedModuleItem::Module(m) => m,
@@ -153,12 +145,15 @@ fn parse_module_tree(
     Ok(ParsedModuleTree {
         children,
         expressions,
-        imports,
         source: contents,
     })
 }
 
-fn parse_string(input: &str, location: String) -> Result<Vec<ParsedModuleItem>, ()> {
+fn parse_string(
+    input: &str,
+    module_path: ModulePath,
+    location: String,
+) -> Result<Vec<ParsedModuleItem>, ()> {
     let lexed = lexer::lex(input);
     if let Err(err) = lexed {
         Report::build(ReportKind::Error, (location.clone(), err.span.clone()))
@@ -174,7 +169,7 @@ fn parse_string(input: &str, location: String) -> Result<Vec<ParsedModuleItem>, 
             .unwrap();
         return Err(());
     }
-    match parser::parse(input, &location, lexed.unwrap()) {
+    match parser::parse(input, module_path, &location, lexed.unwrap()) {
         Err(errs) => {
             for err in errs {
                 Report::build(
@@ -265,7 +260,6 @@ pub struct ParsedModuleTree {
     source: String,
     children: HashMap<String, ParsedModuleTree>,
     expressions: Vec<LocatedExpression>,
-    imports: Vec<Located<CanonicalPath>>,
 }
 
 impl ParsedModuleTree {

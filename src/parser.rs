@@ -187,8 +187,9 @@ where
     pattern
 }
 
-fn parser<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
+fn parser<'tokens, 'src: 'tokens, I>(
+    module_path: ModulePath,
+) -> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -247,10 +248,10 @@ where
             .ignore_then(ident.clone())
             .then_ignore(just(Token::Assign))
             .then(expr.clone())
-            .map_with(|(name, value), extra| {
+            .map_with(move |(name, value), extra| {
                 located(
-                    Expression::StaticDefine {
-                        name,
+                    Expression::CanonicDefine {
+                        name: CanonicalPath::new(module_path.clone(), name),
                         value: Box::new(value),
                     },
                     extra.span(),
@@ -337,10 +338,31 @@ where
                 })
                 .boxed();
 
+            let import_expr = just(Token::Use)
+                .ignore_then(
+                    ident
+                        .clone()
+                        .separated_by(just(Token::DoubleColon))
+                        .at_least(2)
+                        .collect::<Vec<_>>()
+                        .map_with(|mut parts, extra| {
+                            let name = parts.pop().unwrap();
+                            located(
+                                Expression::ImportDefine {
+                                    name: name.clone(),
+                                    value: CanonicalPath::new(ModulePath::new(parts), name),
+                                },
+                                extra.span(),
+                            )
+                        }),
+                )
+                .boxed();
+
             let atom = choice((
                 identifier_expr,
                 val,
                 new_expr,
+                import_expr,
                 just(Token::Return)
                     .ignore_then(expr.clone().or_not())
                     .map_with(|expr, extra| {
@@ -690,25 +712,21 @@ where
                                 is_static,
                             }
                         }),
-                    just(Token::Static)
-                        .or_not()
-                        .then(let_.clone())
-                        .map(|(is_static, expr)| {
-                            if let Expression::Define {
-                                pattern: name,
-                                value,
-                            } = expr.data
-                                && let Pattern::Ident(name) = name.data
-                            {
-                                ClassMember::Field {
-                                    name,
-                                    value: *value,
-                                    is_static: is_static.is_some(),
-                                }
-                            } else {
-                                panic!("Expected field definition in class body")
+                    let_.clone().map(|expr| {
+                        if let Expression::Define {
+                            pattern: name,
+                            value,
+                        } = expr.data
+                            && let Pattern::Ident(name) = name.data
+                        {
+                            ClassMember::Field {
+                                name,
+                                value: *value,
                             }
-                        }),
+                        } else {
+                            panic!("Expected field definition in class body")
+                        }
+                    }),
                     just(Token::Constructor)
                         .ignore_then(function_literal.clone())
                         .map(|mut func| {
@@ -819,26 +837,7 @@ where
         .map_with(|name, extra| ParsedModuleItem::Module(located(name.to_string(), extra.span())))
         .boxed();
 
-    let import = just(Token::Use)
-        .ignore_then(
-            ident
-                .clone()
-                .separated_by(just(Token::DoubleColon))
-                .at_least(2)
-                .collect::<Vec<_>>()
-                .then_ignore(just(Token::Semicolon))
-                .map_with(|mut parts, extra| {
-                    let name = parts.pop().unwrap();
-                    ParsedModuleItem::Import(located(
-                        CanonicalPath::new(ModulePath::new(parts), name),
-                        extra.span(),
-                    ))
-                }),
-        )
-        .boxed();
-
     let module_item = choice((
-        import.clone(),
         expr.then(just(Token::Semicolon).or_not())
             .try_map_with(|(data, semicolon), extra| {
                 if needs_semi(&data.data) && semicolon.is_none() {
@@ -857,22 +856,25 @@ where
 
 pub fn parse<'a>(
     source: &str,
+    module_path: ModulePath,
     file_path: &str,
     tokens: Vec<LocatedToken<'a>>,
 ) -> Result<Vec<ParsedModuleItem>, Vec<Rich<'a, Token<'a>>>> {
     let token_iter = tokens.into_iter().map(|lt| (lt.token, lt.span.into()));
     let token_stream =
         Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
-    parser().parse(token_stream).into_result().map(|mut pm| {
-        for item in &mut pm {
-            match item {
-                ParsedModuleItem::Expression(e) => e.set_module(file_path),
-                ParsedModuleItem::Import(i) => i.location.module = file_path.to_string(),
-                ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
+    parser(module_path)
+        .parse(token_stream)
+        .into_result()
+        .map(|mut pm| {
+            for item in &mut pm {
+                match item {
+                    ParsedModuleItem::Expression(e) => e.set_module(file_path),
+                    ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
+                }
             }
-        }
-        pm
-    })
+            pm
+        })
 }
 
 fn needs_semi(expr: &Expression) -> bool {

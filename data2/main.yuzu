@@ -1,0 +1,11 @@
+mod mod1;
+
+use root::mod1::test_fn;
+
+fn main() {
+    print("Hello from main.yuzu");
+    print(test_fn(3, 4));
+}
+
+main();
+std::std_test();

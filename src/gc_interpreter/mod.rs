@@ -7,42 +7,62 @@ use gc_arena::{
 
 use crate::{
     ModulePath, ParsedProgram,
-    bytecode::{Instruction, compile, compile_expr},
+    bytecode::Instruction,
     gc_interpreter::{
         exception::{
-            array_index_out_of_bounds, cyclic_static_initialization, division_by_zero,
-            duplicate_variable_definition, field_access_error, index_out_of_bounds, type_error,
-            undefined_variable, unhandled_control_flow, unsupported_binary_operation,
+            array_index_out_of_bounds, cannot_instantiate, cyclic_static_initialization,
+            division_by_zero, duplicate_variable_definition, field_access_error,
+            index_out_of_bounds, type_error, undefined_identifier, undefined_variable,
+            unhandled_control_flow, unsupported_binary_operation, unsupported_unary_operation,
         },
         resolver::resolve_canonical_paths,
         value::{
-            ClassInstanceValue, ClassValue, Environment, FunctionValue, IntVariant, LocatedError,
-            ModuleTree, StaticValue, StringVariant, Value, variable_to_string,
+            ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue, IntVariant,
+            LazyValue, LocatedError, ModuleTree, StringVariant, Value, variable_to_string,
         },
     },
     location::{Located, Location},
-    parser::{
-        BinaryOp, ClassMemberKind, Expression, Identifier, LocatedExpression, Pattern, UnaryOp,
-    },
+    parser::{BinaryOp, Identifier, Pattern, UnaryOp},
 };
 
 mod exception;
 mod resolver;
 mod resource;
 pub mod standard;
-mod value;
+pub mod value;
 
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MyRoot<'a> {
-    root_module: GcRefLock<'a, ModuleTree<'a>>,
-    pwd: std::path::PathBuf,
-    program: StaticCollect<ParsedProgram>,
-    args: Value<'a>,
+    pub root_module: GcRefLock<'a, ModuleTree<'a>>,
+    pub pwd: std::path::PathBuf,
+    pub args: Value<'a>,
+    pub code: GcRefLock<'a, StaticCollect<Vec<Located<Instruction>>>>,
+}
+
+pub struct Context<'a> {
+    pub mc: &'a Mutation<'a>,
+    pub root: &'a MyRoot<'a>,
+}
+
+impl<'a> Context<'a> {
+    pub fn gc_lock<T>(&self, val: T) -> GcRefLock<'a, T>
+    where
+        T: Collect,
+    {
+        GcRefLock::new(self.mc, RefLock::new(val))
+    }
+
+    pub fn gc<T>(&self, val: T) -> Gc<'a, T>
+    where
+        T: Collect,
+    {
+        Gc::new(self.mc, val)
+    }
 }
 
 pub fn interpret_global(
-    program: ParsedProgram,
+    mut program: ParsedProgram,
     pwd: std::path::PathBuf,
     args: Vec<String>,
 ) -> Result<(), Located<String>> {
@@ -56,46 +76,50 @@ pub fn interpret_global(
                     .collect(),
             ),
         ));
+        let code = Vec::new();
         MyRoot {
             root_module: Gc::new(mc, RefLock::new(root_module)),
             pwd,
-            program: StaticCollect(program),
             args: args_value,
+            code: GcRefLock::new(mc, RefLock::new(StaticCollect(code))),
         }
     });
     arena.mutate(move |mc, root| {
-        resolve_canonical_paths(mc, root);
+        let ctx = Context { mc, root };
+        let mut code = root.code.borrow_mut(mc);
+        resolve_canonical_paths(&ctx, &mut program, &mut code);
+
+        for i in 0..code.len() {
+            println!("{}: {:?}", i, code[i].data);
+        }
+        drop(code);
+
         let root_module = ModuleTree::get(root.root_module, &ModulePath::root()).unwrap();
         let env = root_module.borrow().env;
-        let root_tree = &root.program.children["root"];
-        for expr in &root_tree.expressions {
-            if let Expression::Define { .. } = expr.data {
-                continue; // handled in resolver
-            }
-            let code = compile_expr(expr);
-            if let Err(e) = interpret(mc, root, &code, env) {
-                let msg = match &e.data {
-                    Value::ClassInstance(ci) => {
-                        let ci_ref = ci.borrow();
-                        ci_ref
-                            .fields
-                            .get("message")
-                            .and_then(|v| {
-                                if let Value::String(s) = v {
-                                    Some(s.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_else(|| variable_to_string(&e.data))
-                    }
-                    _ => variable_to_string(&e.data),
-                };
-                return Err(Located {
-                    data: format!("Uncaught exception: {}", msg),
-                    location: e.location,
-                });
-            }
+        let mut exec_ctx = ExecContext::new();
+
+        if let Err(e) = interpret(&ctx, &mut exec_ctx, env) {
+            let msg = match &e.data {
+                Value::ClassInstance(ci) => {
+                    let ci_ref = ci.borrow();
+                    ci_ref
+                        .fields
+                        .get("message")
+                        .and_then(|v| {
+                            if let Value::String(s) = v {
+                                Some(s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| variable_to_string(&e.data))
+                }
+                _ => variable_to_string(&e.data),
+            };
+            return Err(Located {
+                data: format!("Uncaught exception: {}", msg),
+                location: e.location,
+            });
         }
         Ok(())
     })?;
@@ -106,391 +130,597 @@ pub enum Frame {
     Block,
     Catch {
         target: usize,
-        stack_height: usize,
     },
     Loop {
         break_target: usize,
         continue_target: usize,
-        stack_height: usize,
     },
     Function {
         return_ip: usize,
-        stack_height: usize,
     },
 }
 
 pub struct EnvFrame<'a> {
     pub frame: Frame,
     pub env: Gc<'a, Environment<'a>>,
+    pub stack_height: usize,
 }
 
 impl<'a> EnvFrame<'a> {
-    fn new(frame: Frame, env: Gc<'a, Environment<'a>>) -> Self {
-        Self { frame, env }
-    }
-}
-
-pub enum ExecResult<'a> {
-    Value(Value<'a>),
-    Return(Value<'a>),
-    Error(Value<'a>, Location),
-    Break(Location),
-    Continue(Location),
-}
-
-impl Default for ExecResult<'_> {
-    fn default() -> Self {
-        ExecResult::Value(Value::Null)
-    }
-}
-
-fn convert_err<'a>(val: Result<Value<'a>, LocatedError<'a>>) -> ExecResult<'a> {
-    match val {
-        Ok(v) => ExecResult::Value(v),
-        Err(LocatedError { data, location }) => ExecResult::Error(data, location),
-    }
-}
-
-pub fn interpret<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    code: &[Located<Instruction>],
-    env: Gc<'a, Environment<'a>>,
-) -> Result<Value<'a>, LocatedError<'a>> {
-    let mut frame_stack: Vec<EnvFrame<'a>> = vec![EnvFrame::new(Frame::Block, env)];
-    let mut stack: Vec<Value<'a>> = Vec::new();
-    let mut ip = 0;
-
-    fn bubble_error<'a>(
-        err: Result<Value<'a>, LocatedError<'a>>,
-        frame_stack: &mut Vec<EnvFrame<'a>>,
-        stack: &mut Vec<Value<'a>>,
-        ip: &mut usize,
-    ) -> Result<(), LocatedError<'a>> {
-        let err = err.unwrap_err();
-        while let Some(frame) = frame_stack.pop() {
-            match frame.frame {
-                Frame::Catch {
-                    target,
-                    stack_height,
-                } => {
-                    *ip = target;
-                    stack.truncate(stack_height);
-                    stack.push(err.data);
-                    return Ok(());
-                }
-                _ => continue,
-            }
+    fn new(frame: Frame, env: Gc<'a, Environment<'a>>, stack_height: usize) -> Self {
+        Self {
+            frame,
+            env,
+            stack_height,
         }
-        return Err(err);
     }
-    fn bubble_control_flow<'a>(
-        mc: &Mutation<'a>,
-        root: &MyRoot<'a>,
-        is_break: bool,
-        location: &Location,
-        frame_stack: &mut Vec<EnvFrame<'a>>,
-        stack: &mut Vec<Value<'a>>,
-        ip: &mut usize,
-    ) -> Result<(), LocatedError<'a>> {
-        while let Some(frame) = frame_stack.pop() {
-            match frame.frame {
-                Frame::Loop {
-                    break_target,
-                    continue_target,
-                    stack_height,
-                } => {
-                    *ip = if is_break {
-                        break_target
-                    } else {
-                        continue_target
-                    };
-                    stack.truncate(stack_height);
-                    return Ok(());
-                }
-                _ => continue,
-            }
-        }
-        return unhandled_control_flow(mc, root, location);
-    }
-    fn bubble_return<'a>(
-        mc: &Mutation<'a>,
-        root: &MyRoot<'a>,
-        ret: Value<'a>,
-        location: &Location,
-        frame_stack: &mut Vec<EnvFrame<'a>>,
-        stack: &mut Vec<Value<'a>>,
-        ip: &mut usize,
-    ) -> Result<(), LocatedError<'a>> {
-        while let Some(frame) = frame_stack.pop() {
-            match frame.frame {
-                Frame::Function {
-                    return_ip,
-                    stack_height,
-                } => {
-                    *ip = return_ip;
-                    stack.truncate(stack_height);
-                    stack.push(ret);
-                    return Ok(());
-                }
-                _ => continue,
-            }
-        }
-        return unhandled_control_flow(mc, root, location);
-    }
+}
 
-    while ip < code.len() {
-        let instruction = &code[ip];
-        let env = frame_stack.last().expect("Frame stack empty").env;
-        match &instruction.data {
-            Instruction::Load(identifier) => todo!(),
-            Instruction::Store(identifier) => todo!(),
-            Instruction::Define(pattern, _) => todo!(),
-            Instruction::LoadProperty(_) => todo!(),
-            Instruction::StoreProperty(_) => todo!(),
-            Instruction::LoadIndex => todo!(),
-            Instruction::StoreIndex => todo!(),
-            Instruction::Pop => {
-                stack.pop().expect("Stack empty");
+pub struct ExecContext<'a> {
+    pub stack: Vec<Value<'a>>,
+    pub frame_stack: Vec<EnvFrame<'a>>,
+    pub ip: usize,
+    pub jumped: bool,
+}
+
+impl<'a> ExecContext<'a> {
+    pub fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            frame_stack: Vec::new(),
+            ip: 0,
+            jumped: false,
+        }
+    }
+    pub fn push_frame(&mut self, frame: Frame, env: Gc<'a, Environment<'a>>) {
+        self.frame_stack
+            .push(EnvFrame::new(frame, env, self.stack.len()));
+    }
+    pub fn pop_frame(&mut self) -> EnvFrame<'a> {
+        let frame = self.frame_stack.pop().expect("Frame stack empty");
+        self.stack.truncate(frame.stack_height);
+        frame
+    }
+    pub fn push(&mut self, val: Value<'a>) {
+        self.stack.push(val);
+    }
+    pub fn pop(&mut self) -> Value<'a> {
+        self.stack.pop().expect("Stack empty")
+    }
+    pub fn jump(&mut self, target: usize) {
+        self.ip = target;
+        self.jumped = true;
+    }
+    pub fn advance(&mut self) {
+        if !self.jumped {
+            self.ip += 1;
+        } else {
+            self.jumped = false;
+        }
+    }
+    pub fn call_fn(&mut self, env: Gc<'a, Environment<'a>>, func: CodePointer) {
+        let return_ip = self.ip + 1;
+        self.push_frame(Frame::Function { return_ip }, env);
+        self.jump(func);
+    }
+}
+
+fn bubble_error<'a>(
+    exec_ctx: &mut ExecContext<'a>,
+    err: Result<Value<'a>, LocatedError<'a>>,
+) -> Result<(), LocatedError<'a>> {
+    let err = err.unwrap_err();
+    while let Some(frame) = exec_ctx.frame_stack.last() {
+        match &frame.frame {
+            Frame::Catch { target } => {
+                let target = *target;
+                exec_ctx.pop_frame();
+                exec_ctx.jump(target);
+                exec_ctx.push(err.data);
+                return Ok(());
             }
-            Instruction::PushNull => stack.push(Value::Null),
-            Instruction::PushBool(b) => stack.push(Value::Bool(*b)),
-            Instruction::PushInteger(i) => {
-                stack.push(Value::Integer(IntVariant::from_digit_string(i)))
-            }
-            Instruction::PushNumber(num) => stack.push(Value::Number(*num)),
-            Instruction::PushString(s) => {
-                stack.push(Value::String(Gc::new(mc, StringVariant::from_string(s))))
-            }
-            Instruction::PushArray(items) => {
-                let mut items: Vec<(Value<'a>, bool)> = items
-                    .iter()
-                    .rev()
-                    .map(|is_spread| (stack.pop().expect("Stack empty"), *is_spread))
-                    .collect();
-                items.reverse();
-                let mut item_vec = Vec::new();
-                for (item, is_spread) in items {
-                    if is_spread {
-                        if let Value::Array(arr) = item {
-                            let arr_ref = arr.borrow();
-                            item_vec.extend_from_slice(&arr_ref);
-                        } else {
-                            bubble_error(
-                                type_error(
-                                    mc,
-                                    root,
-                                    "Spread operator can only be applied to arrays",
-                                    &instruction.location,
-                                ),
-                                &mut frame_stack,
-                                &mut stack,
-                                &mut ip,
-                            )?;
-                            continue;
-                        }
-                    } else {
-                        item_vec.push(item);
-                    }
-                }
-                stack.push(Value::Array(Gc::new(mc, RefLock::new(item_vec))));
-            }
-            Instruction::PushObject(items) => todo!(),
-            Instruction::Raise => {
-                let err = stack.pop().expect("Stack empty");
-                bubble_error(
-                    Err(LocatedError {
-                        data: err,
-                        location: instruction.location.clone(),
-                    }),
-                    &mut frame_stack,
-                    &mut stack,
-                    &mut ip,
-                )?;
-                continue;
-            }
-            Instruction::PushFunction {
-                parameters,
-                body_pointer,
-            } => {
-                let func = Value::Function(Gc::new(
-                    mc,
-                    RefLock::new(FunctionValue::Function {
-                        parameters: parameters.clone(),
-                        body: *body_pointer,
-                        env,
-                    }),
-                ));
-                stack.push(func);
-            }
-            Instruction::PushClass {
-                parent,
-                initializer_pointer,
-                properties,
-                constructor_pointer,
-            } => todo!(),
-            Instruction::Break => {
-                bubble_control_flow(
-                    mc,
-                    root,
-                    true,
-                    &instruction.location,
-                    &mut frame_stack,
-                    &mut stack,
-                    &mut ip,
-                )?;
-                continue;
-            }
-            Instruction::Continue => {
-                bubble_control_flow(
-                    mc,
-                    root,
-                    false,
-                    &instruction.location,
-                    &mut frame_stack,
-                    &mut stack,
-                    &mut ip,
-                )?;
-                continue;
-            }
-            Instruction::Return => todo!(),
-            Instruction::Jump(target) => {
-                ip = *target;
-                continue;
-            }
-            Instruction::JumpIfFalse(target) => {
-                let condition = stack.pop().expect("Stack empty");
-                let Value::Bool(b) = condition else {
-                    bubble_error(
-                        type_error(
-                            mc,
-                            root,
-                            "Condition must be a boolean",
-                            &instruction.location,
-                        ),
-                        &mut frame_stack,
-                        &mut stack,
-                        &mut ip,
-                    )?;
-                    continue;
-                };
-                if b {
-                    ip = *target;
-                    continue;
-                }
-            }
-            Instruction::EnterBlock => {
-                let block_env = Gc::new(mc, Environment::new(mc, env));
-                frame_stack.push(EnvFrame::new(Frame::Block, block_env));
-            }
-            Instruction::EnterLoop {
+            _ => continue,
+        }
+    }
+    return Err(err);
+}
+fn bubble_control_flow<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    is_break: bool,
+    location: &Location,
+) -> Result<(), LocatedError<'a>> {
+    while let Some(frame) = exec_ctx.frame_stack.last() {
+        match &frame.frame {
+            Frame::Loop {
                 break_target,
                 continue_target,
             } => {
-                frame_stack.push(EnvFrame::new(
-                    Frame::Loop {
-                        break_target: *break_target,
-                        continue_target: *continue_target,
-                        stack_height: stack.len(),
-                    },
-                    env,
-                ));
+                let target = if is_break {
+                    *break_target
+                } else {
+                    *continue_target
+                };
+                exec_ctx.pop_frame();
+                exec_ctx.jump(target);
+                return Ok(());
             }
-            Instruction::EnterTryCatch { catch_target } => {
-                frame_stack.push(EnvFrame::new(
-                    Frame::Catch {
-                        target: *catch_target,
-                        stack_height: stack.len(),
-                    },
-                    env,
-                ));
+            Frame::Function { .. } => {
+                return unhandled_control_flow(ctx, location);
             }
-            Instruction::ExitFrame => match frame_stack.pop().expect("Frame stack empty").frame {
-                Frame::Function { return_ip, .. } => {
-                    ip = return_ip;
-                    continue;
-                }
-                _ => {}
-            },
-            Instruction::CallFunction(_) => todo!(),
-            Instruction::CallPropertyFunction(_, _) => todo!(),
-            Instruction::TryShortCircuit(binary_op, _) => todo!(),
-            Instruction::BinaryOp(binary_op) => todo!(),
-            Instruction::UnaryOp(unary_op) => todo!(),
-            Instruction::MakeInstance(items) => todo!(),
-            Instruction::CallInitializer => todo!(),
-            Instruction::CheckCatch(_) => todo!(),
-        };
-        ip += 1;
+            _ => continue,
+        }
     }
-    let last = stack
-        .pop()
-        .expect("Stack should have at least one value at the end of execution");
+    return unhandled_control_flow(ctx, location);
+}
+fn bubble_return<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    ret: Value<'a>,
+    location: &Location,
+) -> Result<(), LocatedError<'a>> {
+    while let Some(frame) = exec_ctx.frame_stack.last() {
+        match &frame.frame {
+            Frame::Function { return_ip } => {
+                let target = *return_ip;
+                exec_ctx.pop_frame();
+                exec_ctx.jump(target);
+                exec_ctx.push(ret);
+                return Ok(());
+            }
+            _ => continue,
+        }
+    }
+    return unhandled_control_flow(ctx, location);
+}
+
+pub fn interpret<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    env: Gc<'a, Environment<'a>>,
+) -> Result<Value<'a>, LocatedError<'a>> {
+    exec_ctx.push_frame(Frame::Block, env);
+
+    let code = ctx.root.code.borrow();
+
+    loop {
+        println!(
+            "IP: {}, Stack: {:?}",
+            exec_ctx.ip,
+            exec_ctx
+                .stack
+                .iter()
+                .map(|x| x.get_type())
+                .collect::<Vec<_>>()
+        );
+        match eval_instruction(ctx, exec_ctx, &code) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => bubble_error(exec_ctx, Err(e))?,
+        }
+        exec_ctx.advance();
+    }
+    let last = exec_ctx.pop();
     Ok(last)
 }
 
-fn maybe_take_last_value<'a>(last: &mut ExecResult<'a>) -> Option<Value<'a>> {
-    let ExecResult::Value(_) = last else {
-        return None;
+pub fn eval_instruction<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    code: &Vec<Located<Instruction>>,
+) -> Result<bool, LocatedError<'a>> {
+    let instruction = &code[exec_ctx.ip];
+    let location = &instruction.location;
+    let env = exec_ctx.frame_stack.last().expect("Frame stack empty").env;
+    match &instruction.data {
+        Instruction::Exit => return Ok(false),
+        Instruction::Load(ident) => eval_identifier(ctx, exec_ctx, ident, env, location)?,
+        Instruction::Store(ident) => {
+            let value = exec_ctx.pop();
+            assign_identifier(ctx, ident, env, location, value)?;
+        }
+        Instruction::Define(pattern) => {
+            let value = exec_ctx.pop();
+            let pattern = resolve_pattern(ctx, pattern, location, value)?;
+            for (name, val) in pattern {
+                if !env.define(ctx, name, val) {
+                    return duplicate_variable_definition(ctx, name, location);
+                }
+            }
+        }
+        Instruction::DefineCanonic(canonical_path) => {
+            let Some(module) = ModuleTree::get(ctx.root.root_module, &canonical_path.path) else {
+                panic!("Module not found: {}", canonical_path.path)
+            };
+            let mod_env = module.borrow().env;
+            let item = exec_ctx.pop();
+            mod_env.define_const(ctx, &canonical_path.item, item);
+        }
+        Instruction::LoadProperty(field) => {
+            let object = exec_ctx.pop();
+            let (val, _) = get_property(ctx, &object, field, location)?;
+            exec_ctx.push(val);
+        }
+        Instruction::StoreProperty(field) => {
+            let val = exec_ctx.pop();
+            let object = exec_ctx.pop();
+            let res = set_property(ctx, location, object, field, val)?;
+            exec_ctx.push(res);
+        }
+        Instruction::LoadIndex => {
+            let index = exec_ctx.pop();
+            let array = exec_ctx.pop();
+            let res = get_at_index(ctx, location, index, array)?;
+            exec_ctx.push(res);
+        }
+        Instruction::StoreIndex => {
+            let val = exec_ctx.pop();
+            let index = exec_ctx.pop();
+            let array = exec_ctx.pop();
+            let res = set_at_index(ctx, location, index, array, val)?;
+            exec_ctx.push(res);
+        }
+        Instruction::Pop => {
+            exec_ctx.pop();
+        }
+        Instruction::PushNull => exec_ctx.push(Value::Null),
+        Instruction::PushBool(b) => exec_ctx.push(Value::Bool(*b)),
+        Instruction::PushInteger(i) => {
+            exec_ctx.push(Value::Integer(IntVariant::from_digit_string(i)))
+        }
+        Instruction::PushNumber(num) => exec_ctx.push(Value::Number(*num)),
+        Instruction::PushString(s) => {
+            exec_ctx.push(Value::String(ctx.gc(StringVariant::from_string(s))))
+        }
+        Instruction::PushArray(items) => {
+            let mut items: Vec<(Value<'a>, bool)> = items
+                .iter()
+                .rev()
+                .map(|is_spread| (exec_ctx.pop(), *is_spread))
+                .collect();
+            items.reverse();
+            let mut item_vec = Vec::new();
+            for (item, is_spread) in items {
+                if is_spread {
+                    if let Value::Array(arr) = item {
+                        let arr_ref = arr.borrow();
+                        item_vec.extend_from_slice(&arr_ref);
+                    } else {
+                        return type_error(
+                            ctx,
+                            "Spread operator can only be applied to arrays",
+                            &location,
+                        );
+                    }
+                } else {
+                    item_vec.push(item);
+                }
+            }
+            exec_ctx.push(Value::Array(ctx.gc_lock(item_vec)));
+        }
+        Instruction::PushObject(items) => {
+            let entries: Vec<(Option<String>, Value<'a>)> = items
+                .iter()
+                .rev()
+                .map(|key| (key.clone(), exec_ctx.pop()))
+                .collect();
+            let mut entry_map = HashMap::new();
+            for (key, value) in entries.into_iter().rev() {
+                if let Some(key) = key {
+                    entry_map.insert(key, value);
+                } else {
+                    if let Value::Object(obj) = value {
+                        let obj_ref = obj.borrow();
+                        for (k, v) in obj_ref.iter() {
+                            entry_map.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        return type_error(
+                            ctx,
+                            "Spread operator can only be applied to objects",
+                            &location,
+                        );
+                    };
+                }
+            }
+            exec_ctx.push(Value::Object(ctx.gc_lock(entry_map)));
+        }
+        Instruction::Raise => {
+            let err = exec_ctx.pop();
+            return Err(LocatedError {
+                data: err,
+                location: location.clone(),
+            });
+        }
+        Instruction::PushFunction {
+            parameters,
+            body_pointer,
+        } => {
+            let func_env = ctx.gc(Environment::new(ctx, env));
+            let func = Value::Function(ctx.gc_lock(FunctionValue::Function {
+                parameters: parameters.clone(),
+                body: *body_pointer,
+                env: func_env,
+            }));
+            exec_ctx.push(func);
+        }
+        Instruction::PushLazy(initializer) => {
+            let func_env = ctx.gc(Environment::new(ctx, env));
+            let lazy = Value::Lazy(ctx.gc_lock(LazyValue::Uninitialized {
+                body: *initializer,
+                env: func_env,
+            }));
+            exec_ctx.push(lazy);
+        }
+        Instruction::PushClass {
+            parent,
+            methods,
+            static_methods,
+            constructor,
+        } => {
+            let parent = if *parent {
+                let Value::Class(parent) = exec_ctx.pop() else {
+                    return type_error(ctx, "Parent must be a class", &location);
+                };
+                Some(parent)
+            } else {
+                None
+            };
+            let class = Value::Class(
+                ctx.gc_lock(ClassValue {
+                    constructor: constructor.as_ref().map(|(params, body)| {
+                        ctx.gc_lock(FunctionValue::Function {
+                            parameters: params.clone(),
+                            body: *body,
+                            env: ctx.gc(Environment::new(ctx, env)),
+                        })
+                    }),
+                    methods: methods
+                        .iter()
+                        .map(|(name, params, body)| {
+                            (
+                                name.clone(),
+                                ctx.gc_lock(FunctionValue::Function {
+                                    parameters: params.clone(),
+                                    body: *body,
+                                    env: ctx.gc(Environment::new(ctx, env)),
+                                }),
+                            )
+                        })
+                        .collect(),
+                    static_methods: static_methods
+                        .iter()
+                        .map(|(name, params, body)| {
+                            (
+                                name.clone(),
+                                ctx.gc_lock(FunctionValue::Function {
+                                    parameters: params.clone(),
+                                    body: *body,
+                                    env: ctx.gc(Environment::new(ctx, env)),
+                                }),
+                            )
+                        })
+                        .collect(),
+                    parent,
+                }),
+            );
+            exec_ctx.push(class);
+        }
+        Instruction::MakeInstance(field_names) => {
+            let mut fields = field_names
+                .iter()
+                .rev()
+                .map(|name| (name.clone(), exec_ctx.pop()))
+                .collect::<Vec<_>>();
+            fields.reverse();
+            let field_map = fields.into_iter().collect();
+            let Value::Class(class) = exec_ctx.pop() else {
+                return type_error(ctx, "Attempted to instantiate a non-class value", &location);
+            };
+            let instance = Value::ClassInstance(ctx.gc_lock(ClassInstanceValue {
+                class,
+                fields: field_map,
+            }));
+            exec_ctx.push(instance);
+        }
+        Instruction::Break => {
+            bubble_control_flow(ctx, exec_ctx, true, &location)?;
+        }
+        Instruction::Continue => {
+            bubble_control_flow(ctx, exec_ctx, false, &location)?;
+        }
+        Instruction::Return => {
+            let ret = exec_ctx.pop();
+            bubble_return(ctx, exec_ctx, ret, &location)?;
+        }
+        Instruction::Jump(target) => {
+            exec_ctx.jump(*target);
+        }
+        Instruction::JumpIfFalse(target) => {
+            let condition = exec_ctx.pop();
+            if let Value::Bool(b) = condition {
+                if b {
+                    exec_ctx.jump(*target);
+                }
+            } else {
+                return type_error(ctx, "Condition must be a boolean", &location);
+            };
+        }
+        Instruction::EnterBlock => {
+            let block_env = ctx.gc(Environment::new(ctx, env));
+            exec_ctx.push_frame(Frame::Block, block_env);
+        }
+        Instruction::EnterLoop {
+            break_target,
+            continue_target,
+        } => {
+            exec_ctx.push_frame(
+                Frame::Loop {
+                    break_target: *break_target,
+                    continue_target: *continue_target,
+                },
+                env,
+            );
+        }
+        Instruction::EnterTryCatch { catch_target } => {
+            exec_ctx.push_frame(
+                Frame::Catch {
+                    target: *catch_target,
+                },
+                env,
+            );
+        }
+        Instruction::ExitFrame => match exec_ctx.pop_frame().frame {
+            Frame::Function { return_ip, .. } => {
+                exec_ctx.jump(return_ip);
+            }
+            _ => {}
+        },
+        Instruction::CallFunction(arg_count) => {
+            let mut args = Vec::with_capacity(*arg_count);
+            for _ in 0..*arg_count {
+                args.push(exec_ctx.pop());
+            }
+            args.reverse();
+            let function = exec_ctx.pop();
+            call_function(ctx, exec_ctx, location, env, args, &function)?;
+        }
+        Instruction::CallPropertyFunction(field, arg_count) => {
+            let mut args = Vec::with_capacity(*arg_count);
+            for _ in 0..*arg_count {
+                args.push(exec_ctx.pop());
+            }
+            args.reverse();
+            let object = exec_ctx.pop();
+            let (function, is_method) = get_property(ctx, &object, field, location)?;
+            if is_method {
+                args.insert(0, object);
+            }
+            call_function(ctx, exec_ctx, location, env, args, &function)?;
+        }
+        Instruction::TryShortCircuit(op, target) => {
+            if interpret_short_circuit(op, exec_ctx.stack.last().expect("Stack empty")) {
+                exec_ctx.jump(*target);
+            }
+        }
+        Instruction::BinaryOp(op) => {
+            let right = exec_ctx.pop();
+            let left = exec_ctx.pop();
+            let res = interpret_simple_binary_op(ctx, op, left, right, location)?;
+            exec_ctx.push(res);
+        }
+        Instruction::UnaryOp(op) => {
+            let val = exec_ctx.pop();
+            let res = interpret_simple_unary_op(ctx, op, val, location)?;
+            exec_ctx.push(res);
+        }
+        Instruction::CallConstructor(arg_count) => {
+            let mut args = Vec::with_capacity(*arg_count);
+            for _ in 0..*arg_count {
+                args.push(exec_ctx.pop());
+            }
+            args.reverse();
+            let Value::Class(class) = exec_ctx.pop() else {
+                return type_error(
+                    ctx,
+                    "Attempted to call initializer on a non-class value",
+                    location,
+                );
+            };
+            let class_ref = class.borrow();
+            let Some(constructor) = &class_ref.constructor else {
+                return cannot_instantiate(ctx, "Class does not have a constructor", location);
+            };
+            args.push(Value::Class(class));
+
+            call_function(
+                ctx,
+                exec_ctx,
+                location,
+                env,
+                args,
+                &Value::Function(*constructor),
+            )?;
+        }
+        Instruction::CheckCatch(target) => {
+            let err = exec_ctx.pop();
+            let class = exec_ctx.pop();
+            if let Value::Class(ci) = &class {
+                if is_instance_of(&err, *ci) {
+                    exec_ctx.push(err);
+                    exec_ctx.jump(*target);
+                } else {
+                    return Err(Located::new(err, location.clone())); //continue bubbling
+                }
+            } else {
+                return type_error(ctx, "Expected class instance", location);
+            }
+        }
+        Instruction::InitializeLazyEnd => {
+            let lazy = exec_ctx.pop();
+            let value = exec_ctx.pop();
+            let Value::Lazy(lazy_ref) = lazy else {
+                return type_error(ctx, "Attempted to initialize a non-lazy value", location);
+            };
+            let mut lazy_borrow = lazy_ref.borrow_mut(ctx.mc);
+            match &*lazy_borrow {
+                LazyValue::Initialized(_) => {
+                    return type_error(
+                        ctx,
+                        "Attempted to initialize an already initialized lazy value",
+                        location,
+                    );
+                }
+                _ => {
+                    *lazy_borrow = LazyValue::Initialized(value.clone());
+                    exec_ctx.push(value);
+                }
+            }
+        }
     };
-    let ExecResult::Value(val) = std::mem::take(last) else {
-        unreachable!();
-    };
-    Some(val)
+    Ok(true)
 }
 
 fn set_at_index<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
     location: &Location,
     index: Value<'a>,
     array: Value<'a>,
     result: Value<'a>,
-) -> ExecResult<'a> {
+) -> Result<Value<'a>, LocatedError<'a>> {
     match array {
         Value::Array(arr) => {
             let Value::Integer(i) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "Array index must be an integer",
-                    location,
-                ));
+                return type_error(ctx, "Array index must be an integer", location);
             };
-            let mut arr_ref = arr.borrow_mut(mc);
+            let mut arr_ref = arr.borrow_mut(ctx.mc);
             if let Some(index) = i.try_to_usize()
                 && index < arr_ref.len()
             {
                 arr_ref[index] = result.clone();
-                ExecResult::Value(result)
+                Ok(result)
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, location))
+                array_index_out_of_bounds(ctx, i, location)
             }
         }
-        Value::String(_) => convert_err(type_error(
-            mc,
-            root,
+        Value::String(_) => type_error(
+            ctx,
             "Strings are immutable; cannot assign to index",
             location,
-        )),
+        ),
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             let Value::String(s) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "Object index must be an string",
-                    location,
-                ));
+                return type_error(ctx, "Object index must be an string", location);
             };
             let s = s.to_string();
             if obj_ref.contains_key(&s) {
                 drop(obj_ref);
-                let mut obj_ref = obj.borrow_mut(mc);
+                let mut obj_ref = obj.borrow_mut(ctx.mc);
                 obj_ref.insert(s, result.clone());
-                ExecResult::Value(result)
+                Ok(result)
             } else {
-                convert_err(field_access_error(mc, root, &s, location))
+                field_access_error(ctx, &s, location)
             }
         }
         Value::TypedSlice {
@@ -500,14 +730,9 @@ fn set_at_index<'a>(
             buffer_type,
         } => {
             let Value::Integer(i) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "Array index must be an integer",
-                    location,
-                ));
+                return type_error(ctx, "Array index must be an integer", location);
             };
-            let mut buf_ref = buffer.borrow_mut(mc);
+            let mut buf_ref = buffer.borrow_mut(ctx.mc);
             let byte_start = start * buffer_type.byte_size();
             let byte_end = byte_start + length * buffer_type.byte_size();
             if let Some(index) = i.try_to_usize()
@@ -518,51 +743,34 @@ fn set_at_index<'a>(
                     .try_write_value(&mut buf_ref[byte_offset..byte_end], &result)
                     .is_some()
                 {
-                    ExecResult::Value(result)
+                    Ok(result)
                 } else {
-                    convert_err(type_error(
-                        mc,
-                        root,
-                        "Failed to write value to typed slice",
-                        location,
-                    ))
+                    type_error(ctx, "Failed to write value to typed slice", location)
                 }
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, location))
+                array_index_out_of_bounds(ctx, i, location)
             }
         }
-        _ => convert_err(type_error(
-            mc,
-            root,
-            "Attempted to index a non-array value",
-            location,
-        )),
+        _ => type_error(ctx, "Attempted to index a non-array value", location),
     }
 }
 
 fn call_function<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    stack: &mut Vec<EnvFrame<'a>>,
-    last: &mut ExecResult<'a>,
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
     location: &Location,
     env: Gc<'a, Environment<'a>>,
     args: Vec<Value<'a>>,
     function: &Value<'a>,
-) {
+) -> Result<(), LocatedError<'a>> {
     let Value::Function(f) = function else {
-        *last = convert_err(type_error(
-            mc,
-            root,
-            "Attempted to call a non-function value",
-            location,
-        ));
-        return;
+        return type_error(ctx, "Attempted to call a non-function value", location);
     };
     match *f.borrow() {
         FunctionValue::Builtin { ref func } => {
             // No call environment for builtin functions, as they won't define variables
-            *last = convert_err(func(mc, root, args, location, env));
+            exec_ctx.push(func(ctx, args, location, env)?);
+            Ok(())
         }
         FunctionValue::Function {
             ref parameters,
@@ -571,48 +779,50 @@ fn call_function<'a>(
         } => {
             let args_len = args.len();
             if args_len != parameters.len() {
-                *last = convert_err(type_error(
-                    mc,
-                    root,
+                type_error(
+                    ctx,
                     &format!("Expected {} arguments, got {}", parameters.len(), args_len),
                     location,
-                ));
+                )
             } else {
-                let call_env = Gc::new(mc, Environment::new(mc, func_env));
+                let call_env = ctx.gc(Environment::new(ctx, func_env));
                 for (param, arg) in parameters.iter().zip(args.into_iter()) {
-                    call_env.define(mc, param, arg);
+                    call_env.define(ctx, param, arg);
                 }
+                exec_ctx.call_fn(call_env, body);
+                Ok(())
             }
         }
     }
 }
 
-fn interpret_short_circuit<'a>(
-    op: &BinaryOp,
-    left: Value<'a>,
-) -> Result<ExecResult<'a>, Value<'a>> {
-    Ok(match (op, &left) {
-        (BinaryOp::And, Value::Bool(false)) => ExecResult::Value(Value::Bool(false)),
-        (BinaryOp::Or, Value::Bool(true)) => ExecResult::Value(Value::Bool(true)),
-        (BinaryOp::NullCoalesce, Value::Null) => return Err(left),
-        (BinaryOp::NullCoalesce, _) => ExecResult::Value(left),
-        _ => return Err(left),
-    })
+fn interpret_short_circuit<'a>(op: &BinaryOp, left: &Value<'a>) -> bool {
+    match (op, &left) {
+        (BinaryOp::And, Value::Bool(false)) => true,
+        (BinaryOp::Or, Value::Bool(true)) => true,
+        (BinaryOp::NullCoalesce, Value::Null) => false,
+        (BinaryOp::NullCoalesce, _) => true,
+        _ => return false,
+    }
 }
 
-fn interpret_simple_unary_op<'a>(op: &UnaryOp, value: Value<'a>) -> Option<Value<'a>> {
-    Some(match (op, value) {
+fn interpret_simple_unary_op<'a>(
+    ctx: &Context<'a>,
+    op: &UnaryOp,
+    value: Value<'a>,
+    location: &Location,
+) -> Result<Value<'a>, LocatedError<'a>> {
+    Ok(match (op, value) {
         (UnaryOp::Negate, Value::Number(v)) => Value::Number(-v),
         (UnaryOp::Negate, Value::Integer(v)) => Value::Integer(v.neg()),
         (UnaryOp::Not, Value::Integer(v)) => Value::Integer(v.invert()),
         (UnaryOp::Not, Value::Bool(v)) => Value::Bool(!v),
-        _ => return None,
+        (_, v) => return unsupported_unary_operation(ctx, op, &v, location),
     })
 }
 
 fn interpret_simple_binary_op<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
     op: &BinaryOp,
     left: Value<'a>,
     right: Value<'a>,
@@ -637,7 +847,7 @@ fn interpret_simple_binary_op<'a>(
         (BinaryOp::Divide, Value::Number(l), Value::Number(r)) => Value::Number(l / r),
         (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => Value::Integer(
             l.div(r)
-                .ok_or_else(|| division_by_zero::<Value<'a>>(mc, root, location).unwrap_err())?,
+                .ok_or_else(|| division_by_zero::<Value<'a>>(ctx, location).unwrap_err())?,
         ),
         (BinaryOp::Divide, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() / r),
         (BinaryOp::Divide, Value::Number(l), Value::Integer(r)) => Value::Number(l / r.to_f64()),
@@ -645,7 +855,7 @@ fn interpret_simple_binary_op<'a>(
         (BinaryOp::Modulo, Value::Number(l), Value::Number(r)) => Value::Number(l % r),
         (BinaryOp::Modulo, Value::Integer(l), Value::Integer(r)) => Value::Integer(
             l.rem(r)
-                .ok_or_else(|| division_by_zero::<Value<'a>>(mc, root, location).unwrap_err())?,
+                .ok_or_else(|| division_by_zero::<Value<'a>>(ctx, location).unwrap_err())?,
         ),
         (BinaryOp::Modulo, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() % r),
         (BinaryOp::Modulo, Value::Number(l), Value::Integer(r)) => Value::Number(l % r.to_f64()),
@@ -679,27 +889,27 @@ fn interpret_simple_binary_op<'a>(
         }
 
         (_, left, right) => {
-            return unsupported_binary_operation(mc, root, op, &left, &right, location);
+            return unsupported_binary_operation(ctx, op, &left, &right, location);
         }
     })
 }
 
-pub fn get_std_env<'a>(root: &MyRoot<'a>) -> Gc<'a, Environment<'a>> {
-    let std_tree = ModuleTree::get(root.root_module, &ModulePath::from_root("std")).unwrap();
+pub fn get_std_env<'a>(ctx: &Context<'a>) -> Gc<'a, Environment<'a>> {
+    let std_tree = ModuleTree::get(ctx.root.root_module, &ModulePath::from_root("std")).unwrap();
     let std_env = std_tree.borrow().env;
     std_env
 }
 
 fn get_classes<'a>(
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
     target: &Value<'a>,
 ) -> (
     Option<GcRefLock<'a, ClassValue<'a>>>,
     GcRefLock<'a, ClassValue<'a>>,
 ) {
     let class_name = target.get_type();
-    let std_env = get_std_env(root);
-    let Value::Class(value_class) = std_env.get_simple(class_name).unwrap() else {
+    let std_env = get_std_env(ctx);
+    let Value::Class(value_class) = std_env.get(class_name).unwrap() else {
         panic!("Standard class {} not found", class_name);
     };
 
@@ -714,12 +924,10 @@ fn get_classes<'a>(
 }
 
 fn get_property<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
     target: &Value<'a>,
     field: &str,
     location: &Location,
-    env: Gc<'a, Environment<'a>>,
 ) -> Result<(Value<'a>, bool), LocatedError<'a>> {
     match target {
         Value::Object(obj) => {
@@ -737,49 +945,15 @@ fn get_property<'a>(
         _ => {}
     }
 
-    let (extra_class, value_class) = get_classes(root, target);
+    let (extra_class, value_class) = get_classes(ctx, target);
 
     fn look_for_property_in_class<'a>(
-        mc: &Mutation<'a>,
-        root: &MyRoot<'a>,
         mut class: GcRefLock<'a, ClassValue<'a>>,
         field: &str,
-        location: &Location,
-        env: Gc<'a, Environment<'a>>,
     ) -> Option<Result<(Value<'a>, bool), LocatedError<'a>>> {
         loop {
             let cur_ref = class.borrow();
-            if let Some(val) = cur_ref.static_fields.get(field).cloned() {
-                match val {
-                    StaticValue::BeingInitialized => {
-                        return Some(cyclic_static_initialization(mc, root, field, location));
-                    }
-                    StaticValue::Initialized(v) => {
-                        return Some(Ok((v, false)));
-                    }
-                    StaticValue::Uninitialized(expr) => {
-                        drop(cur_ref);
-                        let mut class_mut = class.borrow_mut(mc);
-                        class_mut
-                            .static_fields
-                            .insert(field.to_string(), StaticValue::BeingInitialized);
-                        drop(class_mut);
-                        let result = interpret(mc, root, expr.as_ref(), env);
-                        match result {
-                            Ok(v) => {
-                                class
-                                    .borrow_mut(mc)
-                                    .static_fields
-                                    .insert(field.to_string(), StaticValue::Initialized(v.clone()));
-                                return Some(Ok((v, false)));
-                            }
-                            Err(err) => {
-                                return Some(Err(err));
-                            }
-                        }
-                    }
-                }
-            } else if let Some(val) = cur_ref.methods.get(field) {
+            if let Some(val) = cur_ref.methods.get(field) {
                 return Some(Ok((Value::Function(*val), true)));
             } else if let Some(val) = cur_ref.static_methods.get(field) {
                 return Some(Ok((Value::Function(*val), false)));
@@ -795,61 +969,48 @@ fn get_property<'a>(
         }
     }
     if let Some(extra_class) = extra_class
-        && let Some(res) = look_for_property_in_class(mc, root, extra_class, field, location, env)
+        && let Some(res) = look_for_property_in_class(extra_class, field)
     {
         res
-    } else if let Some(res) =
-        look_for_property_in_class(mc, root, value_class, field, location, env)
-    {
+    } else if let Some(res) = look_for_property_in_class(value_class, field) {
         res
     } else {
-        field_access_error(mc, root, field, location)
+        field_access_error(ctx, field, location)
     }
 }
 
 fn get_at_index<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
     location: &Location,
     array: Value<'a>,
     index: Value<'a>,
-) -> ExecResult<'a> {
+) -> Result<Value<'a>, LocatedError<'a>> {
     match array {
         Value::Array(arr) => {
             let Value::Integer(i) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "Array index must be an integer",
-                    location,
-                ));
+                return type_error(ctx, "Array index must be an integer", location);
             };
             let arr_ref = arr.borrow();
             if let Some(index) = i.try_to_usize()
                 && index < arr_ref.len()
             {
                 let value = arr_ref[index].clone();
-                ExecResult::Value(value)
+                Ok(value)
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, location))
+                array_index_out_of_bounds(ctx, i, location)
             }
         }
         Value::String(s) => {
             let Value::Integer(i) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "String index must be an integer",
-                    location,
-                ));
+                return type_error(ctx, "String index must be an integer", location);
             };
             if let Some(index) = i.try_to_usize() {
-                let Some(value) = StringVariant::slice(mc, s, index, 1) else {
-                    return convert_err(array_index_out_of_bounds(mc, root, i, location));
+                let Some(value) = StringVariant::slice(ctx, s, index, 1) else {
+                    return array_index_out_of_bounds(ctx, i, location);
                 };
-                ExecResult::Value(Value::String(value))
+                Ok(Value::String(value))
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, location))
+                array_index_out_of_bounds(ctx, i, location)
             }
         }
         Value::TypedSlice {
@@ -859,12 +1020,7 @@ fn get_at_index<'a>(
             buffer_type,
         } => {
             let Value::Integer(i) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "Array index must be an integer",
-                    location,
-                ));
+                return type_error(ctx, "Array index must be an integer", location);
             };
             let byte_start = start * buffer_type.byte_size();
             let byte_end = byte_start + length * buffer_type.byte_size();
@@ -875,97 +1031,58 @@ fn get_at_index<'a>(
                 let byte_offset = byte_start + index * buffer_type.byte_size();
                 let Some(value) = buffer_type.try_read_value(&arr_ref[byte_offset..byte_end])
                 else {
-                    return convert_err(type_error(
-                        mc,
-                        root,
-                        "Failed to read value from typed slice",
-                        &location,
-                    ));
+                    return type_error(ctx, "Failed to read value from typed slice", &location);
                 };
-                ExecResult::Value(value)
+                Ok(value)
             } else {
-                convert_err(array_index_out_of_bounds(mc, root, i, &location))
+                array_index_out_of_bounds(ctx, i, &location)
             }
         }
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             let Value::String(s) = index else {
-                return convert_err(type_error(
-                    mc,
-                    root,
-                    "Object index must be an string",
-                    location,
-                ));
+                return type_error(ctx, "Object index must be an string", location);
             };
             let s = s.to_string();
             if let Some(value) = obj_ref.get(&s).cloned() {
-                ExecResult::Value(value)
+                Ok(value)
             } else {
-                convert_err(field_access_error(mc, root, &s, location))
+                field_access_error(ctx, &s, location)
             }
         }
-        _ => convert_err(type_error(
-            mc,
-            root,
-            "Attempted to index a non-array value",
-            &location,
-        )),
+        _ => type_error(ctx, "Attempted to index a non-array value", &location),
     }
 }
 
 fn set_property<'a>(
-    root: &MyRoot<'a>,
-    mc: &Mutation<'a>,
+    ctx: &Context<'a>,
     location: &Location,
     object: Value<'a>,
-    field: String,
+    field: &String,
     result: Value<'a>,
-) -> ExecResult<'a> {
+) -> Result<Value<'a>, LocatedError<'a>> {
     match object {
         Value::Object(obj) => {
-            obj.borrow_mut(mc).insert(field, result.clone());
-            ExecResult::Value(result)
+            obj.borrow_mut(ctx.mc).insert(field.clone(), result.clone());
+            Ok(result)
         }
         Value::ClassInstance(obj) => {
-            if let Some(field) = obj.borrow_mut(mc).fields.get_mut(&field) {
+            if let Some(field) = obj.borrow_mut(ctx.mc).fields.get_mut(field) {
                 *field = result.clone();
-                ExecResult::Value(result)
+                Ok(result)
             } else {
-                convert_err(type_error(
-                    mc,
-                    root,
+                type_error(
+                    ctx,
                     &format!("Field '{}' does not exist on class instance", field),
                     &location,
-                ))
+                )
             }
         }
-        Value::Class(class) => {
-            let mut cur = class;
-            loop {
-                let mut class_ref = cur.borrow_mut(mc);
-                if let Some(field_val) = class_ref.static_fields.get_mut(&field) {
-                    *field_val = StaticValue::Initialized(result.clone());
-                    return ExecResult::Value(result);
-                } else if let Some(parent) = &class_ref.parent {
-                    let parent = *parent;
-                    drop(class_ref);
-                    cur = parent;
-                } else {
-                    return convert_err(type_error(
-                        mc,
-                        root,
-                        &format!("Static field '{}' does not exist on class", field),
-                        &location,
-                    ));
-                }
-            }
-        }
-        _ => convert_err(type_error(
-            mc,
-            root,
+        _ => type_error(
+            ctx,
             "Attempted to assign field on non-object value",
             &location,
-        )),
+        ),
     }
 }
 
@@ -983,206 +1100,118 @@ fn is_instance_of<'a>(object: &Value<'a>, class: GcRefLock<'a, ClassValue<'a>>) 
     false
 }
 
-fn expression_to_function<'a>(
-    mc: &Mutation<'a>,
-    expr: &'a LocatedExpression,
-    env: Gc<'a, Environment<'a>>,
-    code: &mut Vec<Located<Instruction>>,
-) -> GcRefLock<'a, FunctionValue<'a>> {
-    if let Expression::FunctionLiteral { parameters, body } = &expr.data {
-        let func_env = Gc::new(mc, Environment::new(mc, env));
-        compile(body, code);
-        Gc::new(
-            mc,
-            RefLock::new(FunctionValue::Function {
-                parameters: parameters.clone(),
-                body: Gc::new(mc, StaticCollect(*body.clone())),
-                env: func_env,
-            }),
-        )
-    } else {
-        panic!("Expected function literal");
-    }
-}
-
-fn make_class_literal<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    expr: &'a LocatedExpression,
-    env: Gc<'a, Environment<'a>>,
-    code: &mut Vec<Located<Instruction>>,
-) -> ExecResult<'a> {
-    match &expr.data {
-        Expression::ClassLiteral {
-            parent,
-            properties,
-            constructor,
-        } => {
-            let parent_val = match parent {
-                None => None,
-                Some(p) => match eval_identifier(mc, root, p, env, &expr.location) {
-                    ExecResult::Value(v) => Some(v),
-                    other => {
-                        return other;
-                    }
-                },
-            };
-            let parent_class = match &parent_val {
-                Some(Value::Class(c)) => Some(c.clone()),
-                Some(other) => {
-                    return convert_err(type_error(
-                        mc,
-                        root,
-                        &format!("Expected class as parent, got {:?}", other),
-                        &expr.location,
-                    ));
-                }
-                None => None,
-            };
-            let instance_fields = properties
-                .iter()
-                .filter(|(_, _, kind)| matches!(kind, ClassMemberKind::Field))
-                .map(|(name, expr, _)| (name.clone(), Gc::new(mc, StaticCollect(*expr.clone()))))
-                .collect();
-            let methods = properties
-                .iter()
-                .filter(|(_, _, kind)| matches!(kind, ClassMemberKind::Method))
-                .map(|(name, expr, _)| (name.clone(), expression_to_function(mc, expr, env)))
-                .collect();
-            let static_methods = properties
-                .iter()
-                .filter(|(_, _, kind)| matches!(kind, ClassMemberKind::StaticMethod))
-                .map(|(name, expr, _)| (name.clone(), expression_to_function(mc, expr, env)))
-                .collect();
-            let static_fields = properties
-                .iter()
-                .filter(|(_, _, kind)| matches!(kind, ClassMemberKind::StaticField))
-                .map(|(name, expr, _)| {
-                    (
-                        name.clone(),
-                        StaticValue::Uninitialized(Gc::new(mc, StaticCollect(*expr.clone()))),
-                    )
-                })
-                .collect();
-            let constructor = constructor
-                .as_ref()
-                .map(|expr| expression_to_function(mc, expr, env));
-            let class_val = Gc::new(
-                mc,
-                RefLock::new(ClassValue {
-                    parent: parent_class,
-                    instance_fields,
-                    constructor,
-                    static_fields,
-                    static_methods,
-                    methods,
-                }),
-            );
-            ExecResult::Value(Value::Class(class_val))
-        }
-        _ => unreachable!(),
-    }
-}
-
 fn eval_identifier<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
     ident: &Identifier,
     env: Gc<'a, Environment<'a>>,
     location: &Location,
-) -> ExecResult<'a> {
-    match ident {
-        Identifier::Simple(name) => convert_err(Environment::get(env, mc, root, name, location)),
+) -> Result<(), LocatedError<'a>> {
+    let val = match ident {
+        Identifier::Simple(name) => env.get(name),
         Identifier::Scoped(path) => {
-            let module_tree = ModuleTree::get(root.root_module, &path.path);
+            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
             if let Some(module_tree) = module_tree {
                 let env = module_tree.borrow().env;
-                convert_err(Environment::get(env, mc, root, &path.item, location))
+                env.get(&path.item)
             } else {
-                convert_err(undefined_variable(mc, root, &path.to_string(), location))
+                return undefined_variable(ctx, &path.to_string(), location);
             }
         }
+    };
+    let Some(val) = val else {
+        return undefined_identifier(ctx, ident, location);
+    };
+    match val {
+        Value::Lazy(lazy) => {
+            let mut lazy_ref = lazy.borrow_mut(ctx.mc);
+            match &*lazy_ref {
+                LazyValue::BeingInitialized => {
+                    return cyclic_static_initialization(ctx, ident, location);
+                }
+                LazyValue::Initialized(v) => {
+                    exec_ctx.push(v.clone());
+                }
+                LazyValue::Uninitialized { body, env } => {
+                    let body = *body;
+                    let env = *env;
+                    *lazy_ref = LazyValue::BeingInitialized;
+                    drop(lazy_ref);
+                    let call_env = ctx.gc(Environment::new(ctx, env));
+                    exec_ctx.call_fn(call_env, body);
+                }
+            }
+        }
+        _ => exec_ctx.push(val.clone()),
     }
+    Ok(())
 }
 
 fn assign_identifier<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
+    ctx: &Context<'a>,
     ident: &Identifier,
     env: Gc<'a, Environment<'a>>,
     location: &Location,
     value: Value<'a>,
 ) -> Result<(), LocatedError<'a>> {
     match ident {
-        Identifier::Simple(name) => Environment::set(env, mc, root, name, value, &location),
+        Identifier::Simple(name) => Environment::set(ctx, env, name, value, &location),
         Identifier::Scoped(path) => {
-            let module_tree = ModuleTree::get(root.root_module, &path.path);
+            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
             if let Some(module_tree) = module_tree {
                 let env = module_tree.borrow().env;
-                Environment::set(env, mc, root, &path.item, value, &location)
+                Environment::set(ctx, env, &path.item, value, &location)
             } else {
-                undefined_variable(mc, root, &path.to_string(), location)
+                undefined_variable(ctx, &path.to_string(), location)
             }
         }
     }
 }
 
-fn resolve_pattern<'a>(
-    mc: &Mutation<'a>,
-    root: &MyRoot<'a>,
-    pattern: &'a Located<Pattern>,
+fn resolve_pattern<'a, 'b>(
+    ctx: &Context<'a>,
+    pattern: &'b Pattern,
+    location: &Location,
     value: Value<'a>,
-) -> Result<Vec<(&'a String, Value<'a>)>, LocatedError<'a>> {
-    let mut stack = vec![(pattern, value)];
+) -> Result<Vec<(&'b String, Value<'a>)>, LocatedError<'a>> {
+    let mut stack = vec![(pattern, location, value)];
     let mut result = Vec::new();
-    while let Some((pattern, value)) = stack.pop() {
-        let location = &pattern.location;
-        match &pattern.data {
+    while let Some((pattern, location, value)) = stack.pop() {
+        match &pattern {
             Pattern::Wildcard => continue,
             Pattern::Ident(name) => result.push((name, value.clone())),
             Pattern::Object { entries, rest } => {
                 let Value::Object(obj) = &value else {
-                    return type_error(
-                        mc,
-                        root,
-                        "Expected object value for object pattern",
-                        location,
-                    );
+                    return type_error(ctx, "Expected object value for object pattern", location);
                 };
                 let obj_ref = obj.borrow();
                 let mut remaining_fields = obj_ref.clone();
                 for (item, pattern) in entries {
                     let Some(val) = remaining_fields.remove(item) else {
-                        return field_access_error(mc, root, item, location);
+                        return field_access_error(ctx, item, location);
                     };
-                    stack.push((pattern, val.clone()));
+                    stack.push((&pattern.data, &pattern.location, val.clone()));
                 }
                 if let Some(rest) = rest {
-                    let rest_obj = Value::Object(Gc::new(mc, RefLock::new(remaining_fields)));
+                    let rest_obj = Value::Object(ctx.gc_lock(remaining_fields));
                     result.push((rest, rest_obj));
                 }
             }
             Pattern::Array { items, rest } => {
                 let Value::Array(arr) = &value else {
-                    return type_error(
-                        mc,
-                        root,
-                        "Expected array value for array pattern",
-                        location,
-                    );
+                    return type_error(ctx, "Expected array value for array pattern", location);
                 };
                 let arr_ref = arr.borrow();
                 for (i, pattern) in items.iter().enumerate() {
                     let Some(val) = arr_ref.get(i) else {
-                        return index_out_of_bounds(mc, root, i, location);
+                        return index_out_of_bounds(ctx, i, location);
                     };
-                    stack.push((pattern, val.clone()));
+                    stack.push((&pattern.data, &pattern.location, val.clone()));
                 }
                 if let Some(rest) = rest
                     && items.len() <= arr_ref.len()
                 {
-                    let rest_obj =
-                        Value::Array(Gc::new(mc, RefLock::new(arr_ref[items.len()..].to_vec())));
+                    let rest_obj = Value::Array(ctx.gc_lock(arr_ref[items.len()..].to_vec()));
                     result.push((rest, rest_obj));
                 }
             }

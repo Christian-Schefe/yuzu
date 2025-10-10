@@ -62,10 +62,6 @@ fn factorial(n) {
 
 static a = {val: 10};
 
-class Static {
-    static let value = null;
-}
-
 class MyException : Exception {
     constructor(msg) {
         this.message = msg;

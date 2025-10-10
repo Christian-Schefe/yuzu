@@ -1,18 +1,13 @@
 use crate::{
     location::{Located, located},
-    parser::{ClassMemberKind, Expression, LocatedExpression, Pattern},
+    parser::{ClassMemberKind, Expression, Identifier, LocatedExpression, Pattern},
 };
 
 mod instruction;
 pub use instruction::*;
 
-pub fn compile_expr(expression: &LocatedExpression) -> Vec<Located<Instruction>> {
-    let mut code = Vec::new();
-    compile(expression, &mut code);
-    code
-}
-
 pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instruction>>) {
+    println!("Compiling expression {:?}", expression.data);
     match &expression.data {
         Expression::Null => code.push(located(Instruction::PushNull, expression)),
         Expression::Number(num) => code.push(located(Instruction::PushNumber(*num), expression)),
@@ -54,7 +49,17 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             code.push(located(Instruction::PushObject(entries), expression));
         }
         Expression::FunctionLiteral { parameters, body } => {
-            let body_pointer = code.len() + 2;
+            let jump_index = code.len();
+            code.push(located(Instruction::Jump(0), expression));
+            let body_pointer = code.len();
+            compile(body, code);
+            println!("body:{} code:{}", body_pointer, code.len());
+            code.push(located(Instruction::ExitFrame, expression));
+            let cur_index = code.len();
+            let Instruction::Jump(target) = &mut code[jump_index].data else {
+                unreachable!();
+            };
+            *target = cur_index;
             code.push(located(
                 Instruction::PushFunction {
                     parameters: parameters.clone(),
@@ -62,24 +67,25 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 },
                 expression,
             ));
-            let jump_index = code.len();
-            code.push(located(Instruction::Jump(0), expression));
-            compile(body, code);
-            code.push(located(Instruction::ExitFrame, expression));
-            let cur_index = code.len();
-            let Instruction::Jump(target) = &mut code[jump_index].data else {
-                unreachable!();
-            };
-            *target = cur_index;
+        }
+        Expression::ImportDefine { name, value } => {
+            code.push(located(
+                Instruction::Load(Identifier::Scoped(value.clone())),
+                expression,
+            ));
+            code.push(located(
+                Instruction::Define(Pattern::Ident(name.clone())),
+                expression,
+            ));
         }
         Expression::Block(expressions, last_expr) => {
-            let mut code = vec![located(Instruction::EnterBlock, expression)];
+            code.push(located(Instruction::EnterBlock, expression));
             for expr in expressions {
-                compile(expr, &mut code);
+                compile(expr, code);
                 code.push(located(Instruction::Pop, expr));
             }
             if let Some(last_expr) = last_expr {
-                compile(last_expr, &mut code);
+                compile(last_expr, code);
             } else {
                 code.push(located(Instruction::PushNull, expression));
             }
@@ -163,10 +169,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
         }
         Expression::Define { pattern, value } => {
             compile(value, code);
-            code.push(located(
-                Instruction::Define(pattern.data.clone(), false),
-                pattern,
-            ));
+            code.push(located(Instruction::Define(pattern.data.clone()), pattern));
         }
         Expression::FunctionCall {
             function,
@@ -218,10 +221,25 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 expression,
             ));
         }
-        Expression::StaticDefine { name, value } => {
+        Expression::CanonicDefine { name, value } => {
+            let jump_index = code.len();
+            code.push(located(Instruction::Jump(0), expression));
+            let body_pointer = code.len();
             compile(value, code);
             code.push(located(
-                Instruction::Define(Pattern::Ident(name.clone()), true),
+                Instruction::Load(Identifier::Scoped(name.clone())),
+                expression,
+            ));
+            code.push(located(Instruction::InitializeLazyEnd, expression));
+            code.push(located(Instruction::ExitFrame, expression));
+            let cur_index = code.len();
+            let Instruction::Jump(target) = &mut code[jump_index].data else {
+                unreachable!();
+            };
+            *target = cur_index;
+            code.push(located(Instruction::PushLazy(body_pointer), expression));
+            code.push(located(
+                Instruction::DefineCanonic(name.clone()),
                 expression,
             ));
         }
@@ -318,44 +336,67 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
         } => {
             let jump_index = code.len();
             code.push(located(Instruction::Jump(0), expression));
-            let initializer_pointer = code.len();
+
+            let mut methods = Vec::new();
+            let mut static_methods = Vec::new();
             let mut fields = Vec::new();
             for (name, property, kind) in properties {
-                if !matches!(kind, ClassMemberKind::Field) {
-                    continue;
-                }
-                fields.push(name.clone());
-                compile(property, code);
+                let (params, body) = match kind {
+                    ClassMemberKind::Method | ClassMemberKind::StaticMethod => {
+                        let Expression::FunctionLiteral { parameters, body } = &property.data
+                        else {
+                            panic!("Only functions are allowed as class methods");
+                        };
+                        (parameters.clone(), body)
+                    }
+                    ClassMemberKind::Field => (Vec::new(), property),
+                };
+                let body_pointer = code.len();
+                compile(body, code);
+                code.push(located(Instruction::ExitFrame, expression));
+                match kind {
+                    ClassMemberKind::Method => methods.push((name.clone(), params, body_pointer)),
+                    ClassMemberKind::StaticMethod => {
+                        static_methods.push((name.clone(), params, body_pointer))
+                    }
+                    ClassMemberKind::Field => fields.push((name.clone(), body_pointer)),
+                };
             }
-            code.push(located(Instruction::MakeInstance(fields), expression));
+            let constructor = if let Some(constructor) = constructor {
+                let Expression::FunctionLiteral { parameters, body } = &constructor.data else {
+                    panic!("Only functions are allowed as class methods");
+                };
+                let body_pointer = code.len();
+                let mut field_names = Vec::new();
+                for (name, field_initializer) in &fields {
+                    code.push(located(
+                        Instruction::CallFunction(*field_initializer),
+                        expression,
+                    ));
+                    field_names.push(name.clone());
+                }
+                code.push(located(Instruction::MakeInstance(field_names), expression));
+                compile(body, code);
+                code.push(located(Instruction::ExitFrame, expression));
+                Some((parameters.clone(), body_pointer))
+            } else {
+                None
+            };
+
             let cur_index = code.len();
             let Instruction::Jump(target) = &mut code[jump_index].data else {
                 unreachable!();
             };
             *target = cur_index;
-            for (_, property, kind) in properties {
-                if matches!(kind, ClassMemberKind::Field) {
-                    continue;
-                }
-                compile(property, code);
+            if let Some(parent) = parent {
+                code.push(located(Instruction::Load(parent.clone()), expression));
             }
-            let constructor_pointer = if let Some(constructor) = constructor {
-                let cur_index = code.len();
-                compile(constructor, code);
-                Some(cur_index)
-            } else {
-                None
-            };
-            let property_infos = properties
-                .iter()
-                .map(|(name, _, kind)| (name.clone(), kind.clone()))
-                .collect();
             code.push(located(
                 Instruction::PushClass {
-                    parent: parent.clone(),
-                    initializer_pointer,
-                    properties: property_infos,
-                    constructor_pointer,
+                    parent: parent.is_some(),
+                    methods,
+                    static_methods,
+                    constructor,
                 },
                 expression,
             ));
@@ -391,7 +432,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 code.push(located(Instruction::CheckCatch(0), expression));
             }
             code.push(located(
-                Instruction::Define(Pattern::Ident(exception_var.clone()), false),
+                Instruction::Define(Pattern::Ident(exception_var.clone())),
                 expression,
             ));
             compile(catch_block, code);
@@ -418,12 +459,11 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
         }
         Expression::New { expr, arguments } => {
             compile(expr, code);
-            code.push(located(Instruction::CallInitializer, expression));
             for arg in arguments {
                 compile(arg, code);
             }
             code.push(located(
-                Instruction::CallFunction(arguments.len()),
+                Instruction::CallConstructor(arguments.len()),
                 expression,
             ));
         }
