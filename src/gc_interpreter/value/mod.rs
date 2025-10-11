@@ -404,7 +404,10 @@ pub struct ClassInstanceValue<'a> {
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct ClassValue<'a> {
-    pub constructor: Option<GcRefLock<'a, FunctionValue<'a>>>,
+    pub constructor: Option<(
+        GcRefLock<'a, FunctionValue<'a>>,
+        GcRefLock<'a, FunctionValue<'a>>,
+    )>,
     pub methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub static_methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub parent: Option<GcRefLock<'a, ClassValue<'a>>>,
@@ -432,16 +435,10 @@ impl<'a> Environment<'a> {
         }
     }
 
-    pub fn transfer(
-        ctx: &Context<'a>,
-        source: Gc<'a, Environment<'a>>,
-        target: Gc<'a, Environment<'a>>,
-    ) {
-        for (k, v) in source.values.borrow().iter() {
-            match v {
-                EnvValue::Value(val) => target.define(ctx, k, val.clone()),
-                EnvValue::ConstValue(val) => target.define_const(ctx, k, val.clone()),
-            };
+    pub fn new_child(mc: &Mutation<'a>, parent: Gc<'a, Environment<'a>>) -> Self {
+        Self {
+            values: Gc::new(mc, RefLock::new(HashMap::new())),
+            parent: Some(parent),
         }
     }
 
@@ -499,6 +496,15 @@ impl<'a> Environment<'a> {
         map.insert(name.to_string(), EnvValue::ConstValue(value));
         true
     }
+
+    pub fn collect_known_identifiers(&self, identifiers: &mut Vec<String>) {
+        for (k, _) in self.values.borrow().iter() {
+            identifiers.push(k.clone());
+        }
+        if let Some(parent) = &self.parent {
+            parent.collect_known_identifiers(identifiers);
+        }
+    }
 }
 
 impl<'a> Value<'a> {
@@ -522,7 +528,7 @@ impl<'a> Value<'a> {
     }
 }
 
-pub fn variable_to_string(var: &Value) -> String {
+pub fn value_to_string(var: &Value) -> String {
     match var {
         Value::Number(n) => n.to_string(),
         Value::Integer(i) => i.to_string(),
@@ -534,7 +540,7 @@ pub fn variable_to_string(var: &Value) -> String {
             let entries = entries
                 .borrow()
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
+                .map(|(k, v)| format!("{}: {}", k, value_to_string(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{{{}}}", entries)
@@ -544,20 +550,16 @@ pub fn variable_to_string(var: &Value) -> String {
             let entries = class_instance
                 .fields
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(v)))
+                .map(|(k, v)| format!("{}: {}", k, value_to_string(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "<instance of {} {{{}}}>",
-                variable_to_string(&Value::Class(class_instance.class.clone())),
-                entries
-            )
+            format!("<instance {{{}}}>", entries)
         }
         Value::Array(elements) => {
             let elements = elements
                 .borrow()
                 .iter()
-                .map(|e| variable_to_string(e))
+                .map(|e| value_to_string(e))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("[{}]", elements)
@@ -573,19 +575,26 @@ pub fn variable_to_string(var: &Value) -> String {
                 .borrow()
                 .static_methods
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&Value::Function(*v))))
+                .map(|(k, v)| format!("{}: {}", k, value_to_string(&Value::Function(*v))))
                 .collect::<Vec<_>>()
                 .join(", ");
             let methods = p
                 .borrow()
                 .methods
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, variable_to_string(&Value::Function(*v))))
+                .map(|(k, v)| format!("{}: {}", k, value_to_string(&Value::Function(*v))))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let constructor = p.borrow().constructor.map_or("none".to_string(), |c| {
-                variable_to_string(&Value::Function(c))
-            });
+            let constructor =
+                p.borrow()
+                    .constructor
+                    .map_or("none".to_string(), |(wrapper, actual)| {
+                        format!(
+                            "{} (wrapper), {} (actual)",
+                            value_to_string(&Value::Function(wrapper)),
+                            value_to_string(&Value::Function(actual))
+                        )
+                    });
             let entries = format!(
                 "static methods: {{{}}}, constructor: {}, methods: {{{}}}",
                 static_methods, constructor, methods
@@ -594,7 +603,7 @@ pub fn variable_to_string(var: &Value) -> String {
             let parent = if let Some(parent) = &p.borrow().parent {
                 format!(
                     " extends {}",
-                    variable_to_string(&Value::Class(parent.clone()))
+                    value_to_string(&Value::Class(parent.clone()))
                 )
             } else {
                 "".to_string()
@@ -648,7 +657,7 @@ pub fn variable_to_string(var: &Value) -> String {
             LazyValue::Uninitialized { .. } => "<lazy (uninitialized)>".to_string(),
             LazyValue::BeingInitialized => "<lazy (being initialized)>".to_string(),
             LazyValue::Initialized(value) => {
-                format!("<lazy (initialized): {}>", variable_to_string(value))
+                format!("<lazy (initialized): {}>", value_to_string(value))
             }
         },
     }
@@ -683,9 +692,9 @@ pub struct ModuleTree<'a> {
 }
 
 impl<'a> ModuleTree<'a> {
-    pub fn new(mc: &Mutation<'a>) -> Self {
+    pub fn new(mc: &Mutation<'a>, global_env: Gc<'a, Environment<'a>>) -> Self {
         Self {
-            env: Gc::new(mc, Environment::new_global(mc)),
+            env: Gc::new(mc, Environment::new_child(mc, global_env)),
             children: HashMap::new(),
         }
     }
@@ -700,7 +709,7 @@ impl<'a> ModuleTree<'a> {
                 .borrow_mut(ctx.mc)
                 .children
                 .entry(segment.clone())
-                .or_insert_with(|| ctx.gc_lock(ModuleTree::new(ctx.mc)))
+                .or_insert_with(|| ctx.gc_lock(ModuleTree::new(ctx.mc, ctx.root.global_env)))
         }
         current
     }

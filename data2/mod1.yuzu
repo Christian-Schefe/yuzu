@@ -2,3 +2,30 @@ fn test_fn(a, b) {
     print("In test_fn", a, b);
     a + b
 }
+
+fn fib(n) {
+    if (n <= 1) {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+class TestClass {
+    let x = 10;
+    let y = 20;
+    let arr = [1, 2, 3];
+    let what = let x = 6;
+    constructor(a, b) {
+        print(this.x, this.y, this, a, b);
+        this.x += a;
+        this.y = b;
+        let arr = this.arr;
+        arr[0] = 99;
+        arr[0];
+        arr[1] += 1;
+        arr[1] += this.arr[0];
+        print(arr, this.arr);
+        print(this.what);
+    }
+}

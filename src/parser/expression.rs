@@ -24,10 +24,6 @@ pub enum Expression {
         name: CanonicalPath,
         value: Box<LocatedExpression>,
     },
-    ImportDefine {
-        name: String,
-        value: CanonicalPath,
-    },
     FunctionLiteral {
         parameters: Vec<String>,
         body: Box<LocatedExpression>,
@@ -478,7 +474,6 @@ impl LocatedExpression {
                     .into_iter()
                     .for_each(|arg| arg.set_module(module_path));
             }
-            Expression::ImportDefine { .. } => {}
         }
     }
 }

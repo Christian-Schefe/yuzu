@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     gc_interpreter::{
-        Context, Value, get_std_env,
+        Context, Value, get_class_maybe_lazy, get_std_env,
         value::{ClassInstanceValue, IntVariant, LocatedError, StringVariant},
     },
     location::HasLocation,
@@ -11,11 +11,11 @@ use crate::{
 
 fn make_exception<'a>(ctx: &Context<'a>, msg: &str, variant: &str) -> Value<'a> {
     let std_env = get_std_env(ctx);
-    let p = if let Some(Value::Class(p)) = std_env.get(variant) {
-        p
+    let p = if let Some(c) = get_class_maybe_lazy(std_env, variant) {
+        c
     } else {
-        let Some(Value::Class(p)) = std_env.get("Exception") else {
-            panic!("Exception class not found");
+        let Some(p) = get_class_maybe_lazy(std_env, "Exception") else {
+            panic!("Exception class not found or not initialized");
         };
         p
     };

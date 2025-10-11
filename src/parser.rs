@@ -42,6 +42,12 @@ pub enum BinaryOp {
     NullCoalesce,
 }
 
+impl BinaryOp {
+    pub fn can_short_circuit(&self) -> bool {
+        matches!(self, Self::And | Self::Or | Self::NullCoalesce)
+    }
+}
+
 impl fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -187,9 +193,8 @@ where
     pattern
 }
 
-fn parser<'tokens, 'src: 'tokens, I>(
-    module_path: ModulePath,
-) -> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
+fn parser<'tokens, 'src: 'tokens, I>()
+-> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -237,21 +242,6 @@ where
                 located(
                     Expression::Define {
                         pattern,
-                        value: Box::new(value),
-                    },
-                    extra.span(),
-                )
-            })
-            .boxed();
-
-        let static_define = just(Token::Static)
-            .ignore_then(ident.clone())
-            .then_ignore(just(Token::Assign))
-            .then(expr.clone())
-            .map_with(move |(name, value), extra| {
-                located(
-                    Expression::CanonicDefine {
-                        name: CanonicalPath::new(module_path.clone(), name),
                         value: Box::new(value),
                     },
                     extra.span(),
@@ -348,9 +338,15 @@ where
                         .map_with(|mut parts, extra| {
                             let name = parts.pop().unwrap();
                             located(
-                                Expression::ImportDefine {
-                                    name: name.clone(),
-                                    value: CanonicalPath::new(ModulePath::new(parts), name),
+                                Expression::Define {
+                                    pattern: located(Pattern::Ident(name.clone()), extra.span()),
+                                    value: Box::new(located(
+                                        Expression::Ident(Identifier::Scoped(CanonicalPath::new(
+                                            ModulePath::new(parts),
+                                            name,
+                                        ))),
+                                        extra.span(),
+                                    )),
                                 },
                                 extra.span(),
                             )
@@ -374,7 +370,6 @@ where
                         located(Expression::Raise(Box::new(expr)), extra.span())
                     }),
                 let_.clone(),
-                static_define.clone(),
                 parameter_list
                     .delimited_by(just(Token::LParen), just(Token::RParen))
                     .then_ignore(just(Token::DoubleArrow))
@@ -856,25 +851,21 @@ where
 
 pub fn parse<'a>(
     source: &str,
-    module_path: ModulePath,
     file_path: &str,
     tokens: Vec<LocatedToken<'a>>,
 ) -> Result<Vec<ParsedModuleItem>, Vec<Rich<'a, Token<'a>>>> {
     let token_iter = tokens.into_iter().map(|lt| (lt.token, lt.span.into()));
     let token_stream =
         Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
-    parser(module_path)
-        .parse(token_stream)
-        .into_result()
-        .map(|mut pm| {
-            for item in &mut pm {
-                match item {
-                    ParsedModuleItem::Expression(e) => e.set_module(file_path),
-                    ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
-                }
+    parser().parse(token_stream).into_result().map(|mut pm| {
+        for item in &mut pm {
+            match item {
+                ParsedModuleItem::Expression(e) => e.set_module(file_path),
+                ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
             }
-            pm
-        })
+        }
+        pm
+    })
 }
 
 fn needs_semi(expr: &Expression) -> bool {

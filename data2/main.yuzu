@@ -5,7 +5,19 @@ use root::mod1::test_fn;
 fn main() {
     print("Hello from main.yuzu");
     print(test_fn(3, 4));
+    let obj = new root::mod1::TestClass(100, 200);
+    print(obj.x, obj.y, obj);
+    print(c);
+    
+    print([1, 2, 3].length());
+    for (v in [1,2,3,4]) {
+        print(v);
+    }
 }
+
+let a = 5;
+let c = b + 10;
+let b = a + 10;
 
 main();
 std::std_test();

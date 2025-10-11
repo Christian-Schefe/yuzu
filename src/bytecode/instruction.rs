@@ -1,5 +1,5 @@
 use crate::{
-    CanonicalPath,
+    CanonicalPath, ModulePath,
     parser::{BinaryOp, Identifier, Pattern, UnaryOp},
 };
 
@@ -8,11 +8,12 @@ pub type CodePointer = usize;
 #[derive(Debug, Clone)]
 pub enum Instruction {
     Exit,
+    DuplicateTopN(usize), // number of number or elements to duplicate
     Load(Identifier),
     Store(Identifier),
-    InitializeLazyEnd,
+    InitializeLazy(CanonicalPath),
     Define(Pattern),
-    DefineCanonic(CanonicalPath),
+    DefineCanonic(CanonicalPath, CodePointer),
     LoadProperty(String),
     StoreProperty(String),
     LoadIndex,
@@ -25,7 +26,6 @@ pub enum Instruction {
     PushString(String),
     PushArray(Vec<bool>), // bool indicates if the element is a spread element
     PushObject(Vec<Option<String>>), // Option indicates if the value is a spread element
-    PushLazy(CodePointer),
     Raise,
     PushFunction {
         parameters: Vec<String>,
@@ -35,7 +35,7 @@ pub enum Instruction {
         parent: bool,
         methods: Vec<(String, Vec<String>, CodePointer)>,
         static_methods: Vec<(String, Vec<String>, CodePointer)>,
-        constructor: Option<(Vec<String>, CodePointer)>,
+        constructor: Option<(Vec<String>, (CodePointer, CodePointer))>,
     },
     Break,
     Continue,
@@ -49,6 +49,7 @@ pub enum Instruction {
     },
     EnterTryCatch {
         catch_target: CodePointer,
+        filtered: bool,
     },
     ExitFrame,
     CallFunction(usize),                    // number of arguments
@@ -56,7 +57,7 @@ pub enum Instruction {
     TryShortCircuit(BinaryOp, CodePointer), // jump target
     BinaryOp(BinaryOp),
     UnaryOp(UnaryOp),
-    CallConstructor(usize),    // number of arguments
-    MakeInstance(Vec<String>), // list of property names
-    CheckCatch(CodePointer),   // jump target
+    CallConstructor(usize),           // number of arguments
+    MakeInstance(usize, Vec<String>), // number of constructor args, list of property names
+    EnterModule(ModulePath),
 }

@@ -15,10 +15,10 @@ use crate::{
             index_out_of_bounds, type_error, undefined_identifier, undefined_variable,
             unhandled_control_flow, unsupported_binary_operation, unsupported_unary_operation,
         },
-        resolver::resolve_canonical_paths,
+        resolver::compile_and_setup,
         value::{
             ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue, IntVariant,
-            LazyValue, LocatedError, ModuleTree, StringVariant, Value, variable_to_string,
+            LazyValue, LocatedError, ModuleTree, StringVariant, Value, value_to_string,
         },
     },
     location::{Located, Location},
@@ -38,6 +38,7 @@ pub struct MyRoot<'a> {
     pub pwd: std::path::PathBuf,
     pub args: Value<'a>,
     pub code: GcRefLock<'a, StaticCollect<Vec<Located<Instruction>>>>,
+    pub global_env: Gc<'a, Environment<'a>>,
 }
 
 pub struct Context<'a> {
@@ -67,7 +68,8 @@ pub fn interpret_global(
     args: Vec<String>,
 ) -> Result<(), Located<String>> {
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
-        let root_module = ModuleTree::new(mc);
+        let global_env = Gc::new(mc, Environment::new_global(mc));
+        let root_module = ModuleTree::new(mc, global_env);
         let args_value = Value::Array(Gc::new(
             mc,
             RefLock::new(
@@ -82,23 +84,24 @@ pub fn interpret_global(
             pwd,
             args: args_value,
             code: GcRefLock::new(mc, RefLock::new(StaticCollect(code))),
+            global_env,
         }
     });
     arena.mutate(move |mc, root| {
         let ctx = Context { mc, root };
         let mut code = root.code.borrow_mut(mc);
-        resolve_canonical_paths(&ctx, &mut program, &mut code);
+        compile_and_setup(&ctx, &mut program, &mut code);
 
         for i in 0..code.len() {
             println!("{}: {:?}", i, code[i].data);
         }
         drop(code);
 
-        let root_module = ModuleTree::get(root.root_module, &ModulePath::root()).unwrap();
-        let env = root_module.borrow().env;
+        let root_env = root.root_module.borrow().env;
         let mut exec_ctx = ExecContext::new();
+        println!("root env: {:?}", root_env);
 
-        if let Err(e) = interpret(&ctx, &mut exec_ctx, env) {
+        if let Err(e) = interpret(&ctx, &mut exec_ctx, root_env) {
             let msg = match &e.data {
                 Value::ClassInstance(ci) => {
                     let ci_ref = ci.borrow();
@@ -112,9 +115,9 @@ pub fn interpret_global(
                                 None
                             }
                         })
-                        .unwrap_or_else(|| variable_to_string(&e.data))
+                        .unwrap_or_else(|| value_to_string(&e.data))
                 }
-                _ => variable_to_string(&e.data),
+                _ => value_to_string(&e.data),
             };
             return Err(Located {
                 data: format!("Uncaught exception: {}", msg),
@@ -126,33 +129,32 @@ pub fn interpret_global(
     Ok(())
 }
 
-pub enum Frame {
-    Block,
+pub enum Frame<'a> {
+    Simple,
     Catch {
         target: usize,
+        stack_height: usize,
+        filter_class: Option<GcRefLock<'a, ClassValue<'a>>>,
     },
     Loop {
         break_target: usize,
         continue_target: usize,
+        stack_height: usize,
     },
     Function {
         return_ip: usize,
+        stack_height: usize,
     },
 }
 
 pub struct EnvFrame<'a> {
-    pub frame: Frame,
+    pub frame: Frame<'a>,
     pub env: Gc<'a, Environment<'a>>,
-    pub stack_height: usize,
 }
 
 impl<'a> EnvFrame<'a> {
-    fn new(frame: Frame, env: Gc<'a, Environment<'a>>, stack_height: usize) -> Self {
-        Self {
-            frame,
-            env,
-            stack_height,
-        }
+    fn new(frame: Frame<'a>, env: Gc<'a, Environment<'a>>) -> Self {
+        Self { frame, env }
     }
 }
 
@@ -172,14 +174,11 @@ impl<'a> ExecContext<'a> {
             jumped: false,
         }
     }
-    pub fn push_frame(&mut self, frame: Frame, env: Gc<'a, Environment<'a>>) {
-        self.frame_stack
-            .push(EnvFrame::new(frame, env, self.stack.len()));
+    pub fn push_frame(&mut self, frame: Frame<'a>, env: Gc<'a, Environment<'a>>) {
+        self.frame_stack.push(EnvFrame::new(frame, env));
     }
     pub fn pop_frame(&mut self) -> EnvFrame<'a> {
-        let frame = self.frame_stack.pop().expect("Frame stack empty");
-        self.stack.truncate(frame.stack_height);
-        frame
+        self.frame_stack.pop().expect("Frame stack empty")
     }
     pub fn push(&mut self, val: Value<'a>) {
         self.stack.push(val);
@@ -200,8 +199,44 @@ impl<'a> ExecContext<'a> {
     }
     pub fn call_fn(&mut self, env: Gc<'a, Environment<'a>>, func: CodePointer) {
         let return_ip = self.ip + 1;
-        self.push_frame(Frame::Function { return_ip }, env);
+        self.push_frame(
+            Frame::Function {
+                return_ip,
+                stack_height: self.stack.len(),
+            },
+            env,
+        );
         self.jump(func);
+    }
+    pub fn enter_loop(
+        &mut self,
+        env: Gc<'a, Environment<'a>>,
+        break_target: usize,
+        continue_target: usize,
+    ) {
+        self.push_frame(
+            Frame::Loop {
+                break_target,
+                continue_target,
+                stack_height: self.stack.len(),
+            },
+            env,
+        );
+    }
+    pub fn enter_catch(
+        &mut self,
+        env: Gc<'a, Environment<'a>>,
+        target: usize,
+        filter_class: Option<GcRefLock<'a, ClassValue<'a>>>,
+    ) {
+        self.push_frame(
+            Frame::Catch {
+                target,
+                filter_class,
+                stack_height: self.stack.len(),
+            },
+            env,
+        );
     }
 }
 
@@ -210,16 +245,23 @@ fn bubble_error<'a>(
     err: Result<Value<'a>, LocatedError<'a>>,
 ) -> Result<(), LocatedError<'a>> {
     let err = err.unwrap_err();
-    while let Some(frame) = exec_ctx.frame_stack.last() {
-        match &frame.frame {
-            Frame::Catch { target } => {
-                let target = *target;
-                exec_ctx.pop_frame();
-                exec_ctx.jump(target);
-                exec_ctx.push(err.data);
-                return Ok(());
+    while !exec_ctx.frame_stack.is_empty() {
+        let frame = exec_ctx.pop_frame();
+        if let Frame::Catch {
+            target,
+            stack_height,
+            filter_class,
+        } = frame.frame
+        {
+            if let Some(filter_class) = filter_class {
+                if !is_instance_of(&err.data, filter_class) {
+                    continue; // Keep bubbling
+                }
             }
-            _ => continue,
+            exec_ctx.stack.truncate(stack_height);
+            exec_ctx.jump(target);
+            exec_ctx.push(err.data);
+            return Ok(());
         }
     }
     return Err(err);
@@ -230,45 +272,53 @@ fn bubble_control_flow<'a>(
     is_break: bool,
     location: &Location,
 ) -> Result<(), LocatedError<'a>> {
-    while let Some(frame) = exec_ctx.frame_stack.last() {
-        match &frame.frame {
+    while !exec_ctx.frame_stack.is_empty() {
+        let frame = exec_ctx.pop_frame();
+        match frame.frame {
             Frame::Loop {
                 break_target,
                 continue_target,
+                stack_height,
             } => {
+                exec_ctx.stack.truncate(stack_height);
                 let target = if is_break {
-                    *break_target
+                    break_target
                 } else {
-                    *continue_target
+                    continue_target
                 };
-                exec_ctx.pop_frame();
+                if !is_break {
+                    exec_ctx.frame_stack.push(frame);
+                }
                 exec_ctx.jump(target);
                 return Ok(());
             }
             Frame::Function { .. } => {
                 return unhandled_control_flow(ctx, location);
             }
-            _ => continue,
+            _ => {}
         }
     }
     return unhandled_control_flow(ctx, location);
 }
+
 fn bubble_return<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
     ret: Value<'a>,
     location: &Location,
 ) -> Result<(), LocatedError<'a>> {
-    while let Some(frame) = exec_ctx.frame_stack.last() {
-        match &frame.frame {
-            Frame::Function { return_ip } => {
-                let target = *return_ip;
-                exec_ctx.pop_frame();
-                exec_ctx.jump(target);
-                exec_ctx.push(ret);
-                return Ok(());
-            }
-            _ => continue,
+    while !exec_ctx.frame_stack.is_empty() {
+        let frame = exec_ctx.pop_frame();
+        if let Frame::Function {
+            return_ip,
+            stack_height,
+        } = frame.frame
+        {
+            exec_ctx.stack.truncate(stack_height);
+            let target = return_ip;
+            exec_ctx.jump(target);
+            exec_ctx.push(ret);
+            return Ok(());
         }
     }
     return unhandled_control_flow(ctx, location);
@@ -279,20 +329,11 @@ pub fn interpret<'a>(
     exec_ctx: &mut ExecContext<'a>,
     env: Gc<'a, Environment<'a>>,
 ) -> Result<Value<'a>, LocatedError<'a>> {
-    exec_ctx.push_frame(Frame::Block, env);
+    exec_ctx.push_frame(Frame::Simple, env);
 
     let code = ctx.root.code.borrow();
 
     loop {
-        println!(
-            "IP: {}, Stack: {:?}",
-            exec_ctx.ip,
-            exec_ctx
-                .stack
-                .iter()
-                .map(|x| x.get_type())
-                .collect::<Vec<_>>()
-        );
         match eval_instruction(ctx, exec_ctx, &code) {
             Ok(false) => break,
             Ok(true) => {}
@@ -312,29 +353,64 @@ pub fn eval_instruction<'a>(
     let instruction = &code[exec_ctx.ip];
     let location = &instruction.location;
     let env = exec_ctx.frame_stack.last().expect("Frame stack empty").env;
+    /*println!(
+        "At {}: {:?}\n{:?}",
+        exec_ctx.ip,
+        instruction.data,
+        exec_ctx
+            .stack
+            .iter()
+            .map(|x| value_to_string(x))
+            .collect::<Vec<_>>()
+    );*/
     match &instruction.data {
         Instruction::Exit => return Ok(false),
+        Instruction::EnterModule(path) => {
+            let module = ModuleTree::get(ctx.root.root_module, path);
+            let Some(module) = module else {
+                return undefined_variable(ctx, &path.to_string(), location);
+            };
+            let mod_env = module.borrow().env;
+            exec_ctx.push_frame(Frame::Simple, mod_env);
+        }
+        Instruction::DuplicateTopN(n) => {
+            let stack_len = exec_ctx.stack.len();
+            let val = exec_ctx.stack[stack_len - n..].to_vec();
+            exec_ctx.stack.extend(val);
+        }
         Instruction::Load(ident) => eval_identifier(ctx, exec_ctx, ident, env, location)?,
         Instruction::Store(ident) => {
-            let value = exec_ctx.pop();
-            assign_identifier(ctx, ident, env, location, value)?;
+            let val = exec_ctx.pop();
+            assign_identifier(ctx, ident, env, location, &val)?;
+            exec_ctx.push(val);
         }
         Instruction::Define(pattern) => {
             let value = exec_ctx.pop();
             let pattern = resolve_pattern(ctx, pattern, location, value)?;
             for (name, val) in pattern {
+                println!("Defined variable: {} = {}", name, value_to_string(&val));
                 if !env.define(ctx, name, val) {
                     return duplicate_variable_definition(ctx, name, location);
                 }
             }
         }
-        Instruction::DefineCanonic(canonical_path) => {
+        Instruction::DefineCanonic(canonical_path, initializer) => {
             let Some(module) = ModuleTree::get(ctx.root.root_module, &canonical_path.path) else {
                 panic!("Module not found: {}", canonical_path.path)
             };
             let mod_env = module.borrow().env;
-            let item = exec_ctx.pop();
-            mod_env.define_const(ctx, &canonical_path.item, item);
+            let item = Value::Lazy(ctx.gc_lock(LazyValue::Uninitialized {
+                body: *initializer,
+                env: mod_env,
+            }));
+            println!(
+                "Defined canonic variable: {} = {}",
+                canonical_path,
+                value_to_string(&item)
+            );
+            if !mod_env.define_const(ctx, &canonical_path.item, item) {
+                return duplicate_variable_definition(ctx, &canonical_path.item, location);
+            }
         }
         Instruction::LoadProperty(field) => {
             let object = exec_ctx.pop();
@@ -344,21 +420,21 @@ pub fn eval_instruction<'a>(
         Instruction::StoreProperty(field) => {
             let val = exec_ctx.pop();
             let object = exec_ctx.pop();
-            let res = set_property(ctx, location, object, field, val)?;
-            exec_ctx.push(res);
+            set_property(ctx, location, object, field, &val)?;
+            exec_ctx.push(val);
         }
         Instruction::LoadIndex => {
             let index = exec_ctx.pop();
             let array = exec_ctx.pop();
-            let res = get_at_index(ctx, location, index, array)?;
+            let res = get_at_index(ctx, location, array, index)?;
             exec_ctx.push(res);
         }
         Instruction::StoreIndex => {
             let val = exec_ctx.pop();
             let index = exec_ctx.pop();
             let array = exec_ctx.pop();
-            let res = set_at_index(ctx, location, index, array, val)?;
-            exec_ctx.push(res);
+            set_at_index(ctx, location, array, index, &val)?;
+            exec_ctx.push(val);
         }
         Instruction::Pop => {
             exec_ctx.pop();
@@ -436,21 +512,12 @@ pub fn eval_instruction<'a>(
             parameters,
             body_pointer,
         } => {
-            let func_env = ctx.gc(Environment::new(ctx, env));
             let func = Value::Function(ctx.gc_lock(FunctionValue::Function {
                 parameters: parameters.clone(),
                 body: *body_pointer,
-                env: func_env,
+                env,
             }));
             exec_ctx.push(func);
-        }
-        Instruction::PushLazy(initializer) => {
-            let func_env = ctx.gc(Environment::new(ctx, env));
-            let lazy = Value::Lazy(ctx.gc_lock(LazyValue::Uninitialized {
-                body: *initializer,
-                env: func_env,
-            }));
-            exec_ctx.push(lazy);
         }
         Instruction::PushClass {
             parent,
@@ -468,13 +535,22 @@ pub fn eval_instruction<'a>(
             };
             let class = Value::Class(
                 ctx.gc_lock(ClassValue {
-                    constructor: constructor.as_ref().map(|(params, body)| {
-                        ctx.gc_lock(FunctionValue::Function {
-                            parameters: params.clone(),
-                            body: *body,
-                            env: ctx.gc(Environment::new(ctx, env)),
-                        })
-                    }),
+                    constructor: constructor.as_ref().map(
+                        |(params, (initializer, constructor))| {
+                            (
+                                ctx.gc_lock(FunctionValue::Function {
+                                    parameters: Vec::new(),
+                                    body: *initializer,
+                                    env,
+                                }),
+                                ctx.gc_lock(FunctionValue::Function {
+                                    parameters: params.clone(),
+                                    body: *constructor,
+                                    env,
+                                }),
+                            )
+                        },
+                    ),
                     methods: methods
                         .iter()
                         .map(|(name, params, body)| {
@@ -483,7 +559,7 @@ pub fn eval_instruction<'a>(
                                 ctx.gc_lock(FunctionValue::Function {
                                     parameters: params.clone(),
                                     body: *body,
-                                    env: ctx.gc(Environment::new(ctx, env)),
+                                    env,
                                 }),
                             )
                         })
@@ -496,7 +572,7 @@ pub fn eval_instruction<'a>(
                                 ctx.gc_lock(FunctionValue::Function {
                                     parameters: params.clone(),
                                     body: *body,
-                                    env: ctx.gc(Environment::new(ctx, env)),
+                                    env,
                                 }),
                             )
                         })
@@ -506,7 +582,7 @@ pub fn eval_instruction<'a>(
             );
             exec_ctx.push(class);
         }
-        Instruction::MakeInstance(field_names) => {
+        Instruction::MakeInstance(constructor_arg_len, field_names) => {
             let mut fields = field_names
                 .iter()
                 .rev()
@@ -514,6 +590,12 @@ pub fn eval_instruction<'a>(
                 .collect::<Vec<_>>();
             fields.reverse();
             let field_map = fields.into_iter().collect();
+            let mut args = Vec::new();
+            for _ in 1..*constructor_arg_len {
+                // Skip one for the class instance (this) itself
+                args.push(exec_ctx.pop());
+            }
+            let constructor = exec_ctx.pop();
             let Value::Class(class) = exec_ctx.pop() else {
                 return type_error(ctx, "Attempted to instantiate a non-class value", &location);
             };
@@ -521,7 +603,10 @@ pub fn eval_instruction<'a>(
                 class,
                 fields: field_map,
             }));
+            args.push(instance.clone()); //Instance will become first argument (this)
+            args.reverse();
             exec_ctx.push(instance);
+            call_function(ctx, exec_ctx, location, env, args, &constructor)?;
         }
         Instruction::Break => {
             bubble_control_flow(ctx, exec_ctx, true, &location)?;
@@ -539,7 +624,7 @@ pub fn eval_instruction<'a>(
         Instruction::JumpIfFalse(target) => {
             let condition = exec_ctx.pop();
             if let Value::Bool(b) = condition {
-                if b {
+                if !b {
                     exec_ctx.jump(*target);
                 }
             } else {
@@ -548,30 +633,36 @@ pub fn eval_instruction<'a>(
         }
         Instruction::EnterBlock => {
             let block_env = ctx.gc(Environment::new(ctx, env));
-            exec_ctx.push_frame(Frame::Block, block_env);
+            exec_ctx.push_frame(Frame::Simple, block_env);
         }
         Instruction::EnterLoop {
             break_target,
             continue_target,
         } => {
-            exec_ctx.push_frame(
-                Frame::Loop {
-                    break_target: *break_target,
-                    continue_target: *continue_target,
-                },
-                env,
-            );
+            exec_ctx.enter_loop(env, *break_target, *continue_target);
         }
-        Instruction::EnterTryCatch { catch_target } => {
-            exec_ctx.push_frame(
-                Frame::Catch {
-                    target: *catch_target,
-                },
-                env,
-            );
+        Instruction::EnterTryCatch {
+            catch_target,
+            filtered,
+        } => {
+            let filter_class = if *filtered {
+                let Value::Class(class) = exec_ctx.pop() else {
+                    return type_error(ctx, "Expected class for exception filter", location);
+                };
+                Some(class)
+            } else {
+                None
+            };
+            exec_ctx.enter_catch(env, *catch_target, filter_class);
         }
         Instruction::ExitFrame => match exec_ctx.pop_frame().frame {
-            Frame::Function { return_ip, .. } => {
+            Frame::Function {
+                return_ip,
+                stack_height,
+            } => {
+                //Truncation is only necessary for control flow jumps, not normal function exits
+                //as the stack should be at the correct height already
+                debug_assert_eq!(exec_ctx.stack.len(), stack_height + 1); // Plus return value
                 exec_ctx.jump(return_ip);
             }
             _ => {}
@@ -628,40 +719,40 @@ pub fn eval_instruction<'a>(
                 );
             };
             let class_ref = class.borrow();
-            let Some(constructor) = &class_ref.constructor else {
+            let Some((initializer, constructor)) = &class_ref.constructor else {
                 return cannot_instantiate(ctx, "Class does not have a constructor", location);
             };
-            args.push(Value::Class(class));
 
             call_function(
                 ctx,
                 exec_ctx,
                 location,
                 env,
-                args,
-                &Value::Function(*constructor),
+                Vec::new(),
+                &Value::Function(*initializer),
             )?;
-        }
-        Instruction::CheckCatch(target) => {
-            let err = exec_ctx.pop();
-            let class = exec_ctx.pop();
-            if let Value::Class(ci) = &class {
-                if is_instance_of(&err, *ci) {
-                    exec_ctx.push(err);
-                    exec_ctx.jump(*target);
-                } else {
-                    return Err(Located::new(err, location.clone())); //continue bubbling
-                }
-            } else {
-                return type_error(ctx, "Expected class instance", location);
+
+            exec_ctx.push(Value::Class(class));
+            exec_ctx.push(Value::Function(*constructor));
+            for arg in args {
+                exec_ctx.push(arg);
             }
         }
-        Instruction::InitializeLazyEnd => {
-            let lazy = exec_ctx.pop();
-            let value = exec_ctx.pop();
+        Instruction::InitializeLazy(path) => {
+            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
+            let lazy = if let Some(module_tree) = module_tree {
+                let env = module_tree.borrow().env;
+                env.get(&path.item)
+            } else {
+                return undefined_variable(ctx, &path.to_string(), location);
+            };
+            let Some(lazy) = lazy else {
+                return undefined_variable(ctx, &path.to_string(), location);
+            };
             let Value::Lazy(lazy_ref) = lazy else {
                 return type_error(ctx, "Attempted to initialize a non-lazy value", location);
             };
+            let value = exec_ctx.pop();
             let mut lazy_borrow = lazy_ref.borrow_mut(ctx.mc);
             match &*lazy_borrow {
                 LazyValue::Initialized(_) => {
@@ -684,10 +775,10 @@ pub fn eval_instruction<'a>(
 fn set_at_index<'a>(
     ctx: &Context<'a>,
     location: &Location,
-    index: Value<'a>,
     array: Value<'a>,
-    result: Value<'a>,
-) -> Result<Value<'a>, LocatedError<'a>> {
+    index: Value<'a>,
+    result: &Value<'a>,
+) -> Result<(), LocatedError<'a>> {
     match array {
         Value::Array(arr) => {
             let Value::Integer(i) = index else {
@@ -698,7 +789,7 @@ fn set_at_index<'a>(
                 && index < arr_ref.len()
             {
                 arr_ref[index] = result.clone();
-                Ok(result)
+                Ok(())
             } else {
                 array_index_out_of_bounds(ctx, i, location)
             }
@@ -718,7 +809,7 @@ fn set_at_index<'a>(
                 drop(obj_ref);
                 let mut obj_ref = obj.borrow_mut(ctx.mc);
                 obj_ref.insert(s, result.clone());
-                Ok(result)
+                Ok(())
             } else {
                 field_access_error(ctx, &s, location)
             }
@@ -743,7 +834,7 @@ fn set_at_index<'a>(
                     .try_write_value(&mut buf_ref[byte_offset..byte_end], &result)
                     .is_some()
                 {
-                    Ok(result)
+                    Ok(())
                 } else {
                     type_error(ctx, "Failed to write value to typed slice", location)
                 }
@@ -895,9 +986,24 @@ fn interpret_simple_binary_op<'a>(
 }
 
 pub fn get_std_env<'a>(ctx: &Context<'a>) -> Gc<'a, Environment<'a>> {
-    let std_tree = ModuleTree::get(ctx.root.root_module, &ModulePath::from_root("std")).unwrap();
+    let std_tree = ModuleTree::get(ctx.root.root_module, &ModulePath::std()).unwrap();
     let std_env = std_tree.borrow().env;
     std_env
+}
+
+fn get_class_maybe_lazy<'a>(
+    env: Gc<'a, Environment<'a>>,
+    name: &str,
+) -> Option<GcRefLock<'a, ClassValue<'a>>> {
+    let val = env.get(name)?;
+    match val {
+        Value::Class(c) => Some(c),
+        Value::Lazy(c) => match &*c.borrow() {
+            LazyValue::Initialized(Value::Class(c)) => Some(*c),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn get_classes<'a>(
@@ -909,7 +1015,7 @@ fn get_classes<'a>(
 ) {
     let class_name = target.get_type();
     let std_env = get_std_env(ctx);
-    let Value::Class(value_class) = std_env.get(class_name).unwrap() else {
+    let Some(value_class) = get_class_maybe_lazy(std_env, class_name) else {
         panic!("Standard class {} not found", class_name);
     };
 
@@ -1050,7 +1156,11 @@ fn get_at_index<'a>(
                 field_access_error(ctx, &s, location)
             }
         }
-        _ => type_error(ctx, "Attempted to index a non-array value", &location),
+        _ => type_error(
+            ctx,
+            &format!("Attempted to index a value of type: {}", array.get_type()),
+            &location,
+        ),
     }
 }
 
@@ -1059,17 +1169,17 @@ fn set_property<'a>(
     location: &Location,
     object: Value<'a>,
     field: &String,
-    result: Value<'a>,
-) -> Result<Value<'a>, LocatedError<'a>> {
+    result: &Value<'a>,
+) -> Result<(), LocatedError<'a>> {
     match object {
         Value::Object(obj) => {
             obj.borrow_mut(ctx.mc).insert(field.clone(), result.clone());
-            Ok(result)
+            Ok(())
         }
         Value::ClassInstance(obj) => {
             if let Some(field) = obj.borrow_mut(ctx.mc).fields.get_mut(field) {
                 *field = result.clone();
-                Ok(result)
+                Ok(())
             } else {
                 type_error(
                     ctx,
@@ -1120,6 +1230,8 @@ fn eval_identifier<'a>(
         }
     };
     let Some(val) = val else {
+        let mut idents = Vec::new();
+        env.collect_known_identifiers(&mut idents);
         return undefined_identifier(ctx, ident, location);
     };
     match val {
@@ -1152,15 +1264,15 @@ fn assign_identifier<'a>(
     ident: &Identifier,
     env: Gc<'a, Environment<'a>>,
     location: &Location,
-    value: Value<'a>,
+    value: &Value<'a>,
 ) -> Result<(), LocatedError<'a>> {
     match ident {
-        Identifier::Simple(name) => Environment::set(ctx, env, name, value, &location),
+        Identifier::Simple(name) => Environment::set(ctx, env, name, value.clone(), &location),
         Identifier::Scoped(path) => {
             let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
             if let Some(module_tree) = module_tree {
                 let env = module_tree.borrow().env;
-                Environment::set(ctx, env, &path.item, value, &location)
+                Environment::set(ctx, env, &path.item, value.clone(), &location)
             } else {
                 undefined_variable(ctx, &path.to_string(), location)
             }

@@ -1,13 +1,12 @@
 use crate::{
     location::{Located, located},
-    parser::{ClassMemberKind, Expression, Identifier, LocatedExpression, Pattern},
+    parser::{ClassMemberKind, Expression, LocatedExpression, Pattern},
 };
 
 mod instruction;
 pub use instruction::*;
 
 pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instruction>>) {
-    println!("Compiling expression {:?}", expression.data);
     match &expression.data {
         Expression::Null => code.push(located(Instruction::PushNull, expression)),
         Expression::Number(num) => code.push(located(Instruction::PushNumber(*num), expression)),
@@ -29,6 +28,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 compile(inner, code);
                 code.push(located(Instruction::Return, expression));
             } else {
+                code.push(located(Instruction::PushNull, expression));
                 code.push(located(Instruction::Return, expression));
             }
         }
@@ -53,7 +53,6 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             code.push(located(Instruction::Jump(0), expression));
             let body_pointer = code.len();
             compile(body, code);
-            println!("body:{} code:{}", body_pointer, code.len());
             code.push(located(Instruction::ExitFrame, expression));
             let cur_index = code.len();
             let Instruction::Jump(target) = &mut code[jump_index].data else {
@@ -65,16 +64,6 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                     parameters: parameters.clone(),
                     body_pointer,
                 },
-                expression,
-            ));
-        }
-        Expression::ImportDefine { name, value } => {
-            code.push(located(
-                Instruction::Load(Identifier::Scoped(value.clone())),
-                expression,
-            ));
-            code.push(located(
-                Instruction::Define(Pattern::Ident(name.clone())),
                 expression,
             ));
         }
@@ -170,6 +159,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
         Expression::Define { pattern, value } => {
             compile(value, code);
             code.push(located(Instruction::Define(pattern.data.clone()), pattern));
+            code.push(located(Instruction::PushNull, expression));
         }
         Expression::FunctionCall {
             function,
@@ -186,19 +176,25 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
         }
         Expression::BinaryOp { op, left, right } => {
             compile(left, code);
+            let can_short_circuit = op.can_short_circuit();
             let try_short_circuit_index = code.len();
-            code.push(located(
-                Instruction::TryShortCircuit(op.clone(), 0),
-                expression,
-            ));
+            if can_short_circuit {
+                code.push(located(
+                    Instruction::TryShortCircuit(op.clone(), 0),
+                    expression,
+                ));
+            }
             compile(right, code);
             code.push(located(Instruction::BinaryOp(op.clone()), expression));
-            let cur_index = code.len();
-            let Instruction::TryShortCircuit(_, target) = &mut code[try_short_circuit_index].data
-            else {
-                unreachable!();
-            };
-            *target = cur_index;
+            if can_short_circuit {
+                let cur_index = code.len();
+                let Instruction::TryShortCircuit(_, target) =
+                    &mut code[try_short_circuit_index].data
+                else {
+                    unreachable!();
+                };
+                *target = cur_index;
+            }
         }
         Expression::FieldAccess { object, field } => {
             compile(object, code);
@@ -227,19 +223,17 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             let body_pointer = code.len();
             compile(value, code);
             code.push(located(
-                Instruction::Load(Identifier::Scoped(name.clone())),
+                Instruction::InitializeLazy(name.clone()),
                 expression,
             ));
-            code.push(located(Instruction::InitializeLazyEnd, expression));
             code.push(located(Instruction::ExitFrame, expression));
             let cur_index = code.len();
             let Instruction::Jump(target) = &mut code[jump_index].data else {
                 unreachable!();
             };
             *target = cur_index;
-            code.push(located(Instruction::PushLazy(body_pointer), expression));
             code.push(located(
-                Instruction::DefineCanonic(name.clone()),
+                Instruction::DefineCanonic(name.clone(), body_pointer),
                 expression,
             ));
         }
@@ -270,6 +264,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             Expression::FieldAccess { object, field } => {
                 compile(object, code);
                 if let Some(op) = op {
+                    code.push(located(Instruction::DuplicateTopN(1), expression));
                     code.push(located(
                         Instruction::LoadProperty(field.clone()),
                         expression,
@@ -304,6 +299,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 compile(array, code);
                 compile(index, code);
                 if let Some(op) = op {
+                    code.push(located(Instruction::DuplicateTopN(2), expression)); // duplicate array and index
                     code.push(located(Instruction::LoadIndex, expression));
                     let try_short_circuit_index = code.len();
                     code.push(located(
@@ -362,23 +358,38 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                     ClassMemberKind::Field => fields.push((name.clone(), body_pointer)),
                 };
             }
+
             let constructor = if let Some(constructor) = constructor {
                 let Expression::FunctionLiteral { parameters, body } = &constructor.data else {
                     panic!("Only functions are allowed as class methods");
                 };
-                let body_pointer = code.len();
+                let constructor_pointer = code.len();
+                compile(body, code);
+                code.push(located(Instruction::ExitFrame, expression));
+
+                let initializer_pointer = code.len();
                 let mut field_names = Vec::new();
                 for (name, field_initializer) in &fields {
                     code.push(located(
-                        Instruction::CallFunction(*field_initializer),
+                        Instruction::PushFunction {
+                            parameters: Vec::new(),
+                            body_pointer: *field_initializer,
+                        },
                         expression,
                     ));
+                    code.push(located(Instruction::CallFunction(0), expression));
                     field_names.push(name.clone());
                 }
-                code.push(located(Instruction::MakeInstance(field_names), expression));
-                compile(body, code);
+                code.push(located(
+                    Instruction::MakeInstance(parameters.len(), field_names),
+                    expression,
+                ));
+                code.push(located(Instruction::Pop, expression)); // pop unused constructor return value
                 code.push(located(Instruction::ExitFrame, expression));
-                Some((parameters.clone(), body_pointer))
+                Some((
+                    parameters.clone(),
+                    (initializer_pointer, constructor_pointer),
+                ))
             } else {
                 None
             };
@@ -411,42 +422,39 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             exception_var,
             catch_block,
         } => {
+            if let Some(exception_prototype) = exception_prototype {
+                compile(exception_prototype, code);
+            }
             let try_catch_index = code.len();
             code.push(located(
-                Instruction::EnterTryCatch { catch_target: 0 },
+                Instruction::EnterTryCatch {
+                    catch_target: 0,
+                    filtered: exception_prototype.is_some(),
+                },
                 expression,
             ));
             compile(try_block, code);
+            code.push(located(Instruction::ExitFrame, expression));
             let jump_index = code.len();
             code.push(located(Instruction::Jump(0), expression));
             let cur_index = code.len();
-            let Instruction::EnterTryCatch { catch_target } = &mut code[try_catch_index].data
+            let Instruction::EnterTryCatch { catch_target, .. } = &mut code[try_catch_index].data
             else {
                 unreachable!();
             };
             *catch_target = cur_index;
-            let mut check_catch_index = None;
-            if let Some(exception_prototype) = exception_prototype {
-                compile(exception_prototype, code);
-                check_catch_index = Some(code.len());
-                code.push(located(Instruction::CheckCatch(0), expression));
-            }
+            code.push(located(Instruction::EnterBlock, expression)); // new scope for catch variable
             code.push(located(
                 Instruction::Define(Pattern::Ident(exception_var.clone())),
                 expression,
             ));
             compile(catch_block, code);
+            code.push(located(Instruction::ExitFrame, expression));
             let cur_index = code.len();
             let Instruction::Jump(target) = &mut code[jump_index].data else {
                 unreachable!();
             };
             *target = cur_index;
-            if let Some(check_catch_index) = check_catch_index {
-                let Instruction::CheckCatch(target) = &mut code[check_catch_index].data else {
-                    unreachable!();
-                };
-                *target = cur_index;
-            }
         }
         Expression::ArrayIndex { array, index } => {
             compile(array, code);
