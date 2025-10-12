@@ -66,6 +66,7 @@ pub fn interpret_global(
     mut program: ParsedProgram,
     pwd: std::path::PathBuf,
     args: Vec<String>,
+    main_module: String,
 ) -> Result<(), Located<String>> {
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
         let global_env = Gc::new(mc, Environment::new_global(mc));
@@ -90,16 +91,11 @@ pub fn interpret_global(
     arena.mutate(move |mc, root| {
         let ctx = Context { mc, root };
         let mut code = root.code.borrow_mut(mc);
-        compile_and_setup(&ctx, &mut program, &mut code);
-
-        for i in 0..code.len() {
-            println!("{}: {:?}", i, code[i].data);
-        }
+        compile_and_setup(&ctx, &mut program, &mut code, main_module);
         drop(code);
 
         let root_env = root.root_module.borrow().env;
         let mut exec_ctx = ExecContext::new();
-        println!("root env: {:?}", root_env);
 
         if let Err(e) = interpret(&ctx, &mut exec_ctx, root_env) {
             let msg = match &e.data {
@@ -129,6 +125,7 @@ pub fn interpret_global(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
 pub enum Frame<'a> {
     Simple,
     Catch {
@@ -286,9 +283,7 @@ fn bubble_control_flow<'a>(
                 } else {
                     continue_target
                 };
-                if !is_break {
-                    exec_ctx.frame_stack.push(frame);
-                }
+                exec_ctx.frame_stack.push(frame);
                 exec_ctx.jump(target);
                 return Ok(());
             }
@@ -353,16 +348,11 @@ pub fn eval_instruction<'a>(
     let instruction = &code[exec_ctx.ip];
     let location = &instruction.location;
     let env = exec_ctx.frame_stack.last().expect("Frame stack empty").env;
-    /*println!(
-        "At {}: {:?}\n{:?}",
-        exec_ctx.ip,
-        instruction.data,
-        exec_ctx
-            .stack
-            .iter()
-            .map(|x| value_to_string(x))
-            .collect::<Vec<_>>()
-    );*/
+
+    /*
+    println!("IP {}: {:?}", exec_ctx.ip, instruction.data);
+    println!("Frames: {:?}", exec_ctx.frame_stack.iter().map(|f| &f.frame).collect::<Vec<_>>());
+    */
     match &instruction.data {
         Instruction::Exit => return Ok(false),
         Instruction::EnterModule(path) => {
@@ -388,7 +378,6 @@ pub fn eval_instruction<'a>(
             let value = exec_ctx.pop();
             let pattern = resolve_pattern(ctx, pattern, location, value)?;
             for (name, val) in pattern {
-                println!("Defined variable: {} = {}", name, value_to_string(&val));
                 if !env.define(ctx, name, val) {
                     return duplicate_variable_definition(ctx, name, location);
                 }
@@ -403,11 +392,6 @@ pub fn eval_instruction<'a>(
                 body: *initializer,
                 env: mod_env,
             }));
-            println!(
-                "Defined canonic variable: {} = {}",
-                canonical_path,
-                value_to_string(&item)
-            );
             if !mod_env.define_const(ctx, &canonical_path.item, item) {
                 return duplicate_variable_definition(ctx, &canonical_path.item, location);
             }
@@ -814,29 +798,18 @@ fn set_at_index<'a>(
                 field_access_error(ctx, &s, location)
             }
         }
-        Value::TypedSlice {
+        Value::TypedBuffer {
             buffer,
-            start,
-            length,
             buffer_type,
         } => {
             let Value::Integer(i) = index else {
                 return type_error(ctx, "Array index must be an integer", location);
             };
-            let mut buf_ref = buffer.borrow_mut(ctx.mc);
-            let byte_start = start * buffer_type.byte_size();
-            let byte_end = byte_start + length * buffer_type.byte_size();
-            if let Some(index) = i.try_to_usize()
-                && index < buf_ref.len()
-            {
-                let byte_offset = byte_start + index * buffer_type.byte_size();
-                if buffer_type
-                    .try_write_value(&mut buf_ref[byte_offset..byte_end], &result)
-                    .is_some()
-                {
+            if let Some(index) = i.try_to_usize() {
+                if let Some(_) = buffer_type.try_write_buffer(ctx, buffer, index, result) {
                     Ok(())
                 } else {
-                    type_error(ctx, "Failed to write value to typed slice", location)
+                    type_error(ctx, "Failed to write value to typed buffer", location)
                 }
             } else {
                 array_index_out_of_bounds(ctx, i, location)
@@ -1119,27 +1092,19 @@ fn get_at_index<'a>(
                 array_index_out_of_bounds(ctx, i, location)
             }
         }
-        Value::TypedSlice {
+        Value::TypedBuffer {
             buffer,
-            start,
-            length,
             buffer_type,
         } => {
             let Value::Integer(i) = index else {
                 return type_error(ctx, "Array index must be an integer", location);
             };
-            let byte_start = start * buffer_type.byte_size();
-            let byte_end = byte_start + length * buffer_type.byte_size();
-            let arr_ref = buffer.borrow();
-            if let Some(index) = i.try_to_usize()
-                && index < arr_ref.len()
-            {
-                let byte_offset = byte_start + index * buffer_type.byte_size();
-                let Some(value) = buffer_type.try_read_value(&arr_ref[byte_offset..byte_end])
-                else {
-                    return type_error(ctx, "Failed to read value from typed slice", &location);
-                };
-                Ok(value)
+            if let Some(index) = i.try_to_usize() {
+                if let Some(value) = buffer_type.try_read_buffer(buffer, index) {
+                    Ok(value)
+                } else {
+                    type_error(ctx, "Failed to read value from typed slice", location)
+                }
             } else {
                 array_index_out_of_bounds(ctx, i, &location)
             }

@@ -1,0 +1,135 @@
+fn std_test() {
+    print("Hello from std.yuzu");
+}
+
+class IndexIterator {
+    let array = null;
+    let index = 0;
+    constructor(array) {
+        this.array = array;
+    }
+    fn next() {
+        if (this.index < this.array.length()) {
+            let value = this.array[this.index];
+            this.index += 1;
+            {value: value}
+        } else {
+            null;
+        }
+    }
+}
+
+class ClassInstance {}
+class Class {}
+class Number {}
+class Integer {}
+class String {}
+
+class Resource {
+    fn close() {
+        intrinsics::resource_close(this);
+    }
+    fn read(buffer) {
+        intrinsics::resource_read(this, buffer)
+    }
+}
+
+class Buffer {
+    static fn with_size(size) intrinsics::buffer_with_size(size);
+    fn length() intrinsics::buffer_length(this);
+    fn slice(start, length) intrinsics::buffer_slice(this, start, length);
+    fn to_string() intrinsics::buffer_to_string(this);
+}
+
+class ByteArray {
+    let buffer = null;
+    let view = null;
+    let length = 0;
+    let capacity = 0;
+
+    constructor(capacity) {
+        this.buffer = Buffer.with_size(capacity);
+        this.view = intrinsics::uint8_array_of(this.buffer);
+        this.capacity = capacity;
+    }
+
+    fn push(byte) {
+        if (this.length >= this.capacity) {
+            this.capacity = this.capacity * 2;
+            let new_buffer = Buffer.with_size(this.capacity);
+            intrinsics::buffer_copy(this.buffer, new_buffer.slice(0, this.length));
+            this.buffer = new_buffer;
+            this.view = intrinsics::uint8_array_of(this.buffer);
+        }
+        this.view[this.length] = byte;
+        this.length += 1;
+    }
+
+    fn clear() {
+        this.length = 0;
+        this.buffer = Buffer.with_size(this.capacity);
+        this.view = intrinsics::uint8_array_of(this.buffer);
+    }
+
+    fn as_slice() intrinsics::buffer_slice(this.buffer, 0, this.length);
+}
+
+class BufferedReader {
+    let resource = null;
+    let buffer = null;
+    constructor(resource) {
+        this.resource = resource;
+        this.buffer = new ByteArray(1024);
+    }
+    fn readline() {
+        let has_read = false;
+        while (true) {
+            let buffer = intrinsics::buffer_with_size(1);
+            let bytes_read = this.resource.read(buffer);
+            if (bytes_read == 0) {
+                break;
+            }
+            has_read = true;
+            let uint8_buffer = intrinsics::uint8_array_of(buffer);
+            let byte = uint8_buffer[0];
+            print("Read byte:", bytes_read, byte);
+            //ignore carriage returns
+            if (byte == 13) { // carriage return
+                continue;
+            }
+            if (byte == 10) { // newline
+                break;
+            }
+            this.buffer.push(byte);
+        }
+        if (!has_read) {
+            return null;
+        }
+        let line = intrinsics::buffer_to_string(this.buffer.as_slice());
+        this.buffer.clear();
+        line
+    }
+}
+
+class Array {
+    fn length() intrinsics::array_length(this);
+    fn iter() new IndexIterator(this);
+}
+
+class Exception {
+    let message = "";
+    constructor(message) {
+        this.message = message;
+        print("Exception created:", message);
+    }
+}
+
+//initialize lazy statics
+Array;
+Exception;
+Number;
+Integer;
+String;
+ClassInstance;
+Class;
+Resource;

@@ -193,8 +193,9 @@ where
     pattern
 }
 
-fn parser<'tokens, 'src: 'tokens, I>()
--> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
+fn parser<'tokens, 'src: 'tokens, I>(
+    root_name: String,
+) -> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -254,16 +255,20 @@ where
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .map_with(|expr, extra| located(expr.data, extra.span()));
 
+        let root_name_clone = root_name.clone();
         let identifier = ident
             .clone()
             .separated_by(just(Token::DoubleColon))
             .at_least(1)
             .collect::<Vec<_>>()
-            .map_with(|mut parts, extra| {
+            .map_with(move |mut parts, extra| {
                 let ident = if parts.len() == 1 {
                     Identifier::Simple(parts[0].clone())
                 } else {
                     let name = parts.pop().unwrap();
+                    if parts[0] == "root" {
+                        parts[0] = root_name_clone.clone();
+                    }
                     Identifier::Scoped(CanonicalPath::new(ModulePath::new(parts), name))
                 };
                 located(ident, extra.span())
@@ -335,8 +340,11 @@ where
                         .separated_by(just(Token::DoubleColon))
                         .at_least(2)
                         .collect::<Vec<_>>()
-                        .map_with(|mut parts, extra| {
+                        .map_with(move |mut parts, extra| {
                             let name = parts.pop().unwrap();
+                            if parts[0] == "root" {
+                                parts[0] = root_name.clone();
+                            }
                             located(
                                 Expression::Define {
                                     pattern: located(Pattern::Ident(name.clone()), extra.span()),
@@ -851,21 +859,25 @@ where
 
 pub fn parse<'a>(
     source: &str,
+    root_name: String,
     file_path: &str,
     tokens: Vec<LocatedToken<'a>>,
 ) -> Result<Vec<ParsedModuleItem>, Vec<Rich<'a, Token<'a>>>> {
     let token_iter = tokens.into_iter().map(|lt| (lt.token, lt.span.into()));
     let token_stream =
         Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
-    parser().parse(token_stream).into_result().map(|mut pm| {
-        for item in &mut pm {
-            match item {
-                ParsedModuleItem::Expression(e) => e.set_module(file_path),
-                ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
+    parser(root_name)
+        .parse(token_stream)
+        .into_result()
+        .map(|mut pm| {
+            for item in &mut pm {
+                match item {
+                    ParsedModuleItem::Expression(e) => e.set_module(file_path),
+                    ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
+                }
             }
-        }
-        pm
-    })
+            pm
+        })
 }
 
 fn needs_semi(expr: &Expression) -> bool {

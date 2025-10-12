@@ -13,6 +13,7 @@ pub fn compile_and_setup<'a>(
     ctx: &Context<'a>,
     program: &mut ParsedProgram,
     code: &mut Vec<Located<Instruction>>,
+    main_module: String,
 ) {
     let mut items = Vec::new();
 
@@ -31,7 +32,7 @@ pub fn compile_and_setup<'a>(
     define_intrinsics(ctx, intrinsic_module.borrow().env);
 
     let std_expressions = &program.children["std"].expressions;
-    let root_expressions = &program.children["root"].expressions;
+    let root_expressions = &program.children[&main_module].expressions;
     let first_location = root_expressions
         .first()
         .map(|e| e.location.clone())
@@ -54,7 +55,7 @@ pub fn compile_and_setup<'a>(
     code.push(Located::new(Instruction::ExitFrame, first_location.clone()));
 
     code.push(Located::new(
-        Instruction::EnterModule(ModulePath::root()),
+        Instruction::EnterModule(ModulePath::from_root(&main_module)),
         first_location.clone(),
     ));
     let root_block = Located::new(

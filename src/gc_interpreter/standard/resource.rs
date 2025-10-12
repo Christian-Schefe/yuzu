@@ -1,10 +1,13 @@
-use gc_arena::Gc;
+use gc_arena::{Gc, StaticCollect};
 
 use crate::gc_interpreter::{
     Context,
     exception::{function_argument_error, io_error, type_error},
-    resource::{FileResource, SocketResource},
-    standard::{expect_arg_len, expect_string_arg, expect_usize_arg, make_builtin_function},
+    resource::{FileResource, TcpListenerResource, TcpStreamResource},
+    standard::{
+        expect_arg_len, expect_buffer_arg, expect_string_arg, expect_usize_arg,
+        make_builtin_function,
+    },
     value::{Environment, IntVariant, Value},
 };
 
@@ -47,7 +50,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
     );
     env.define_const(
         ctx,
-        "socket_connect",
+        "tcp_connect",
         Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
             expect_arg_len(ctx, &args, 2, span)?;
             let host = expect_string_arg(ctx, &args[0], span)?.to_string();
@@ -57,7 +60,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             } else {
                 return type_error(ctx, "Port argument must be a valid u16", span);
             };
-            let socket = SocketResource::new(host.clone(), port).map_err(|e| {
+            let socket = TcpStreamResource::connect(&host, port).map_err(|e| {
                 io_error::<()>(
                     ctx,
                     &format!("Failed to connect to {}:{}: {}", host, port, e),
@@ -66,6 +69,65 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                 .unwrap_err()
             })?;
             Ok(Value::Resource(ctx.gc_lock(Box::new(socket))))
+        })),
+    );
+    env.define_const(
+        ctx,
+        "tcp_listen",
+        Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
+            expect_arg_len(ctx, &args, 2, span)?;
+            let addr = expect_string_arg(ctx, &args[0], span)?.to_string();
+            let port = expect_usize_arg(ctx, &args[1], span)?;
+            let port = if let Some(port) = TryInto::<u16>::try_into(port).ok() {
+                port
+            } else {
+                return type_error(ctx, "Port argument must be a valid u16", span);
+            };
+            let socket = TcpListenerResource::bind(&addr, port).map_err(|e| {
+                io_error::<()>(
+                    ctx,
+                    &format!("Failed to listen on {}:{}: {}", addr, port, e),
+                    span,
+                )
+                .unwrap_err()
+            })?;
+            Ok(Value::Resource(ctx.gc_lock(Box::new(socket))))
+        })),
+    );
+    env.define_const(
+        ctx,
+        "tcp_accept",
+        Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
+            expect_arg_len(ctx, &args, 1, span)?;
+            match &args[0] {
+                Value::Resource(res) => {
+                    let mut res_ref = res.borrow_mut(ctx.mc);
+                    match res_ref.as_any_mut().downcast_mut::<TcpListenerResource>() {
+                        Some(listener) => {
+                            let (stream, _) = listener.accept().map_err(|e| {
+                                io_error::<()>(
+                                    ctx,
+                                    &format!("Failed to accept connection: {}", e),
+                                    span,
+                                )
+                                .unwrap_err()
+                            })?;
+                            let socket = TcpStreamResource {
+                                stream: StaticCollect(Some(stream)),
+                            };
+                            Ok(Value::Resource(ctx.gc_lock(Box::new(socket))))
+                        }
+                        None => {
+                            return type_error(
+                                ctx,
+                                "Accept argument must be a TcpListener resource",
+                                span,
+                            );
+                        }
+                    }
+                }
+                _ => return type_error(ctx, "Accept argument must be a resource", span),
+            }
         })),
     );
     env.define_const(
@@ -96,25 +158,22 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
         ctx,
         "resource_read",
         Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
-            expect_arg_len(ctx, &args, 4, span)?;
+            expect_arg_len(ctx, &args, 2, span)?;
             match &args[0] {
                 Value::Resource(res) => {
                     let mut res_ref = res.borrow_mut(ctx.mc);
-                    let read_amount = expect_usize_arg(ctx, &args[2], span)?;
-                    let read_offset = expect_usize_arg(ctx, &args[3], span)?;
-                    let mut buf = match &args[1] {
-                        Value::Buffer(b) => {
-                            &mut b.borrow_mut(ctx.mc)[read_offset..read_offset + read_amount]
-                        }
-                        _ => {
-                            return type_error(ctx, "Read buffer argument must be a buffer", span);
-                        }
-                    };
-                    let bytes_read = res_ref.read(&mut buf).map_err(|e| {
-                        io_error::<()>(ctx, &format!("Failed to read from resource: {}", e), span)
+                    let buf = expect_buffer_arg(ctx, &args[1], span)?;
+                    buf.with_mut_slice(ctx, |slice| {
+                        let bytes_read = res_ref.read(slice).map_err(|e| {
+                            io_error::<()>(
+                                ctx,
+                                &format!("Failed to read from resource: {}", e),
+                                span,
+                            )
                             .unwrap_err()
-                    })?;
-                    Ok(Value::Integer(IntVariant::from_u64(bytes_read as u64)))
+                        })?;
+                        Ok(Value::Integer(IntVariant::from_u64(bytes_read as u64)))
+                    })
                 }
                 _ => return type_error(ctx, "Read argument must be a resource", span),
             }
@@ -124,24 +183,22 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
         ctx,
         "resource_write",
         Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
-            expect_arg_len(ctx, &args, 4, span)?;
+            expect_arg_len(ctx, &args, 2, span)?;
             match &args[0] {
                 Value::Resource(res) => {
                     let mut res_ref = res.borrow_mut(ctx.mc);
-                    let write_amount = expect_usize_arg(ctx, &args[2], span)?;
-                    let write_offset = expect_usize_arg(ctx, &args[3], span)?;
-                    let buf = match &args[1] {
-                        Value::Buffer(b) => &b.borrow()[write_offset..write_offset + write_amount],
-                        _ => {
-                            return type_error(ctx, "Write buffer argument must be a buffer", span);
-                        }
-                    };
-
-                    let bytes_written = res_ref.write(&buf).map_err(|e| {
-                        io_error::<()>(ctx, &format!("Failed to write to resource: {}", e), span)
+                    let buf = expect_buffer_arg(ctx, &args[1], span)?;
+                    buf.with_slice(|slice| {
+                        let bytes_written = res_ref.write(slice).map_err(|e| {
+                            io_error::<()>(
+                                ctx,
+                                &format!("Failed to write to resource: {}", e),
+                                span,
+                            )
                             .unwrap_err()
-                    })?;
-                    Ok(Value::Integer(IntVariant::from_u64(bytes_written as u64)))
+                        })?;
+                        Ok(Value::Integer(IntVariant::from_u64(bytes_written as u64)))
+                    })
                 }
                 _ => return type_error(ctx, "Write argument must be a resource", span),
             }

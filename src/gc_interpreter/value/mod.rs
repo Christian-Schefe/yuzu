@@ -2,7 +2,7 @@ use gc_arena::{
     Collect, Gc, Mutation, StaticCollect,
     lock::{GcRefLock, RefLock},
 };
-use std::{collections::HashMap, fmt::Debug};
+use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use crate::{
     ModulePath,
@@ -32,14 +32,44 @@ pub enum Value<'a> {
     Function(GcRefLock<'a, FunctionValue<'a>>),
     Class(GcRefLock<'a, ClassValue<'a>>),
     Resource(GcRefLock<'a, Box<dyn Resource>>),
-    Buffer(GcRefLock<'a, Vec<u8>>),
-    TypedSlice {
-        buffer: GcRefLock<'a, Vec<u8>>,
-        start: usize,
-        length: usize,
+    Buffer(Gc<'a, BufferValue<'a>>),
+    TypedBuffer {
+        buffer: Gc<'a, BufferValue<'a>>,
         buffer_type: TypedBufferType,
     },
     Lazy(GcRefLock<'a, LazyValue<'a>>),
+}
+
+#[derive(Clone, Collect, Debug)]
+#[collect(no_drop)]
+pub struct BufferValue<'a> {
+    pub buffer: GcRefLock<'a, Vec<u8>>,
+    pub start: usize,
+    pub length: usize,
+}
+
+impl<'a> BufferValue<'a> {
+    pub fn slice(&self, start: usize, length: usize) -> Option<BufferValue<'a>> {
+        if start + length > self.length {
+            return None;
+        }
+        if start == 0 && length == self.length {
+            return Some(self.clone());
+        }
+        Some(BufferValue {
+            buffer: self.buffer,
+            start: self.start + start,
+            length,
+        })
+    }
+    pub fn with_slice<T, F: FnOnce(&[u8]) -> T>(&self, f: F) -> T {
+        let buf_ref = self.buffer.borrow();
+        f(&buf_ref[self.start..self.start + self.length])
+    }
+    pub fn with_mut_slice<T, F: FnOnce(&mut [u8]) -> T>(&self, ctx: &Context<'a>, f: F) -> T {
+        let mut buf_ref = self.buffer.borrow_mut(ctx.mc);
+        f(&mut buf_ref[self.start..self.start + self.length])
+    }
 }
 
 #[derive(Clone, Collect, Debug)]
@@ -181,6 +211,40 @@ impl TypedBufferType {
             TypedBufferType::Int32 | TypedBufferType::Uint32 | TypedBufferType::Float32 => 4,
             TypedBufferType::Int64 | TypedBufferType::Uint64 | TypedBufferType::Float64 => 8,
         }
+    }
+    pub fn try_read_buffer<'a>(
+        &self,
+        buffer: Gc<'a, BufferValue<'a>>,
+        index: usize,
+    ) -> Option<Value<'a>> {
+        let byte_size = self.byte_size();
+        let byte_start = index.checked_mul(byte_size)?;
+        let byte_end = byte_start.checked_add(byte_size)?;
+        if byte_end > buffer.length {
+            return None;
+        }
+        buffer.with_slice(|slice| self.try_read_value(&slice[byte_start..byte_end]))
+    }
+    pub fn try_write_buffer<'a>(
+        &self,
+        ctx: &Context<'a>,
+        buffer: Gc<'a, BufferValue<'a>>,
+        index: usize,
+        value: &Value<'a>,
+    ) -> Option<()> {
+        let byte_size = self.byte_size();
+        let byte_start = index.checked_mul(byte_size)?;
+        let byte_end = byte_start.checked_add(byte_size)?;
+        println!(
+            "Writing value {:?} at index {} (bytes {} to {}) {} {}",
+            value, index, byte_start, byte_end, buffer.start, buffer.length
+        );
+        if byte_end > buffer.length {
+            return None;
+        }
+        buffer.with_mut_slice(ctx, |slice| {
+            self.try_write_value(&mut slice[byte_start..byte_end], value)
+        })
     }
     pub fn try_read_value<'a>(&self, buffer: &[u8]) -> Option<Value<'a>> {
         match self {
@@ -349,10 +413,24 @@ impl PartialEq for Value<'_> {
     }
 }
 
-pub trait Resource: Collect {
+#[allow(unused)]
+pub trait Resource: ResourceBase + Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+pub trait ResourceBase: Collect {
     fn close(&mut self) -> Result<(), String>;
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, String>;
     fn write(&mut self, buf: &[u8]) -> Result<usize, String>;
+}
+
+impl<T: Any + 'static + ResourceBase> Resource for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 impl std::fmt::Debug for dyn Resource {
@@ -522,7 +600,7 @@ impl<'a> Value<'a> {
             Value::Class(_) => "Class",
             Value::Resource(_) => "Resource",
             Value::Buffer(_) => "Buffer",
-            Value::TypedSlice { .. } => "TypedSlice",
+            Value::TypedBuffer { .. } => "TypedSlice",
             Value::Lazy(_) => "Lazy",
         }
     }
@@ -611,47 +689,36 @@ pub fn value_to_string(var: &Value) -> String {
             format!("<prototype {{{}}}{}>", entries, parent)
         }
         Value::Buffer(buf) => {
-            let buf = buf.borrow();
-            let display = if buf.len() > 10 {
-                let mut s = buf[..10]
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            let display = if buf.length > 10 {
+                let mut s = buf.with_slice(|slice| {
+                    slice[..10]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
                 s.push_str(" ...");
                 s
             } else {
-                buf.iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                buf.with_slice(|slice| {
+                    slice
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
             };
             format!("<buffer [{}]>", display)
         }
-        Value::TypedSlice {
+        Value::TypedBuffer {
             buffer,
-            start,
-            length,
             buffer_type,
         } => {
-            let buf = buffer.borrow();
-            let end = start + length;
-            let display = if *length > 10 {
-                let mut s = buf[*start..(*start + 10).min(buf.len())]
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                s.push_str(" ...");
-                s
-            } else {
-                buf[*start..end.min(buf.len())]
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            format!("<typed slice of {:?} [{}]>", buffer_type, display)
+            format!(
+                "<typed slice of {:?} [{}]>",
+                buffer_type,
+                value_to_string(&Value::Buffer(*buffer))
+            )
         }
         Value::Lazy(lazy) => match &*lazy.borrow() {
             LazyValue::Uninitialized { .. } => "<lazy (uninitialized)>".to_string(),

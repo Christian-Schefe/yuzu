@@ -13,8 +13,8 @@ use crate::{
             system::define_system_globals,
         },
         value::{
-            ClassInstanceValue, ClassValue, Environment, FunctionValue, IntVariant, LocatedError,
-            StringVariant, Value, value_to_string,
+            BufferValue, ClassInstanceValue, ClassValue, Environment, FunctionValue, IntVariant,
+            LocatedError, StringVariant, Value, value_to_string,
         },
     },
     location::Location,
@@ -154,9 +154,9 @@ fn expect_buffer_arg<'a>(
     ctx: &Context<'a>,
     value: &Value<'a>,
     expr: &Location,
-) -> Result<GcRefLock<'a, Vec<u8>>, LocatedError<'a>> {
+) -> Result<Gc<'a, BufferValue<'a>>, LocatedError<'a>> {
     if let Value::Buffer(b) = value {
-        Ok(b.clone())
+        Ok(*b)
     } else {
         type_error(
             ctx,

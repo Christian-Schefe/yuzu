@@ -1,25 +1,24 @@
-use std::{
-    collections::{HashMap, HashSet},
-    vec,
-};
+use std::{collections::HashMap, path::PathBuf, vec};
 
 use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
-use clio::Input;
 
-use crate::parser::{LocatedExpression, ParsedModuleItem};
+use crate::{
+    package::{parse_fake_package, parse_package_root},
+    parser::LocatedExpression,
+};
 
 mod bytecode;
 mod gc_interpreter;
 mod lexer;
 mod location;
+mod package;
 mod parser;
 
 #[derive(Debug, Parser)]
 #[clap(trailing_var_arg = true)]
 struct Args {
-    #[clap(value_parser)]
-    input: Input,
+    input: PathBuf,
     other: Vec<String>,
 }
 
@@ -32,39 +31,41 @@ fn main() {
         }
     };
 
-    let pwd = args
-        .input
-        .path()
-        .to_path_buf()
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
+    if !args.input.exists() {
+        eprintln!(
+            "Input path does not exist: {}",
+            args.input.to_string_lossy()
+        );
+        std::process::exit(1);
+    }
 
-    let file_location_str = args.input.path().to_string_lossy().to_string();
+    let mut map = HashMap::new();
+    let (pwd, main_module) = if args.input.is_file() {
+        let pwd = args.input.parent().unwrap().to_path_buf();
 
-    let mut visited_files = HashSet::new();
-    let Ok(parsed) = parse_module_tree(&mut visited_files, ModulePath::root(), &file_location_str)
-    else {
+        let Ok(main_module) = parse_fake_package(&args.input, &mut map) else {
+            std::process::exit(1);
+        };
+        (pwd, main_module)
+    } else {
+        let pwd = args.input.clone();
+
+        let Ok(main_module) = parse_package_root(&args.input, &mut map) else {
+            std::process::exit(1);
+        };
+        (pwd, main_module)
+    };
+
+    let std_path = PathBuf::from("./example/std");
+    let Ok(_) = parse_package_root(&std_path, &mut map) else {
         std::process::exit(1);
     };
-    let Ok(parsed_std) = parse_module_tree(
-        &mut visited_files,
-        ModulePath::std(),
-        "./data2/std.yuzu",
-    ) else {
-        std::process::exit(1);
-    };
 
-    let parsed = ParsedProgram {
-        children: HashMap::from([
-            ("root".to_string(), parsed),
-            ("std".to_string(), parsed_std),
-        ]),
-    };
+    let parsed = ParsedProgram { children: map };
 
     let sources = parsed.get_sources();
 
-    let interpreted = gc_interpreter::interpret_global(parsed, pwd, args.other);
+    let interpreted = gc_interpreter::interpret_global(parsed, pwd, args.other, main_module);
     if let Err(err) = interpreted {
         let err_message = err.data;
         Report::build(
@@ -85,110 +86,6 @@ fn main() {
     }
 }
 
-fn parse_module_tree(
-    visited_files: &mut HashSet<String>,
-    path: ModulePath,
-    file_path: &str,
-) -> Result<ParsedModuleTree, ()> {
-    let contents = std::fs::read_to_string(&file_path).unwrap();
-    let pm = parse_string(&contents, path.to_string())?;
-    let mut children = HashMap::new();
-    let mut expressions = Vec::new();
-
-    let mut success = true;
-    for item in pm {
-        let child = match item {
-            ParsedModuleItem::Expression(e) => {
-                expressions.push(e);
-                continue;
-            }
-            ParsedModuleItem::Module(m) => m,
-        };
-        let child_module_path = path.push(child.data.clone());
-        let file_parent = std::path::Path::new(&file_path).parent().unwrap();
-        let child_file_path = file_parent.join(format!("{}.yuzu", child.data));
-        let child_file_path = child_file_path.to_string_lossy().to_string();
-
-        if visited_files.contains(&child_file_path) {
-            Report::build(
-                ReportKind::Error,
-                (child.location.module.clone(), child.location.span.clone()),
-            )
-            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-            .with_message(format!(
-                "Module imported multiple times: {}",
-                child_module_path
-            ))
-            .with_label(
-                Label::new((child.location.module, child.location.span))
-                    .with_message("Module imported multiple times here")
-                    .with_color(Color::Red),
-            )
-            .finish()
-            .eprint(ariadne::sources(vec![(file_path.to_string(), &contents)]))
-            .unwrap();
-            success = false;
-            continue;
-        }
-        visited_files.insert(child_file_path.clone());
-
-        let child_tree = parse_module_tree(visited_files, child_module_path, &child_file_path);
-        let Ok(child_tree) = child_tree else {
-            success = false;
-            continue;
-        };
-        children.insert(child.data.clone(), child_tree);
-    }
-    if !success {
-        return Err(());
-    }
-    Ok(ParsedModuleTree {
-        children,
-        expressions,
-        source: contents,
-    })
-}
-
-fn parse_string(input: &str, location: String) -> Result<Vec<ParsedModuleItem>, ()> {
-    let lexed = lexer::lex(input);
-    if let Err(err) = lexed {
-        Report::build(ReportKind::Error, (location.clone(), err.span.clone()))
-            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-            .with_message(err.error.to_string())
-            .with_label(
-                Label::new((location.clone(), err.span))
-                    .with_message(err.error.to_string())
-                    .with_color(Color::Red),
-            )
-            .finish()
-            .eprint(ariadne::sources(vec![(location.clone(), input)]))
-            .unwrap();
-        return Err(());
-    }
-    match parser::parse(input, &location, lexed.unwrap()) {
-        Err(errs) => {
-            for err in errs {
-                Report::build(
-                    ReportKind::Error,
-                    (location.clone(), err.span().into_range()),
-                )
-                .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-                .with_message(err.to_string())
-                .with_label(
-                    Label::new((location.clone(), err.span().into_range()))
-                        .with_message(err.reason().to_string())
-                        .with_color(Color::Red),
-                )
-                .finish()
-                .eprint(ariadne::sources(vec![(location.clone(), input)]))
-                .unwrap();
-            }
-            Err(())
-        }
-        Ok(parsed) => Ok(parsed),
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ModulePath {
     path: Vec<String>,
@@ -201,11 +98,6 @@ impl std::fmt::Display for ModulePath {
 }
 
 impl ModulePath {
-    pub fn root() -> Self {
-        Self {
-            path: vec!["root".to_string()],
-        }
-    }
     pub fn std() -> Self {
         Self {
             path: vec!["std".to_string()],

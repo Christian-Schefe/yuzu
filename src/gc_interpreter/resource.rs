@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 
 use gc_arena::{Collect, StaticCollect};
 
-use crate::gc_interpreter::value::Resource;
+use crate::gc_interpreter::value::ResourceBase;
 
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -24,7 +24,7 @@ impl FileResource {
     }
 }
 
-impl Resource for FileResource {
+impl ResourceBase for FileResource {
     fn close(&mut self) -> Result<(), String> {
         if let Some(file) = self.file.take() {
             file.sync_all().map_err(|e| e.to_string())?;
@@ -51,21 +51,20 @@ impl Resource for FileResource {
 
 #[derive(Collect)]
 #[collect(no_drop)]
-pub struct SocketResource {
+pub struct TcpStreamResource {
     pub stream: StaticCollect<Option<std::net::TcpStream>>,
 }
 
-impl SocketResource {
-    pub fn new(host: String, port: u16) -> Result<Self, String> {
-        let stream =
-            std::net::TcpStream::connect((host.as_str(), port)).map_err(|e| e.to_string())?;
+impl TcpStreamResource {
+    pub fn connect(host: &str, port: u16) -> Result<Self, String> {
+        let stream = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
         Ok(Self {
             stream: StaticCollect(Some(stream)),
         })
     }
 }
 
-impl Resource for SocketResource {
+impl ResourceBase for TcpStreamResource {
     fn close(&mut self) -> Result<(), String> {
         if let Some(stream) = self.stream.take() {
             stream
@@ -89,5 +88,44 @@ impl Resource for SocketResource {
         } else {
             Err("Socket is closed".into())
         }
+    }
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub struct TcpListenerResource {
+    pub listener: StaticCollect<Option<std::net::TcpListener>>,
+}
+
+impl TcpListenerResource {
+    pub fn bind(host: &str, port: u16) -> Result<Self, String> {
+        let listener = std::net::TcpListener::bind((host, port)).map_err(|e| e.to_string())?;
+        Ok(Self {
+            listener: StaticCollect(Some(listener)),
+        })
+    }
+    pub fn accept(&mut self) -> Result<(std::net::TcpStream, std::net::SocketAddr), String> {
+        if let Some(listener) = self.listener.as_mut() {
+            listener.accept().map_err(|e| e.to_string())
+        } else {
+            Err("Listener is closed".into())
+        }
+    }
+}
+
+impl ResourceBase for TcpListenerResource {
+    fn close(&mut self) -> Result<(), String> {
+        if let Some(listener) = self.listener.take() {
+            drop(listener);
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, _buf: &mut [u8]) -> Result<usize, String> {
+        Err("Cannot read from a TcpListener".into())
+    }
+
+    fn write(&mut self, _buf: &[u8]) -> Result<usize, String> {
+        Err("Cannot write to a TcpListener".into())
     }
 }
