@@ -25,7 +25,7 @@ pub enum Expression {
         value: Box<LocatedExpression>,
     },
     FunctionLiteral {
-        parameters: Vec<String>,
+        parameters: FunctionParameters,
         body: Box<LocatedExpression>,
     },
     ClassLiteral {
@@ -81,7 +81,7 @@ pub enum Expression {
     },
     FunctionCall {
         function: Box<LocatedExpression>,
-        arguments: Vec<LocatedExpression>,
+        arguments: Vec<(LocatedExpression, bool)>, // bool indicates if the argument is a spread
     },
     Raise(Box<LocatedExpression>),
     New {
@@ -346,6 +346,42 @@ impl Located<Pattern> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FunctionParameters {
+    pub parameters: Vec<String>,
+    pub rest_parameter: Option<String>,
+}
+
+impl FunctionParameters {
+    pub fn empty() -> Self {
+        Self {
+            parameters: Vec::new(),
+            rest_parameter: None,
+        }
+    }
+    pub fn new(parameters: Vec<String>, rest_parameter: Option<String>) -> Self {
+        Self {
+            parameters,
+            rest_parameter,
+        }
+    }
+}
+
+impl Display for FunctionParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params = self.parameters.join(", ");
+        if let Some(rest) = &self.rest_parameter {
+            if !self.parameters.is_empty() {
+                write!(f, "{}, ...{}", params, rest)
+            } else {
+                write!(f, "...{}", rest)
+            }
+        } else {
+            write!(f, "{}", params)
+        }
+    }
+}
+
 impl LocatedExpression {
     pub fn set_module(&mut self, module_path: &str) {
         self.location.module = module_path.to_string();
@@ -452,9 +488,9 @@ impl LocatedExpression {
                 arguments,
             } => {
                 function.set_module(module_path);
-                arguments
-                    .into_iter()
-                    .for_each(|arg| arg.set_module(module_path));
+                arguments.into_iter().for_each(|(arg, _)| {
+                    arg.set_module(module_path);
+                });
             }
             Expression::Break => {}
             Expression::Continue => {}

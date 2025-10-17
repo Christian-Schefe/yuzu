@@ -22,7 +22,7 @@ use crate::{
         },
     },
     location::{Located, Location},
-    parser::{BinaryOp, Identifier, Pattern, UnaryOp},
+    parser::{BinaryOp, FunctionParameters, Identifier, Pattern, UnaryOp},
 };
 
 mod exception;
@@ -433,29 +433,7 @@ pub fn eval_instruction<'a>(
             exec_ctx.push(Value::String(ctx.gc(StringVariant::from_string(s))))
         }
         Instruction::PushArray(items) => {
-            let mut items: Vec<(Value<'a>, bool)> = items
-                .iter()
-                .rev()
-                .map(|is_spread| (exec_ctx.pop(), *is_spread))
-                .collect();
-            items.reverse();
-            let mut item_vec = Vec::new();
-            for (item, is_spread) in items {
-                if is_spread {
-                    if let Value::Array(arr) = item {
-                        let arr_ref = arr.borrow();
-                        item_vec.extend_from_slice(&arr_ref);
-                    } else {
-                        return type_error(
-                            ctx,
-                            "Spread operator can only be applied to arrays",
-                            &location,
-                        );
-                    }
-                } else {
-                    item_vec.push(item);
-                }
-            }
+            let item_vec = pop_spread_args(ctx, exec_ctx, location, items)?;
             exec_ctx.push(Value::Array(ctx.gc_lock(item_vec)));
         }
         Instruction::PushObject(items) => {
@@ -497,7 +475,7 @@ pub fn eval_instruction<'a>(
             body_pointer,
         } => {
             let func = Value::Function(ctx.gc_lock(FunctionValue::Function {
-                parameters: parameters.clone(),
+                parameters: StaticCollect(parameters.clone()),
                 body: *body_pointer,
                 env,
             }));
@@ -523,12 +501,12 @@ pub fn eval_instruction<'a>(
                         |(params, (initializer, constructor))| {
                             (
                                 ctx.gc_lock(FunctionValue::Function {
-                                    parameters: Vec::new(),
+                                    parameters: StaticCollect(FunctionParameters::empty()),
                                     body: *initializer,
                                     env,
                                 }),
                                 ctx.gc_lock(FunctionValue::Function {
-                                    parameters: params.clone(),
+                                    parameters: StaticCollect(params.clone()),
                                     body: *constructor,
                                     env,
                                 }),
@@ -541,7 +519,7 @@ pub fn eval_instruction<'a>(
                             (
                                 name.clone(),
                                 ctx.gc_lock(FunctionValue::Function {
-                                    parameters: params.clone(),
+                                    parameters: StaticCollect(params.clone()),
                                     body: *body,
                                     env,
                                 }),
@@ -554,7 +532,7 @@ pub fn eval_instruction<'a>(
                             (
                                 name.clone(),
                                 ctx.gc_lock(FunctionValue::Function {
-                                    parameters: params.clone(),
+                                    parameters: StaticCollect(params.clone()),
                                     body: *body,
                                     env,
                                 }),
@@ -566,7 +544,7 @@ pub fn eval_instruction<'a>(
             );
             exec_ctx.push(class);
         }
-        Instruction::MakeInstance(constructor_arg_len, field_names) => {
+        Instruction::MakeInstance(field_names) => {
             let mut fields = field_names
                 .iter()
                 .rev()
@@ -574,11 +552,10 @@ pub fn eval_instruction<'a>(
                 .collect::<Vec<_>>();
             fields.reverse();
             let field_map = fields.into_iter().collect();
-            let mut args = Vec::new();
-            for _ in 1..*constructor_arg_len {
-                // Skip one for the class instance (this) itself
-                args.push(exec_ctx.pop());
-            }
+            let Value::Array(args) = exec_ctx.pop() else {
+                unreachable!("CallConstructor should have pushed an argument array");
+            };
+            let mut args = args.take();
             let constructor = exec_ctx.pop();
             let Value::Class(class) = exec_ctx.pop() else {
                 return type_error(ctx, "Attempted to instantiate a non-class value", &location);
@@ -651,12 +628,8 @@ pub fn eval_instruction<'a>(
             }
             _ => {}
         },
-        Instruction::CallFunction(arg_count) => {
-            let mut args = Vec::with_capacity(*arg_count);
-            for _ in 0..*arg_count {
-                args.push(exec_ctx.pop());
-            }
-            args.reverse();
+        Instruction::CallFunction(args) => {
+            let args = pop_spread_args(ctx, exec_ctx, location, args)?;
             let function = exec_ctx.pop();
             call_function(ctx, exec_ctx, location, env, args, &function)?;
         }
@@ -705,9 +678,7 @@ pub fn eval_instruction<'a>(
 
             exec_ctx.push(Value::Class(class));
             exec_ctx.push(Value::Function(*constructor));
-            for arg in args {
-                exec_ctx.push(arg);
-            }
+            exec_ctx.push(Value::Array(ctx.gc_lock(args)));
         }
         Instruction::InitializeLazy(path) => {
             let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
@@ -741,6 +712,38 @@ pub fn eval_instruction<'a>(
         }
     };
     Ok(true)
+}
+
+fn pop_spread_args<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    location: &Location,
+    items: &Vec<bool>,
+) -> Result<Vec<Value<'a>>, LocatedError<'a>> {
+    let mut items: Vec<(Value<'a>, bool)> = items
+        .iter()
+        .rev()
+        .map(|is_spread| (exec_ctx.pop(), *is_spread))
+        .collect();
+    items.reverse();
+    let mut item_vec = Vec::new();
+    for (item, is_spread) in items {
+        if is_spread {
+            if let Value::Array(arr) = item {
+                let arr_ref = arr.borrow();
+                item_vec.extend_from_slice(&arr_ref);
+            } else {
+                return type_error(
+                    ctx,
+                    "Spread operator can only be applied to arrays",
+                    &location,
+                );
+            }
+        } else {
+            item_vec.push(item);
+        }
+    }
+    Ok(item_vec)
 }
 
 fn set_at_index<'a>(
@@ -836,19 +839,46 @@ fn call_function<'a>(
             env: func_env,
         } => {
             let args_len = args.len();
-            if args_len != parameters.len() {
-                type_error(
-                    ctx,
-                    &format!("Expected {} arguments, got {}", parameters.len(), args_len),
-                    location,
-                )
-            } else {
-                let call_env = ctx.gc(Environment::new(ctx, func_env));
-                for (param, arg) in parameters.iter().zip(args.into_iter()) {
-                    call_env.define(ctx, param, arg);
+            let param_len = parameters.parameters.len();
+            if let Some(rest) = &parameters.rest_parameter {
+                if args_len < param_len {
+                    type_error(
+                        ctx,
+                        &format!(
+                            "Expected at least {} arguments, got {}",
+                            param_len, args_len
+                        ),
+                        location,
+                    )
+                } else {
+                    let call_env = ctx.gc(Environment::new(ctx, func_env));
+                    let mut args_iter = args.into_iter();
+                    for (param, arg) in parameters
+                        .parameters
+                        .iter()
+                        .zip(args_iter.by_ref().take(param_len))
+                    {
+                        call_env.define(ctx, param, arg);
+                    }
+                    call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
+                    exec_ctx.call_fn(call_env, body);
+                    Ok(())
                 }
-                exec_ctx.call_fn(call_env, body);
-                Ok(())
+            } else {
+                if args_len != param_len {
+                    type_error(
+                        ctx,
+                        &format!("Expected {} arguments, got {}", param_len, args_len),
+                        location,
+                    )
+                } else {
+                    let call_env = ctx.gc(Environment::new(ctx, func_env));
+                    for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
+                        call_env.define(ctx, param, arg);
+                    }
+                    exec_ctx.call_fn(call_env, body);
+                    Ok(())
+                }
             }
         }
     }

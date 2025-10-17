@@ -19,6 +19,18 @@ export class IndexIterator {
     }
 }
 
+export class Function {
+    fn call() this();
+    fn partial_apply(...args) {
+        fn wrapper(...extra_args) {
+            this(...args, ...extra_args);
+        }
+        wrapper
+    }
+}
+export class Bool {}
+export class Null {}
+
 export class ClassInstance {}
 export class Class {}
 export class Number {
@@ -120,6 +132,8 @@ export class Array {
     fn iter() new IndexIterator(this);
 }
 
+export class Object {}
+
 export class Exception {
     let message = "";
     constructor(message) {
@@ -137,3 +151,7 @@ String;
 ClassInstance;
 Class;
 Resource;
+Function;
+Object;
+Bool;
+Null;

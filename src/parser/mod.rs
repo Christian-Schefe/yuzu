@@ -204,9 +204,41 @@ where
 
     let parameter_list = ident
         .clone()
+        .map(|name| (name, false))
+        .or(just(Token::ThreeDots)
+            .ignore_then(ident.clone())
+            .map(|name| (name, true)))
         .separated_by(just(Token::Comma))
         .allow_trailing()
         .collect::<Vec<_>>()
+        .try_map_with(|params, extra| {
+            let duplicates = get_duplicates(params.iter().map(|(name, _)| name).cloned());
+            if !duplicates.is_empty() {
+                return Err(chumsky::error::Rich::custom(
+                    extra.span(),
+                    format!(
+                        "Duplicate function parameter names: {}",
+                        duplicates.into_iter().collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+            let mut items = Vec::new();
+            let mut rest = None;
+            for (item, is_rest) in params {
+                if rest.is_some() {
+                    return Err(chumsky::error::Rich::custom(
+                        extra.span(),
+                        "Rest pattern must be the last item in parameter list",
+                    ));
+                }
+                if is_rest {
+                    rest = Some(item);
+                } else {
+                    items.push(item);
+                }
+            }
+            Ok(FunctionParameters::new(items, rest))
+        })
         .boxed();
 
     let expr = recursive(move |expr| {
@@ -214,24 +246,14 @@ where
             .clone()
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .then(expr.clone())
-            .try_map_with(|(params, body), extra| {
-                let duplicate_params = get_duplicates(params.iter().cloned());
-                if !duplicate_params.is_empty() {
-                    return Err(chumsky::error::Rich::custom(
-                        extra.span(),
-                        format!(
-                            "Duplicate function parameter names: {}",
-                            duplicate_params.into_iter().collect::<Vec<_>>().join(", ")
-                        ),
-                    ));
-                }
-                Ok(Box::new(located(
+            .map_with(|(params, body), extra| {
+                Box::new(located(
                     Expression::FunctionLiteral {
                         parameters: params,
                         body: Box::new(body),
                     },
                     extra.span(),
-                )))
+                ))
             })
             .boxed();
 
@@ -288,7 +310,7 @@ where
             }
             .map_with(|expr, extra| located(expr, extra.span()));
 
-            let array = just(Token::ThreeDots)
+            let expression_spread_list = just(Token::ThreeDots)
                 .or_not()
                 .then(expr.clone())
                 .map(|(spread, expr)| (expr, spread.is_some()))
@@ -391,7 +413,7 @@ where
                             extra.span(),
                         )
                     }),
-                array
+                expression_spread_list
                     .clone()
                     .delimited_by(just(Token::LBracket), just(Token::RBracket))
                     .map(Expression::ArrayLiteral)
@@ -511,15 +533,9 @@ where
                 ),
                 postfix(
                     15,
-                    just(Token::LParen)
-                        .ignore_then(
-                            expr.clone()
-                                .separated_by(just(Token::Comma))
-                                .collect::<Vec<_>>()
-                                .or_not()
-                                .map(|v| v.unwrap_or_default()),
-                        )
-                        .then_ignore(just(Token::RParen))
+                    expression_spread_list
+                        .clone()
+                        .delimited_by(just(Token::LParen), just(Token::RParen))
                         .boxed(),
                     |lhs, op, extra| {
                         located(
@@ -681,7 +697,7 @@ where
                             };
                             let is_static = is_static.is_some();
                             if !is_static {
-                                parameters.insert(0, "this".to_string());
+                                parameters.parameters.insert(0, "this".to_string());
                             }
                             ClassMember::Method {
                                 name,
@@ -711,7 +727,7 @@ where
                             else {
                                 panic!("Expected function definition in class body")
                             };
-                            parameters.insert(0, "this".to_string());
+                            parameters.parameters.insert(0, "this".to_string());
                             ClassMember::Constructor { value: *func }
                         }),
                 ))

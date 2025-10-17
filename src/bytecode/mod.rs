@@ -1,6 +1,6 @@
 use crate::{
     location::{Located, located},
-    parser::{ClassMemberKind, Expression, LocatedExpression, Pattern},
+    parser::{ClassMemberKind, Expression, FunctionParameters, LocatedExpression, Pattern},
 };
 
 mod instruction;
@@ -166,11 +166,11 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             arguments,
         } => {
             compile(function, code);
-            for arg in arguments {
+            for (arg, _) in arguments {
                 compile(arg, code);
             }
             code.push(located(
-                Instruction::CallFunction(arguments.len()),
+                Instruction::CallFunction(arguments.iter().map(|(_, spread)| *spread).collect()),
                 expression,
             ));
         }
@@ -331,7 +331,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                         };
                         (parameters.clone(), body)
                     }
-                    ClassMemberKind::Field => (Vec::new(), property),
+                    ClassMemberKind::Field => (FunctionParameters::empty(), property),
                 };
                 let body_pointer = code.len();
                 compile(body, code);
@@ -358,18 +358,15 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 for (name, field_initializer) in &fields {
                     code.push(located(
                         Instruction::PushFunction {
-                            parameters: Vec::new(),
+                            parameters: FunctionParameters::empty(),
                             body_pointer: *field_initializer,
                         },
                         expression,
                     ));
-                    code.push(located(Instruction::CallFunction(0), expression));
+                    code.push(located(Instruction::CallFunction(Vec::new()), expression));
                     field_names.push(name.clone());
                 }
-                code.push(located(
-                    Instruction::MakeInstance(parameters.len(), field_names),
-                    expression,
-                ));
+                code.push(located(Instruction::MakeInstance(field_names), expression));
                 code.push(located(Instruction::Pop, expression)); // pop unused constructor return value
                 code.push(located(Instruction::ExitFrame, expression));
                 Some((

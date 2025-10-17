@@ -1,6 +1,6 @@
 use crate::{
     CanonicalPath, ModulePath,
-    parser::{BinaryOp, Identifier, Pattern, UnaryOp},
+    parser::{BinaryOp, FunctionParameters, Identifier, Pattern, UnaryOp},
 };
 
 pub type CodePointer = usize;
@@ -28,14 +28,14 @@ pub enum Instruction {
     PushObject(Vec<Option<String>>), // Option indicates if the value is a spread element
     Raise,
     PushFunction {
-        parameters: Vec<String>,
+        parameters: FunctionParameters,
         body_pointer: CodePointer,
     },
     PushClass {
         parent: bool,
-        methods: Vec<(String, Vec<String>, CodePointer)>,
-        static_methods: Vec<(String, Vec<String>, CodePointer)>,
-        constructor: Option<(Vec<String>, (CodePointer, CodePointer))>,
+        methods: Vec<(String, FunctionParameters, CodePointer)>,
+        static_methods: Vec<(String, FunctionParameters, CodePointer)>,
+        constructor: Option<(FunctionParameters, (CodePointer, CodePointer))>,
     },
     Break,
     Continue,
@@ -52,11 +52,11 @@ pub enum Instruction {
         filtered: bool,
     },
     ExitFrame,
-    CallFunction(usize),                    // number of arguments
+    CallFunction(Vec<bool>), // bool indicates if the element is a spread element
     TryShortCircuit(BinaryOp, CodePointer), // jump target
     BinaryOp(BinaryOp),
     UnaryOp(UnaryOp),
-    CallConstructor(usize),           // number of arguments
-    MakeInstance(usize, Vec<String>), // number of constructor args, list of property names
+    CallConstructor(usize),    // number of arguments
+    MakeInstance(Vec<String>), // list of property names
     EnterModule(ModulePath),
 }

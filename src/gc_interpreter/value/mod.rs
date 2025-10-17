@@ -11,6 +11,7 @@ use crate::{
         exception::{cannot_assign_to_constant, undefined_variable},
     },
     location::{Located, Location},
+    parser::FunctionParameters,
 };
 
 mod number;
@@ -443,7 +444,7 @@ impl std::fmt::Debug for dyn Resource {
 #[collect(no_drop)]
 pub enum FunctionValue<'a> {
     Function {
-        parameters: Vec<String>,
+        parameters: StaticCollect<FunctionParameters>,
         body: CodePointer,
         env: Gc<'a, Environment<'a>>,
     },
@@ -490,7 +491,7 @@ impl std::fmt::Debug for FunctionValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FunctionValue::Function { parameters, .. } => {
-                write!(f, "<function ({})>", parameters.join(", "))
+                write!(f, "<function ({})>", parameters.to_string())
             }
             FunctionValue::Builtin { .. } => write!(f, "<builtin function>"),
             FunctionValue::Curried { func, bound_args } => {
@@ -498,7 +499,7 @@ impl std::fmt::Debug for FunctionValue<'_> {
                     f,
                     "<curried function ({}) with {} bound args>",
                     match &*func.borrow() {
-                        FunctionValue::Function { parameters, .. } => parameters.join(", "),
+                        FunctionValue::Function { parameters, .. } => parameters.to_string(),
                         FunctionValue::Builtin { .. } => "builtin".to_string(),
                         FunctionValue::Curried { .. } => "curried".to_string(),
                     },
@@ -681,7 +682,7 @@ pub fn value_to_string(var: &Value) -> String {
         }
         Value::Function(f) => match &*f.borrow() {
             FunctionValue::Function { parameters, .. } => {
-                format!("<function ({})>", parameters.join(", "))
+                format!("<function ({})>", parameters.to_string())
             }
             FunctionValue::Builtin { .. } => format!("<builtin function>"),
             FunctionValue::Curried { .. } => format!("<curried function>"),
