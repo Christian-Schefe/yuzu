@@ -98,12 +98,17 @@ fn parse_module_tree(
     let pm = parse_string(&contents, path.get_root().to_string(), path.to_string())?;
     let mut children = HashMap::new();
     let mut expressions = Vec::new();
+    let mut exported_expressions = Vec::new();
 
     let mut success = true;
     for item in pm {
         let child = match item {
             ParsedModuleItem::Expression(e) => {
                 expressions.push(e);
+                continue;
+            }
+            ParsedModuleItem::ExportedExpression(e) => {
+                exported_expressions.push(e);
                 continue;
             }
             ParsedModuleItem::Module(m) => m,
@@ -153,6 +158,7 @@ fn parse_module_tree(
     Ok(ParsedModuleTree {
         children,
         expressions,
+        exported_expressions,
         source: contents,
     })
 }

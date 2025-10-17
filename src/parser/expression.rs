@@ -159,6 +159,7 @@ impl ClassMember {
 
 pub enum ParsedModuleItem {
     Expression(LocatedExpression),
+    ExportedExpression(LocatedExpression),
     Module(Located<String>),
 }
 

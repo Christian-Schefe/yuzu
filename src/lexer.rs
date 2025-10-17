@@ -134,6 +134,8 @@ pub enum Token<'a> {
     Use,
     #[token("mod")]
     Mod,
+    #[token("export")]
+    Export,
 
     #[token("if")]
     If,
@@ -251,6 +253,7 @@ impl fmt::Display for Token<'_> {
             Self::DoubleColon => write!(f, "::"),
             Self::Null => write!(f, "null"),
             Self::Let => write!(f, "let"),
+            Self::Export => write!(f, "export"),
             Self::Fn => write!(f, "fn"),
             Self::Class => write!(f, "class"),
             Self::Or => write!(f, "||"),

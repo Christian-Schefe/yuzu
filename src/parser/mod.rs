@@ -841,15 +841,28 @@ where
         .boxed();
 
     let module_item = choice((
-        expr.then(just(Token::Semicolon).or_not())
-            .try_map_with(|(data, semicolon), extra| {
+        just(Token::Export)
+            .or_not()
+            .then(expr.clone())
+            .then(just(Token::Semicolon).or_not())
+            .try_map_with(|((is_export, data), semicolon), extra| {
                 if needs_semi(&data.data) && semicolon.is_none() {
                     return Err(chumsky::error::Rich::custom(
                         extra.span(),
                         "Expected ';' after expression in block",
                     ));
                 };
-                Ok(ParsedModuleItem::Expression(data))
+                if is_export.is_some() {
+                    let Expression::Define { .. } = data.data else {
+                        return Err(chumsky::error::Rich::custom(
+                            extra.span(),
+                            "Only definitions can be exported",
+                        ));
+                    };
+                    Ok(ParsedModuleItem::ExportedExpression(data))
+                } else {
+                    Ok(ParsedModuleItem::Expression(data))
+                }
             }),
         module.clone(),
     ));
@@ -873,6 +886,7 @@ pub fn parse<'a>(
             for item in &mut pm {
                 match item {
                     ParsedModuleItem::Expression(e) => e.set_module(file_path),
+                    ParsedModuleItem::ExportedExpression(e) => e.set_module(file_path),
                     ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
                 }
             }

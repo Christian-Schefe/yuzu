@@ -76,8 +76,7 @@ fn collect_canonical_items<'a>(
 ) {
     let _ = ModuleTree::get_or_insert(ctx, ctx.root.root_module, path);
 
-    let expressions = std::mem::take(&mut tree.expressions);
-    let mut unused_expressions = Vec::new();
+    let expressions = std::mem::take(&mut tree.exported_expressions);
     for expr in expressions.into_iter() {
         match expr.data {
             Expression::Define { pattern, value } => {
@@ -95,15 +94,11 @@ fn collect_canonical_items<'a>(
                 );
                 items.push(expr);
             }
-            Expression::CanonicDefine { .. } => {
-                panic!("CanonicDefine should not appear in source code");
-            }
-            other => {
-                unused_expressions.push(Located::new(other, expr.location));
+            _ => {
+                panic!("Expression can't be exported");
             }
         }
     }
-    tree.expressions = unused_expressions;
     for (name, child) in &mut tree.children {
         let child_path = path.push(name.clone());
         collect_canonical_items(ctx, items, &child_path, child);

@@ -158,6 +158,7 @@ pub struct ParsedModuleTree {
     source: String,
     children: HashMap<String, ParsedModuleTree>,
     expressions: Vec<LocatedExpression>,
+    exported_expressions: Vec<LocatedExpression>,
 }
 
 impl ParsedModuleTree {

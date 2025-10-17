@@ -459,6 +459,10 @@ pub enum FunctionValue<'a> {
             >,
         >,
     },
+    Curried {
+        func: GcRefLock<'a, FunctionValue<'a>>,
+        bound_args: Vec<Value<'a>>,
+    },
 }
 
 impl std::fmt::Debug for FunctionValue<'_> {
@@ -468,6 +472,18 @@ impl std::fmt::Debug for FunctionValue<'_> {
                 write!(f, "<function ({})>", parameters.join(", "))
             }
             FunctionValue::Builtin { .. } => write!(f, "<builtin function>"),
+            FunctionValue::Curried { func, bound_args } => {
+                write!(
+                    f,
+                    "<curried function ({}) with {} bound args>",
+                    match &*func.borrow() {
+                        FunctionValue::Function { parameters, .. } => parameters.join(", "),
+                        FunctionValue::Builtin { .. } => "builtin".to_string(),
+                        FunctionValue::Curried { .. } => "curried".to_string(),
+                    },
+                    bound_args.len()
+                )
+            }
         }
     }
 }
@@ -647,6 +663,7 @@ pub fn value_to_string(var: &Value) -> String {
                 format!("<function ({})>", parameters.join(", "))
             }
             FunctionValue::Builtin { .. } => format!("<builtin function>"),
+            FunctionValue::Curried { .. } => format!("<curried function>"),
         },
         Value::Class(p) => {
             let static_methods = p

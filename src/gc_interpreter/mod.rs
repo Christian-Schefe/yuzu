@@ -836,6 +836,13 @@ fn call_function<'a>(
             exec_ctx.push(func(ctx, args, location, env)?);
             Ok(())
         }
+        FunctionValue::Curried {
+            func,
+            ref bound_args,
+        } => {
+            let args = bound_args.iter().cloned().chain(args.into_iter()).collect();
+            call_function(ctx, exec_ctx, location, env, args, &Value::Function(func))
+        }
         FunctionValue::Function {
             ref parameters,
             body,
