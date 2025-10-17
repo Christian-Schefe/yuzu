@@ -14,6 +14,9 @@ fn main() {
         print(v);
     }
 
+    let func = (-11).abs;
+    print("abs", (-10).abs(), func());
+
     let listener = intrinsics::tcp_listen("127.0.0.1", 8080);
     print("Listening on 127.0.0.1:8080");
     let stream = intrinsics::tcp_accept(listener);
@@ -29,9 +32,9 @@ fn main() {
     print("Connection closed");
 }
 
-let a = 5;
-let c = b + 10;
-let b = a + 10;
+export let a = 5;
+export let c = b + 10;
+export let b = a + 10;
 
 main();
 std::std_test();

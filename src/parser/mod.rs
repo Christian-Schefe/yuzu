@@ -496,32 +496,6 @@ where
                     Some(BinaryOp::Divide),
                 ),
                 postfix(
-                    16,
-                    just(Token::Dot)
-                        .ignore_then(select! { Token::Ident(name) => name.to_string() })
-                        .then_ignore(just(Token::LParen))
-                        .then(
-                            expr.clone()
-                                .separated_by(just(Token::Comma))
-                                .collect::<Vec<_>>()
-                                .or_not()
-                                .map(|v| v.unwrap_or_default()),
-                        )
-                        .then_ignore(just(Token::RParen))
-                        .map_with(|expr, extra| (expr, extra.span()))
-                        .boxed(),
-                    |lhs, ((name, op), span): ((String, Vec<_>), SimpleSpan), _| {
-                        located(
-                            Expression::PropertyFunctionCall {
-                                object: Box::new(lhs),
-                                function: name,
-                                arguments: op,
-                            },
-                            span,
-                        )
-                    },
-                ),
-                postfix(
                     15,
                     just(Token::Dot)
                         .ignore_then(select! { Token::Ident(name) => name.to_string() }),

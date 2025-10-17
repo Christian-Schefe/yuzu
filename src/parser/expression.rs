@@ -83,11 +83,6 @@ pub enum Expression {
         function: Box<LocatedExpression>,
         arguments: Vec<LocatedExpression>,
     },
-    PropertyFunctionCall {
-        object: Box<LocatedExpression>,
-        function: String,
-        arguments: Vec<LocatedExpression>,
-    },
     Raise(Box<LocatedExpression>),
     New {
         expr: Box<LocatedExpression>,
@@ -224,9 +219,14 @@ pub fn desugar_iter_loop(
     body: LocatedExpression,
 ) -> Expression {
     let get_iterable_call = LocatedExpression::new(
-        Expression::PropertyFunctionCall {
-            object: Box::new(iterable.clone()),
-            function: "iter".to_string(),
+        Expression::FunctionCall {
+            function: Box::new(LocatedExpression::new(
+                Expression::FieldAccess {
+                    object: Box::new(iterable.clone()),
+                    field: "iter".to_string(),
+                },
+                iterable.location.clone(),
+            )),
             arguments: vec![],
         },
         iterable.location.clone(),
@@ -243,12 +243,17 @@ pub fn desugar_iter_loop(
     );
 
     let get_item_call = LocatedExpression::new(
-        Expression::PropertyFunctionCall {
-            object: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("$iterable".to_string())),
+        Expression::FunctionCall {
+            function: Box::new(LocatedExpression::new(
+                Expression::FieldAccess {
+                    object: Box::new(LocatedExpression::new(
+                        Expression::Ident(Identifier::Simple("$iterable".to_string())),
+                        iterable.location.clone(),
+                    )),
+                    field: "next".to_string(),
+                },
                 iterable.location.clone(),
             )),
-            function: "next".to_string(),
             arguments: vec![],
         },
         iterable.location.clone(),
@@ -447,16 +452,6 @@ impl LocatedExpression {
                 arguments,
             } => {
                 function.set_module(module_path);
-                arguments
-                    .into_iter()
-                    .for_each(|arg| arg.set_module(module_path));
-            }
-            Expression::PropertyFunctionCall {
-                object,
-                function: _,
-                arguments,
-            } => {
-                object.set_module(module_path);
                 arguments
                     .into_iter()
                     .for_each(|arg| arg.set_module(module_path));

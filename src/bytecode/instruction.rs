@@ -53,7 +53,6 @@ pub enum Instruction {
     },
     ExitFrame,
     CallFunction(usize),                    // number of arguments
-    CallPropertyFunction(String, usize),    // number of arguments
     TryShortCircuit(BinaryOp, CodePointer), // jump target
     BinaryOp(BinaryOp),
     UnaryOp(UnaryOp),

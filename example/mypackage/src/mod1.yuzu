@@ -1,9 +1,16 @@
-fn test_fn(a, b) {
+export fn test_fn(a, b) {
     print("In test_fn", a, b);
+    let inst = new TestClass2();
+    inst.method(40);
+    let m = inst.method;
+    m(41);
+    let m2 = TestClass2.method;
+    m2(inst, 42);
+
     a + b
 }
 
-fn fib(n) {
+export fn fib(n) {
     if (n <= 1) {
         n
     } else {
@@ -11,7 +18,7 @@ fn fib(n) {
     }
 }
 
-class TestClass {
+export class TestClass {
     let x = 10;
     let y = 20;
     let arr = [1, 2, 3];
@@ -27,5 +34,15 @@ class TestClass {
         arr[1] += this.arr[0];
         print(arr, this.arr);
         print(this.what);
+    }
+}
+
+export class TestClass2 {
+    constructor() null;
+    fn method(a) {
+        print("In TestClass2 method", a);
+    }
+    static fn static_method(a) {
+        print("In TestClass2 static_method", a);
     }
 }

@@ -398,7 +398,7 @@ pub fn eval_instruction<'a>(
         }
         Instruction::LoadProperty(field) => {
             let object = exec_ctx.pop();
-            let (val, _) = get_property(ctx, &object, field, location)?;
+            let val = get_property(ctx, &object, field, location)?;
             exec_ctx.push(val);
         }
         Instruction::StoreProperty(field) => {
@@ -658,19 +658,6 @@ pub fn eval_instruction<'a>(
             }
             args.reverse();
             let function = exec_ctx.pop();
-            call_function(ctx, exec_ctx, location, env, args, &function)?;
-        }
-        Instruction::CallPropertyFunction(field, arg_count) => {
-            let mut args = Vec::with_capacity(*arg_count);
-            for _ in 0..*arg_count {
-                args.push(exec_ctx.pop());
-            }
-            args.reverse();
-            let object = exec_ctx.pop();
-            let (function, is_method) = get_property(ctx, &object, field, location)?;
-            if is_method {
-                args.insert(0, object);
-            }
             call_function(ctx, exec_ctx, location, env, args, &function)?;
         }
         Instruction::TryShortCircuit(op, target) => {
@@ -1014,18 +1001,18 @@ fn get_property<'a>(
     target: &Value<'a>,
     field: &str,
     location: &Location,
-) -> Result<(Value<'a>, bool), LocatedError<'a>> {
+) -> Result<Value<'a>, LocatedError<'a>> {
     match target {
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             if let Some(val) = obj_ref.get(field).cloned() {
-                return Ok((val, false));
+                return Ok(val);
             }
         }
         Value::ClassInstance(obj) => {
             let obj_ref = obj.borrow();
             if let Some(val) = obj_ref.fields.get(field).cloned() {
-                return Ok((val, false));
+                return Ok(val);
             }
         }
         _ => {}
@@ -1034,15 +1021,25 @@ fn get_property<'a>(
     let (extra_class, value_class) = get_classes(ctx, target);
 
     fn look_for_property_in_class<'a>(
+        ctx: &Context<'a>,
+        target: &Value<'a>,
         mut class: GcRefLock<'a, ClassValue<'a>>,
         field: &str,
-    ) -> Option<Result<(Value<'a>, bool), LocatedError<'a>>> {
+        is_class: bool,
+    ) -> Option<Result<Value<'a>, LocatedError<'a>>> {
         loop {
             let cur_ref = class.borrow();
             if let Some(val) = cur_ref.methods.get(field) {
-                return Some(Ok((Value::Function(*val), true)));
-            } else if let Some(val) = cur_ref.static_methods.get(field) {
-                return Some(Ok((Value::Function(*val), false)));
+                if is_class {
+                    return Some(Ok(Value::Function(*val)));
+                } else {
+                    let func_val = Value::Function(
+                        ctx.gc_lock(FunctionValue::curry(*val, vec![target.clone()])),
+                    );
+                    return Some(Ok(func_val));
+                }
+            } else if is_class && let Some(val) = cur_ref.static_methods.get(field) {
+                return Some(Ok(Value::Function(*val)));
             }
 
             if let Some(parent) = &cur_ref.parent {
@@ -1054,11 +1051,14 @@ fn get_property<'a>(
             }
         }
     }
+
+    let is_class = matches!(target, Value::Class(_));
     if let Some(extra_class) = extra_class
-        && let Some(res) = look_for_property_in_class(extra_class, field)
+        && let Some(res) = look_for_property_in_class(ctx, target, extra_class, field, is_class)
     {
         res
-    } else if let Some(res) = look_for_property_in_class(value_class, field) {
+    } else if let Some(res) = look_for_property_in_class(ctx, target, value_class, field, is_class)
+    {
         res
     } else {
         field_access_error(ctx, field, location)

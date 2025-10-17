@@ -203,20 +203,6 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 expression,
             ));
         }
-        Expression::PropertyFunctionCall {
-            object,
-            function,
-            arguments,
-        } => {
-            compile(object, code);
-            for arg in arguments {
-                compile(arg, code);
-            }
-            code.push(located(
-                Instruction::CallPropertyFunction(function.clone(), arguments.len()),
-                expression,
-            ));
-        }
         Expression::CanonicDefine { name, value } => {
             let jump_index = code.len();
             code.push(located(Instruction::Jump(0), expression));

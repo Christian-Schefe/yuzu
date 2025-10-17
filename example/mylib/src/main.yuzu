@@ -1,3 +1,3 @@
-fn lib_fn(a, b) {
+export fn lib_fn(a, b) {
     return a + b;
 }

@@ -1,8 +1,8 @@
-fn std_test() {
+export fn std_test() {
     print("Hello from std.yuzu");
 }
 
-class IndexIterator {
+export class IndexIterator {
     let array = null;
     let index = 0;
     constructor(array) {
@@ -19,13 +19,17 @@ class IndexIterator {
     }
 }
 
-class ClassInstance {}
-class Class {}
-class Number {}
-class Integer {}
-class String {}
+export class ClassInstance {}
+export class Class {}
+export class Number {
+    fn abs() if (this < 0) { -this } else { this }
+}
+export class Integer {
+    fn abs() if (this < 0) { -this } else { this }
+}
+export class String {}
 
-class Resource {
+export class Resource {
     fn close() {
         intrinsics::resource_close(this);
     }
@@ -34,14 +38,14 @@ class Resource {
     }
 }
 
-class Buffer {
+export class Buffer {
     static fn with_size(size) intrinsics::buffer_with_size(size);
     fn length() intrinsics::buffer_length(this);
     fn slice(start, length) intrinsics::buffer_slice(this, start, length);
     fn to_string() intrinsics::buffer_to_string(this);
 }
 
-class ByteArray {
+export class ByteArray {
     let buffer = null;
     let view = null;
     let length = 0;
@@ -74,7 +78,7 @@ class ByteArray {
     fn as_slice() intrinsics::buffer_slice(this.buffer, 0, this.length);
 }
 
-class BufferedReader {
+export class BufferedReader {
     let resource = null;
     let buffer = null;
     constructor(resource) {
@@ -111,12 +115,12 @@ class BufferedReader {
     }
 }
 
-class Array {
+export class Array {
     fn length() intrinsics::array_length(this);
     fn iter() new IndexIterator(this);
 }
 
-class Exception {
+export class Exception {
     let message = "";
     constructor(message) {
         this.message = message;

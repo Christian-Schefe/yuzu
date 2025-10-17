@@ -465,6 +465,27 @@ pub enum FunctionValue<'a> {
     },
 }
 
+impl<'a> FunctionValue<'a> {
+    pub fn curry(
+        func: GcRefLock<'a, FunctionValue<'a>>,
+        bound_args: Vec<Value<'a>>,
+    ) -> FunctionValue<'a> {
+        let func_ref = func.borrow();
+        if let Self::Curried { func, bound_args } = &*func_ref {
+            FunctionValue::Curried {
+                func: func.clone(),
+                bound_args: {
+                    let mut new_bound_args = bound_args.clone();
+                    new_bound_args.extend_from_slice(&bound_args);
+                    new_bound_args
+                },
+            }
+        } else {
+            FunctionValue::Curried { func, bound_args }
+        }
+    }
+}
+
 impl std::fmt::Debug for FunctionValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
