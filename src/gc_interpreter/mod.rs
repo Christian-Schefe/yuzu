@@ -681,6 +681,41 @@ pub fn eval_instruction<'a>(
                 &Value::Function(*constructor),
             )?;
         }
+        Instruction::StartInitializeLazy(path) => {
+            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
+            let lazy = if let Some(module_tree) = module_tree {
+                let env = module_tree.borrow().env;
+                env.get(&path.item)
+            } else {
+                return undefined_variable(ctx, &path.to_string(), location);
+            };
+            let Some(lazy) = lazy else {
+                return undefined_variable(ctx, &path.to_string(), location);
+            };
+            let Value::Lazy(lazy_ref) = lazy else {
+                return type_error(ctx, "Attempted to initialize a non-lazy value", location);
+            };
+            let mut lazy_borrow = lazy_ref.borrow_mut(ctx.mc);
+            match &*lazy_borrow {
+                LazyValue::Initialized(_) => {
+                    return type_error(
+                        ctx,
+                        "Attempted to initialize an already initialized lazy value",
+                        location,
+                    );
+                }
+                LazyValue::BeingInitialized => {
+                    return cyclic_static_initialization(
+                        ctx,
+                        &Identifier::Scoped(path.clone()),
+                        location,
+                    );
+                }
+                _ => {
+                    *lazy_borrow = LazyValue::BeingInitialized;
+                }
+            }
+        }
         Instruction::InitializeLazy(path) => {
             let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
             let lazy = if let Some(module_tree) = module_tree {
@@ -1258,7 +1293,7 @@ fn eval_identifier<'a>(
     };
     match val {
         Value::Lazy(lazy) => {
-            let mut lazy_ref = lazy.borrow_mut(ctx.mc);
+            let lazy_ref = lazy.borrow();
             match &*lazy_ref {
                 LazyValue::BeingInitialized => {
                     return cyclic_static_initialization(ctx, ident, location);
@@ -1269,8 +1304,6 @@ fn eval_identifier<'a>(
                 LazyValue::Uninitialized { body, env } => {
                     let body = *body;
                     let env = *env;
-                    *lazy_ref = LazyValue::BeingInitialized;
-                    drop(lazy_ref);
                     let call_env = ctx.gc(Environment::new(ctx, env));
                     exec_ctx.call_fn(call_env, body);
                 }

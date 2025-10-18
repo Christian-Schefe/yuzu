@@ -11,6 +11,7 @@ pub enum Instruction {
     DuplicateTopN(usize), // number of number or elements to duplicate
     Load(Identifier),
     Store(Identifier),
+    StartInitializeLazy(CanonicalPath),
     InitializeLazy(CanonicalPath),
     InitializeModule(ModulePath),
     Define(Pattern),

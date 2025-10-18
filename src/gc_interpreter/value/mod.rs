@@ -15,6 +15,7 @@ use crate::{
 };
 
 mod number;
+
 pub use number::IntVariant;
 
 pub type CodePointer = usize;
@@ -415,6 +416,7 @@ pub trait Resource: ResourceBase + Any {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
+
 pub trait ResourceBase: Collect {
     fn close(&mut self) -> Result<(), String>;
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, String>;

@@ -212,6 +212,10 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 expression,
             ));
             code.push(located(Instruction::Pop, expression));
+            code.push(located(
+                Instruction::StartInitializeLazy(name.clone()),
+                expression,
+            ));
             compile(value, code);
             code.push(located(
                 Instruction::InitializeLazy(name.clone()),
