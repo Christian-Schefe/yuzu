@@ -236,10 +236,6 @@ impl TypedBufferType {
         let byte_size = self.byte_size();
         let byte_start = index.checked_mul(byte_size)?;
         let byte_end = byte_start.checked_add(byte_size)?;
-        println!(
-            "Writing value {:?} at index {} (bytes {} to {}) {} {}",
-            value, index, byte_start, byte_end, buffer.start, buffer.length
-        );
         if byte_end > buffer.length {
             return None;
         }
@@ -513,17 +509,14 @@ impl std::fmt::Debug for FunctionValue<'_> {
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct ClassInstanceValue<'a> {
-    pub fields: HashMap<String, Value<'a>>,
+    pub inner: Value<'a>,
     pub class: GcRefLock<'a, ClassValue<'a>>,
 }
 
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct ClassValue<'a> {
-    pub constructor: Option<(
-        GcRefLock<'a, FunctionValue<'a>>,
-        GcRefLock<'a, FunctionValue<'a>>,
-    )>,
+    pub constructor: Option<GcRefLock<'a, FunctionValue<'a>>>,
     pub methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub static_methods: HashMap<String, GcRefLock<'a, FunctionValue<'a>>>,
     pub parent: Option<GcRefLock<'a, ClassValue<'a>>>,
@@ -663,13 +656,8 @@ pub fn value_to_string(var: &Value) -> String {
         }
         Value::ClassInstance(class_instance) => {
             let class_instance = class_instance.borrow();
-            let entries = class_instance
-                .fields
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, value_to_string(v)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("<instance {{{}}}>", entries)
+            let inner = value_to_string(&class_instance.inner);
+            format!("<instance {}>", inner)
         }
         Value::Array(elements) => {
             let elements = elements
@@ -702,16 +690,9 @@ pub fn value_to_string(var: &Value) -> String {
                 .map(|(k, v)| format!("{}: {}", k, value_to_string(&Value::Function(*v))))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let constructor =
-                p.borrow()
-                    .constructor
-                    .map_or("none".to_string(), |(wrapper, actual)| {
-                        format!(
-                            "{} (wrapper), {} (actual)",
-                            value_to_string(&Value::Function(wrapper)),
-                            value_to_string(&Value::Function(actual))
-                        )
-                    });
+            let constructor = p.borrow().constructor.map_or("none".to_string(), |ctor| {
+                value_to_string(&Value::Function(ctor))
+            });
             let entries = format!(
                 "static methods: {{{}}}, constructor: {}, methods: {{{}}}",
                 static_methods, constructor, methods
@@ -795,6 +776,8 @@ pub struct ValueClasses<'a> {
 pub struct ModuleTree<'a> {
     pub env: Gc<'a, Environment<'a>>,
     children: HashMap<String, GcRefLock<'a, ModuleTree<'a>>>,
+    pub initializer: Option<CodePointer>,
+    pub is_initialized: bool,
 }
 
 impl<'a> ModuleTree<'a> {
@@ -802,6 +785,8 @@ impl<'a> ModuleTree<'a> {
         Self {
             env: Gc::new(mc, Environment::new_child(mc, global_env)),
             children: HashMap::new(),
+            initializer: None,
+            is_initialized: false,
         }
     }
     pub fn get_or_insert(

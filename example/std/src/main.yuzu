@@ -3,18 +3,14 @@ export fn std_test() {
 }
 
 export class IndexIterator {
-    let array = null;
-    let index = 0;
     constructor(array) {
-        this.array = array;
+        {array: array, index: 0}
     }
     fn next() {
         if (this.index < this.array.length()) {
             let value = this.array[this.index];
             this.index += 1;
             {value: value}
-        } else {
-            null;
         }
     }
 }
@@ -58,15 +54,10 @@ export class Buffer {
 }
 
 export class ByteArray {
-    let buffer = null;
-    let view = null;
-    let length = 0;
-    let capacity = 0;
-
     constructor(capacity) {
-        this.buffer = Buffer.with_size(capacity);
-        this.view = intrinsics::uint8_array_of(this.buffer);
-        this.capacity = capacity;
+        let buffer = Buffer.with_size(capacity);
+        let view = intrinsics::uint8_array_of(buffer);
+        {buffer: buffer, view: view, length: 0, capacity: capacity}
     }
 
     fn push(byte) {
@@ -91,11 +82,9 @@ export class ByteArray {
 }
 
 export class BufferedReader {
-    let resource = null;
-    let buffer = null;
     constructor(resource) {
-        this.resource = resource;
-        this.buffer = new ByteArray(1024);
+        let buffer = new ByteArray(1024);
+        {resource: resource, buffer: buffer}
     }
     fn readline() {
         let has_read = false;
@@ -135,10 +124,9 @@ export class Array {
 export class Object {}
 
 export class Exception {
-    let message = "";
     constructor(message) {
-        this.message = message;
         print("Exception created:", message);
+        {message: message}
     }
 }
 

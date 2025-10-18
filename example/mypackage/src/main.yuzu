@@ -1,11 +1,13 @@
 mod mod1;
 
+print("Module main loaded");
 use root::mod1::test_fn;
 
 fn main() {
     print("Hello from main.yuzu");
     print(test_fn(3, 4));
-    let obj = new root::mod1::TestClass(100, 200);
+    let obj = new root::mod1::TestClass();
+    obj.test_method(100, 200);
     print(obj.x, obj.y, obj);
     print(c);
     
@@ -15,8 +17,8 @@ fn main() {
     }
 
     let func = (-11).abs;
-    let papply = func.partial_apply(1, 2, 3);
-    papply(4, 5, 6);
+    //let papply = func.partial_apply(1, 2, 3);
+    //papply(4, 5, 6);
     print("abs", (-10).abs(), func(), func.call());
 
     let listener = intrinsics::tcp_listen("127.0.0.1", 8080);
@@ -33,6 +35,7 @@ fn main() {
     }
     print("Connection closed");
 }
+
 
 export let a = 5;
 export let c = b + 10;

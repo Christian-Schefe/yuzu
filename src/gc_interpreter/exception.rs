@@ -26,7 +26,7 @@ fn make_exception<'a>(ctx: &Context<'a>, msg: &str, variant: &str) -> Value<'a> 
         Value::String(ctx.gc(StringVariant::from_string(msg))),
     );
     Value::ClassInstance(ctx.gc_lock(ClassInstanceValue {
-        fields: map,
+        inner: Value::Object(ctx.gc_lock(map)),
         class: p,
     }))
 }

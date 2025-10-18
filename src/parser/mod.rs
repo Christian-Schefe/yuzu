@@ -690,44 +690,33 @@ where
                         .then_ignore(just(Token::Fn))
                         .then(ident.clone())
                         .then(function_literal.clone())
-                        .map(|((is_static, name), mut func)| {
+                        .try_map(|((is_static, name), mut func), span| {
                             let Expression::FunctionLiteral { parameters, .. } = &mut func.data
                             else {
                                 panic!("Expected function definition in class body")
                             };
                             let is_static = is_static.is_some();
                             if !is_static {
+                                if parameters.parameters.contains(&"this".to_string()) {
+                                    return Err(chumsky::error::Rich::custom(
+                                        span,
+                                        "Instance method parameter list cannot contain 'this' parameter",
+                                    ));
+                                }
                                 parameters.parameters.insert(0, "this".to_string());
                             }
-                            ClassMember::Method {
+                            Ok(ClassMember::Method {
                                 name,
                                 value: *func,
                                 is_static,
-                            }
+                            })
                         }),
-                    let_.clone().map(|expr| {
-                        if let Expression::Define {
-                            pattern: name,
-                            value,
-                        } = expr.data
-                            && let Pattern::Ident(name) = name.data
-                        {
-                            ClassMember::Field {
-                                name,
-                                value: *value,
-                            }
-                        } else {
-                            panic!("Expected field definition in class body")
-                        }
-                    }),
                     just(Token::Constructor)
                         .ignore_then(function_literal.clone())
                         .map(|mut func| {
-                            let Expression::FunctionLiteral { parameters, .. } = &mut func.data
-                            else {
+                            let Expression::FunctionLiteral { .. } = &mut func.data else {
                                 panic!("Expected function definition in class body")
                             };
-                            parameters.parameters.insert(0, "this".to_string());
                             ClassMember::Constructor { value: *func }
                         }),
                 ))
@@ -747,9 +736,7 @@ where
             )
             .try_map_with(|((pattern, parent), body), extra| {
                 let duplicates = get_duplicates(body.iter().map(|member| match member {
-                    ClassMember::Field { name, .. } | ClassMember::Method { name, .. } => {
-                        name.clone()
-                    }
+                    ClassMember::Method { name, .. } => name.clone(),
                     ClassMember::Constructor { .. } => "$constructor".to_string(),
                 }));
                 if !duplicates.is_empty() {
@@ -785,16 +772,18 @@ where
                 block.clone(),
             ))
             .boxed();
+            // Note the order here matters: we want to try parsing no-semi statements first,
+            // so that an empty block {} is not interpreted as an object literal.
             let statement = choice((
-                inline_expr
-                    .clone()
-                    .then(just(Token::Semicolon).map(|x| Some(x))),
                 no_semi_statements
                     .clone()
                     .then(just(Token::Semicolon).or_not()),
+                inline_expr
+                    .clone()
+                    .then(just(Token::Semicolon).map(|x| Some(x))),
             ))
             .boxed();
-            let last_statement = choice((inline_expr.clone(), no_semi_statements));
+            let last_statement = choice((no_semi_statements, inline_expr.clone()));
             statement
                 .repeated()
                 .collect::<Vec<_>>()
@@ -817,8 +806,8 @@ where
             for_loop,
             for_iter_loop,
             while_loop,
-            inline_expr,
             block,
+            inline_expr,
         ))
         .boxed()
     })

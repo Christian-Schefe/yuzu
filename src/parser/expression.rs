@@ -91,10 +91,6 @@ pub enum Expression {
 }
 
 pub enum ClassMember {
-    Field {
-        name: String,
-        value: LocatedExpression,
-    },
     Method {
         name: String,
         value: LocatedExpression,
@@ -107,7 +103,6 @@ pub enum ClassMember {
 
 #[derive(Debug, Clone)]
 pub enum ClassMemberKind {
-    Field,
     Method,
     StaticMethod,
 }
@@ -115,7 +110,6 @@ pub enum ClassMemberKind {
 impl ClassMember {
     pub fn expr(&self) -> &LocatedExpression {
         match self {
-            ClassMember::Field { value, .. } => value,
             ClassMember::Method { value, .. } => value,
             ClassMember::Constructor { value } => value,
         }
@@ -125,9 +119,6 @@ impl ClassMember {
         let mut constructor = None;
         for member in members {
             match member {
-                ClassMember::Field { name, value } => {
-                    properties.push((name, Box::new(value), ClassMemberKind::Field));
-                }
                 ClassMember::Method {
                     name,
                     value,
@@ -353,12 +344,6 @@ pub struct FunctionParameters {
 }
 
 impl FunctionParameters {
-    pub fn empty() -> Self {
-        Self {
-            parameters: Vec::new(),
-            rest_parameter: None,
-        }
-    }
     pub fn new(parameters: Vec<String>, rest_parameter: Option<String>) -> Self {
         Self {
             parameters,

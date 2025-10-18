@@ -1,6 +1,6 @@
 use crate::{
     location::{Located, located},
-    parser::{ClassMemberKind, Expression, FunctionParameters, LocatedExpression, Pattern},
+    parser::{ClassMemberKind, Expression, LocatedExpression, Pattern},
 };
 
 mod instruction;
@@ -207,6 +207,11 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             let jump_index = code.len();
             code.push(located(Instruction::Jump(0), expression));
             let body_pointer = code.len();
+            code.push(located(
+                Instruction::InitializeModule(name.path.clone()),
+                expression,
+            ));
+            code.push(located(Instruction::Pop, expression));
             compile(value, code);
             code.push(located(
                 Instruction::InitializeLazy(name.clone()),
@@ -321,58 +326,33 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
 
             let mut methods = Vec::new();
             let mut static_methods = Vec::new();
-            let mut fields = Vec::new();
+
             for (name, property, kind) in properties {
-                let (params, body) = match kind {
-                    ClassMemberKind::Method | ClassMemberKind::StaticMethod => {
-                        let Expression::FunctionLiteral { parameters, body } = &property.data
-                        else {
-                            panic!("Only functions are allowed as class methods");
-                        };
-                        (parameters.clone(), body)
-                    }
-                    ClassMemberKind::Field => (FunctionParameters::empty(), property),
+                let Expression::FunctionLiteral { parameters, body } = &property.data else {
+                    panic!("Only functions are allowed as class methods");
                 };
                 let body_pointer = code.len();
                 compile(body, code);
                 code.push(located(Instruction::ExitFrame, expression));
                 match kind {
-                    ClassMemberKind::Method => methods.push((name.clone(), params, body_pointer)),
-                    ClassMemberKind::StaticMethod => {
-                        static_methods.push((name.clone(), params, body_pointer))
+                    ClassMemberKind::Method => {
+                        methods.push((name.clone(), parameters.clone(), body_pointer))
                     }
-                    ClassMemberKind::Field => fields.push((name.clone(), body_pointer)),
+                    ClassMemberKind::StaticMethod => {
+                        static_methods.push((name.clone(), parameters.clone(), body_pointer))
+                    }
                 };
             }
 
             let constructor = if let Some(constructor) = constructor {
                 let Expression::FunctionLiteral { parameters, body } = &constructor.data else {
-                    panic!("Only functions are allowed as class methods");
+                    panic!("Only functions are allowed as constructors");
                 };
                 let constructor_pointer = code.len();
                 compile(body, code);
                 code.push(located(Instruction::ExitFrame, expression));
 
-                let initializer_pointer = code.len();
-                let mut field_names = Vec::new();
-                for (name, field_initializer) in &fields {
-                    code.push(located(
-                        Instruction::PushFunction {
-                            parameters: FunctionParameters::empty(),
-                            body_pointer: *field_initializer,
-                        },
-                        expression,
-                    ));
-                    code.push(located(Instruction::CallFunction(Vec::new()), expression));
-                    field_names.push(name.clone());
-                }
-                code.push(located(Instruction::MakeInstance(field_names), expression));
-                code.push(located(Instruction::Pop, expression)); // pop unused constructor return value
-                code.push(located(Instruction::ExitFrame, expression));
-                Some((
-                    parameters.clone(),
-                    (initializer_pointer, constructor_pointer),
-                ))
+                Some((parameters.clone(), constructor_pointer))
             } else {
                 None
             };
@@ -457,6 +437,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 Instruction::CallConstructor(arguments.len()),
                 expression,
             ));
+            code.push(located(Instruction::MakeInstance, expression));
         }
     }
 }

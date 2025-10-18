@@ -12,6 +12,7 @@ pub enum Instruction {
     Load(Identifier),
     Store(Identifier),
     InitializeLazy(CanonicalPath),
+    InitializeModule(ModulePath),
     Define(Pattern),
     DefineCanonic(CanonicalPath, CodePointer),
     LoadProperty(String),
@@ -35,7 +36,7 @@ pub enum Instruction {
         parent: bool,
         methods: Vec<(String, FunctionParameters, CodePointer)>,
         static_methods: Vec<(String, FunctionParameters, CodePointer)>,
-        constructor: Option<(FunctionParameters, (CodePointer, CodePointer))>,
+        constructor: Option<(FunctionParameters, CodePointer)>,
     },
     Break,
     Continue,
@@ -56,7 +57,6 @@ pub enum Instruction {
     TryShortCircuit(BinaryOp, CodePointer), // jump target
     BinaryOp(BinaryOp),
     UnaryOp(UnaryOp),
-    CallConstructor(usize),    // number of arguments
-    MakeInstance(Vec<String>), // list of property names
-    EnterModule(ModulePath),
+    CallConstructor(usize), // number of arguments
+    MakeInstance,
 }

@@ -19,11 +19,14 @@ export fn fib(n) {
 }
 
 export class TestClass {
-    let x = 10;
-    let y = 20;
-    let arr = [1, 2, 3];
-    let what = let x = 6;
-    constructor(a, b) {
+    constructor() {
+        let x = 10;
+        let y = 20;
+        let arr = [1, 2, 3];
+        let what = let xz = 6;
+        {x: x, y: y, arr: arr, what: what}
+    }
+    fn test_method(a, b) {
         print(this.x, this.y, this, a, b);
         this.x += a;
         this.y = b;
@@ -46,3 +49,5 @@ export class TestClass2 {
         print("In TestClass2 static_method", a);
     }
 }
+
+print("Module mod1 loaded");

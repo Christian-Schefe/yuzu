@@ -43,7 +43,7 @@ pub fn define_object_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>
     );
     env.define_const(
         ctx,
-        "class_super",
+        "class_constructor",
         Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
             if args.len() != 1 {
                 return function_argument_error(
@@ -53,11 +53,8 @@ pub fn define_object_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>
                 );
             }
             let class = expect_class_arg(ctx, &args[0], expr)?;
-            let Some(parent) = class.borrow().parent else {
-                return type_error(ctx, "Class has no parent", expr);
-            };
-            let Some((_, ctor)) = parent.borrow().constructor else {
-                return type_error(ctx, "Parent class has no constructor", expr);
+            let Some(ctor) = class.borrow().constructor else {
+                return type_error(ctx, "Class has no constructor", expr);
             };
             Ok(Value::Function(ctor))
         })),
