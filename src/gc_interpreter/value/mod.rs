@@ -438,9 +438,17 @@ impl std::fmt::Debug for dyn Resource {
     }
 }
 
+#[derive(Collect, Debug)]
+#[collect(no_drop)]
+pub struct FunctionValue<'a> {
+    pub func: Gc<'a, FunctionValueType<'a>>,
+    pub bound_args: Vec<Value<'a>>,
+    pub is_async: bool,
+}
+
 #[derive(Collect)]
 #[collect(no_drop)]
-pub enum FunctionValue<'a> {
+pub enum FunctionValueType<'a> {
     Function {
         parameters: StaticCollect<FunctionParameters>,
         body: CodePointer,
@@ -458,52 +466,39 @@ pub enum FunctionValue<'a> {
             >,
         >,
     },
-    Curried {
-        func: GcRefLock<'a, FunctionValue<'a>>,
-        bound_args: Vec<Value<'a>>,
-    },
 }
 
 impl<'a> FunctionValue<'a> {
+    pub fn new(ctx: &Context<'a>, func: FunctionValueType<'a>) -> Self {
+        Self {
+            func: ctx.gc(func),
+            bound_args: Vec::new(),
+            is_async: false,
+        }
+    }
     pub fn curry(
         func: GcRefLock<'a, FunctionValue<'a>>,
         bound_args: Vec<Value<'a>>,
     ) -> FunctionValue<'a> {
         let func_ref = func.borrow();
-        if let Self::Curried { func, bound_args } = &*func_ref {
-            FunctionValue::Curried {
-                func: func.clone(),
-                bound_args: {
-                    let mut new_bound_args = bound_args.clone();
-                    new_bound_args.extend_from_slice(&bound_args);
-                    new_bound_args
-                },
-            }
-        } else {
-            FunctionValue::Curried { func, bound_args }
+
+        let mut new_bound_args = func_ref.bound_args.clone();
+        new_bound_args.extend_from_slice(&bound_args);
+        FunctionValue {
+            func: func_ref.func,
+            bound_args: new_bound_args,
+            is_async: func_ref.is_async,
         }
     }
 }
 
-impl std::fmt::Debug for FunctionValue<'_> {
+impl std::fmt::Debug for FunctionValueType<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FunctionValue::Function { parameters, .. } => {
+            FunctionValueType::Function { parameters, .. } => {
                 write!(f, "<function ({})>", parameters.to_string())
             }
-            FunctionValue::Builtin { .. } => write!(f, "<builtin function>"),
-            FunctionValue::Curried { func, bound_args } => {
-                write!(
-                    f,
-                    "<curried function ({}) with {} bound args>",
-                    match &*func.borrow() {
-                        FunctionValue::Function { parameters, .. } => parameters.to_string(),
-                        FunctionValue::Builtin { .. } => "builtin".to_string(),
-                        FunctionValue::Curried { .. } => "curried".to_string(),
-                    },
-                    bound_args.len()
-                )
-            }
+            FunctionValueType::Builtin { .. } => write!(f, "<builtin function>"),
         }
     }
 }
@@ -670,12 +665,11 @@ pub fn value_to_string(var: &Value) -> String {
                 .join(", ");
             format!("[{}]", elements)
         }
-        Value::Function(f) => match &*f.borrow() {
-            FunctionValue::Function { parameters, .. } => {
+        Value::Function(f) => match &*f.borrow().func {
+            FunctionValueType::Function { parameters, .. } => {
                 format!("<function ({})>", parameters.to_string())
             }
-            FunctionValue::Builtin { .. } => format!("<builtin function>"),
-            FunctionValue::Curried { .. } => format!("<curried function>"),
+            FunctionValueType::Builtin { .. } => format!("<builtin function>"),
         },
         Value::Class(p) => {
             let static_methods = p

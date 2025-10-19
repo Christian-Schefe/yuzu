@@ -17,8 +17,9 @@ use crate::{
         },
         resolver::compile_and_setup,
         value::{
-            ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue, IntVariant,
-            LazyValue, LocatedError, ModuleTree, StringVariant, Value, value_to_string,
+            ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue,
+            FunctionValueType, IntVariant, LazyValue, LocatedError, ModuleTree, StringVariant,
+            Value, value_to_string,
         },
     },
     location::{Located, Location},
@@ -497,11 +498,14 @@ pub fn eval_instruction<'a>(
             parameters,
             body_pointer,
         } => {
-            let func = Value::Function(ctx.gc_lock(FunctionValue::Function {
-                parameters: StaticCollect(parameters.clone()),
-                body: *body_pointer,
-                env,
-            }));
+            let func = Value::Function(ctx.gc_lock(FunctionValue::new(
+                ctx,
+                FunctionValueType::Function {
+                    parameters: StaticCollect(parameters.clone()),
+                    body: *body_pointer,
+                    env,
+                },
+            )));
             exec_ctx.push(func);
         }
         Instruction::PushClass {
@@ -521,22 +525,28 @@ pub fn eval_instruction<'a>(
             let class = Value::Class(
                 ctx.gc_lock(ClassValue {
                     constructor: constructor.as_ref().map(|(params, constructor)| {
-                        ctx.gc_lock(FunctionValue::Function {
-                            parameters: StaticCollect(params.clone()),
-                            body: *constructor,
-                            env,
-                        })
+                        ctx.gc_lock(FunctionValue::new(
+                            ctx,
+                            FunctionValueType::Function {
+                                parameters: StaticCollect(params.clone()),
+                                body: *constructor,
+                                env,
+                            },
+                        ))
                     }),
                     methods: methods
                         .iter()
                         .map(|(name, params, body)| {
                             (
                                 name.clone(),
-                                ctx.gc_lock(FunctionValue::Function {
-                                    parameters: StaticCollect(params.clone()),
-                                    body: *body,
-                                    env,
-                                }),
+                                ctx.gc_lock(FunctionValue::new(
+                                    ctx,
+                                    FunctionValueType::Function {
+                                        parameters: StaticCollect(params.clone()),
+                                        body: *body,
+                                        env,
+                                    },
+                                )),
                             )
                         })
                         .collect(),
@@ -545,11 +555,14 @@ pub fn eval_instruction<'a>(
                         .map(|(name, params, body)| {
                             (
                                 name.clone(),
-                                ctx.gc_lock(FunctionValue::Function {
-                                    parameters: StaticCollect(params.clone()),
-                                    body: *body,
-                                    env,
-                                }),
+                                ctx.gc_lock(FunctionValue::new(
+                                    ctx,
+                                    FunctionValueType::Function {
+                                        parameters: StaticCollect(params.clone()),
+                                        body: *body,
+                                        env,
+                                    },
+                                )),
                             )
                         })
                         .collect(),
@@ -863,20 +876,23 @@ fn call_function<'a>(
     let Value::Function(f) = function else {
         return type_error(ctx, "Attempted to call a non-function value", location);
     };
-    match *f.borrow() {
-        FunctionValue::Builtin { ref func } => {
+    let f_ref = f.borrow();
+
+    let args = f_ref
+        .bound_args
+        .iter()
+        .cloned()
+        .chain(args.into_iter())
+        .collect();
+    let func = f_ref.func;
+    drop(f_ref);
+    match *func {
+        FunctionValueType::Builtin { ref func } => {
             // No call environment for builtin functions, as they won't define variables
             exec_ctx.push(func(ctx, args, location, env)?);
             Ok(())
         }
-        FunctionValue::Curried {
-            func,
-            ref bound_args,
-        } => {
-            let args = bound_args.iter().cloned().chain(args.into_iter()).collect();
-            call_function(ctx, exec_ctx, location, env, args, &Value::Function(func))
-        }
-        FunctionValue::Function {
+        FunctionValueType::Function {
             ref parameters,
             body,
             env: func_env,

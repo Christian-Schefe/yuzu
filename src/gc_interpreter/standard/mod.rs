@@ -13,8 +13,8 @@ use crate::{
             system::define_system_globals,
         },
         value::{
-            BufferValue, ClassInstanceValue, ClassValue, Environment, FunctionValue, IntVariant,
-            LocatedError, StringVariant, Value, value_to_string,
+            BufferValue, ClassInstanceValue, ClassValue, Environment, FunctionValue,
+            FunctionValueType, IntVariant, LocatedError, StringVariant, Value, value_to_string,
         },
     },
     location::Location,
@@ -232,7 +232,10 @@ fn make_builtin_function<'a>(
     ) -> Result<Value<'b>, LocatedError<'b>>
     + 'static,
 ) -> GcRefLock<'a, FunctionValue<'a>> {
-    ctx.gc_lock(FunctionValue::Builtin {
-        func: StaticCollect(Box::new(func)),
-    })
+    ctx.gc_lock(FunctionValue::new(
+        ctx,
+        FunctionValueType::Builtin {
+            func: StaticCollect(Box::new(func)),
+        },
+    ))
 }
