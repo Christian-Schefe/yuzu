@@ -644,13 +644,11 @@ pub fn eval_instruction<'a>(
         Instruction::BinaryOp(op) => {
             let right = exec_ctx.pop();
             let left = exec_ctx.pop();
-            let res = interpret_simple_binary_op(ctx, op, left, right, location)?;
-            exec_ctx.push(res);
+            interpret_binary_op(ctx, exec_ctx, op, left, right, location, env)?;
         }
         Instruction::UnaryOp(op) => {
             let val = exec_ctx.pop();
-            let res = interpret_simple_unary_op(ctx, op, val, location)?;
-            exec_ctx.push(res);
+            interpret_unary_op(ctx, exec_ctx, op, val, location, env)?;
         }
         Instruction::CallConstructor(arg_count) => {
             let mut args = Vec::with_capacity(*arg_count);
@@ -939,6 +937,24 @@ fn interpret_short_circuit<'a>(op: &BinaryOp, left: &Value<'a>) -> bool {
     }
 }
 
+fn interpret_unary_op<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    op: &UnaryOp,
+    value: Value<'a>,
+    location: &Location,
+    env: Gc<'a, Environment<'a>>,
+) -> Result<(), LocatedError<'a>> {
+    if let Value::ClassInstance(_) = &value {
+        if let Ok(method) = get_property(ctx, &value, op.method_name(), location) {
+            return call_function(ctx, exec_ctx, location, env, vec![], &method);
+        }
+    }
+    let res = interpret_simple_unary_op(ctx, op, value, location)?;
+    exec_ctx.push(res);
+    Ok(())
+}
+
 fn interpret_simple_unary_op<'a>(
     ctx: &Context<'a>,
     op: &UnaryOp,
@@ -952,6 +968,25 @@ fn interpret_simple_unary_op<'a>(
         (UnaryOp::Not, Value::Bool(v)) => Value::Bool(!v),
         (_, v) => return unsupported_unary_operation(ctx, op, &v, location),
     })
+}
+
+fn interpret_binary_op<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    op: &BinaryOp,
+    left: Value<'a>,
+    right: Value<'a>,
+    location: &Location,
+    env: Gc<'a, Environment<'a>>,
+) -> Result<(), LocatedError<'a>> {
+    if let Value::ClassInstance(_) = &left {
+        if let Ok(method) = get_property(ctx, &left, op.method_name(), location) {
+            return call_function(ctx, exec_ctx, location, env, vec![right], &method);
+        }
+    }
+    let res = interpret_simple_binary_op(ctx, op, left, right, location)?;
+    exec_ctx.push(res);
+    Ok(())
 }
 
 fn interpret_simple_binary_op<'a>(

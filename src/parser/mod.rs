@@ -46,6 +46,24 @@ impl BinaryOp {
     pub fn can_short_circuit(&self) -> bool {
         matches!(self, Self::And | Self::Or | Self::NullCoalesce)
     }
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Self::Add => "$add",
+            Self::Subtract => "$sub",
+            Self::Multiply => "$mul",
+            Self::Divide => "$div",
+            Self::Modulo => "$mod",
+            Self::Equal => "$eq",
+            Self::NotEqual => "$neq",
+            Self::Less => "$lt",
+            Self::LessEqual => "$le",
+            Self::Greater => "$gt",
+            Self::GreaterEqual => "$ge",
+            Self::And => "$and",
+            Self::Or => "$or",
+            Self::NullCoalesce => "$coalesce",
+        }
+    }
 }
 
 impl fmt::Display for BinaryOp {
@@ -80,6 +98,15 @@ impl fmt::Display for UnaryOp {
         match self {
             Self::Not => write!(f, "not"),
             Self::Negate => write!(f, "-"),
+        }
+    }
+}
+
+impl UnaryOp {
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Self::Not => "$not",
+            Self::Negate => "$negate",
         }
     }
 }

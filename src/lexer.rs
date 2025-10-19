@@ -178,7 +178,7 @@ pub enum Token<'a> {
     #[token("|")]
     Pipe,
 
-    #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice())]
+    #[regex(r"[a-zA-Z_$][a-zA-Z0-9_]*", |lex| lex.slice())]
     Ident(&'a str),
 
     #[regex(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", |lex| lex.slice().parse::<f64>().map_err(|_| LexingError::InvalidChar(lex.slice().to_string()).at(lex.span())), priority = 3)]

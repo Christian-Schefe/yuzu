@@ -195,12 +195,12 @@ pub enum PatternArrayItem {
 /// into:
 /// ```
 /// {
-///     let $iterable = iterable.iter();
-///     let $item = $iterable.next();
-///     while ($item != null) {
-///         let item = $item.value;
+///     let #iterable = iterable.iter();
+///     let #item = #iterable.next();
+///     while (#item != null) {
+///         let item = #item.value;
 ///         [body]
-///         $item = $iterable.next();
+///         #item = #iterable.next();
 ///     }
 /// }
 /// ```
@@ -225,7 +225,7 @@ pub fn desugar_iter_loop(
     let iter_init = LocatedExpression::new(
         Expression::Define {
             pattern: Located::new(
-                Pattern::Ident("$iterable".to_string()),
+                Pattern::Ident("#iterable".to_string()),
                 iterable.location.clone(),
             ),
             value: Box::new(get_iterable_call),
@@ -238,7 +238,7 @@ pub fn desugar_iter_loop(
             function: Box::new(LocatedExpression::new(
                 Expression::FieldAccess {
                     object: Box::new(LocatedExpression::new(
-                        Expression::Ident(Identifier::Simple("$iterable".to_string())),
+                        Expression::Ident(Identifier::Simple("#iterable".to_string())),
                         iterable.location.clone(),
                     )),
                     field: "next".to_string(),
@@ -252,7 +252,7 @@ pub fn desugar_iter_loop(
     let outer_item_init = LocatedExpression::new(
         Expression::Define {
             pattern: Located::new(
-                Pattern::Ident("$item".to_string()),
+                Pattern::Ident("#item".to_string()),
                 iterable.location.clone(),
             ),
             value: Box::new(get_item_call.clone()),
@@ -264,7 +264,7 @@ pub fn desugar_iter_loop(
         Expression::BinaryOp {
             op: BinaryOp::NotEqual,
             left: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("$item".to_string())),
+                Expression::Ident(Identifier::Simple("#item".to_string())),
                 iterable.location.clone(),
             )),
             right: Box::new(LocatedExpression::new(
@@ -278,7 +278,7 @@ pub fn desugar_iter_loop(
     let get_inner_item_value = LocatedExpression::new(
         Expression::FieldAccess {
             object: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("$item".to_string())),
+                Expression::Ident(Identifier::Simple("#item".to_string())),
                 iterable.location.clone(),
             )),
             field: "value".to_string(),
@@ -295,7 +295,7 @@ pub fn desugar_iter_loop(
     let outer_item_update = LocatedExpression::new(
         Expression::Assign {
             target: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("$item".to_string())),
+                Expression::Ident(Identifier::Simple("#item".to_string())),
                 iterable.location.clone(),
             )),
             value: Box::new(get_item_call),

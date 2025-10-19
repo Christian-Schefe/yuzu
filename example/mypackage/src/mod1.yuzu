@@ -1,6 +1,6 @@
 export fn test_fn(a, b) {
     print("In test_fn", a, b);
-    let inst = new TestClass2();
+    let inst = new TestClass2(5);
     inst.method(40);
     let m = inst.method;
     m(41);
@@ -41,12 +41,20 @@ export class TestClass {
 }
 
 export class TestClass2 {
-    constructor() null;
+    constructor(a) {value: a};
     fn method(a) {
         print("In TestClass2 method", a);
     }
     static fn static_method(a) {
         print("In TestClass2 static_method", a);
+    }
+    fn $add(other) {
+        print("In TestClass2 operator +", this, other);
+        new TestClass2(this.value + other.value)
+    }
+    fn $negate() {
+        print("In TestClass2 operator -", this);
+        new TestClass2(-this.value)
     }
 }
 

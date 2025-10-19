@@ -2,6 +2,7 @@ mod mod1;
 
 print("Module main loaded");
 use root::mod1::test_fn;
+use root::mod1::TestClass2;
 
 fn main() {
     print("Hello from main.yuzu");
@@ -15,6 +16,11 @@ fn main() {
     for (v in [1,2,3,4]) {
         print(v);
     }
+
+    let a = new TestClass2(3);
+    let b = new TestClass2(5);
+    let c = a + b;
+    print("Created c from a + b:", a,b, c, -c);
 
     let func = (-11).abs;
     //let papply = func.partial_apply(1, 2, 3);
