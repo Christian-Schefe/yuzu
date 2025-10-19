@@ -7,7 +7,7 @@ use std::{any::Any, collections::HashMap, fmt::Debug};
 use crate::{
     ModulePath,
     gc_interpreter::{
-        Context,
+        Context, ExecContext,
         exception::{cannot_assign_to_constant, undefined_variable},
     },
     location::{Located, Location},
@@ -40,6 +40,25 @@ pub enum Value<'a> {
         buffer_type: TypedBufferType,
     },
     Lazy(GcRefLock<'a, LazyValue<'a>>),
+    Future(GcRefLock<'a, Task<'a>>),
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub enum Task<'a> {
+    Pending(ExecContext<'a>),
+    Completed(Value<'a>),
+    Failed(Value<'a>, StaticCollect<Location>),
+}
+
+impl Debug for Task<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Task::Pending(_) => write!(f, "<pending future>"),
+            Task::Completed(v) => write!(f, "<completed future: {:?}>", v),
+            Task::Failed(e, _) => write!(f, "<failed future: {:?}>", e),
+        }
+    }
 }
 
 #[derive(Clone, Collect, Debug)]
@@ -469,11 +488,11 @@ pub enum FunctionValueType<'a> {
 }
 
 impl<'a> FunctionValue<'a> {
-    pub fn new(ctx: &Context<'a>, func: FunctionValueType<'a>) -> Self {
+    pub fn new(ctx: &Context<'a>, func: FunctionValueType<'a>, is_async: bool) -> Self {
         Self {
             func: ctx.gc(func),
             bound_args: Vec::new(),
-            is_async: false,
+            is_async,
         }
     }
     pub fn curry(
@@ -630,6 +649,7 @@ impl<'a> Value<'a> {
             Value::Buffer(_) => "Buffer",
             Value::TypedBuffer { .. } => "TypedSlice",
             Value::Lazy(_) => "Lazy",
+            Value::Future(_) => "Future",
         }
     }
 }
@@ -741,6 +761,15 @@ pub fn value_to_string(var: &Value) -> String {
             LazyValue::BeingInitialized => "<lazy (being initialized)>".to_string(),
             LazyValue::Initialized(value) => {
                 format!("<lazy (initialized): {}>", value_to_string(value))
+            }
+        },
+        Value::Future(future) => match &*future.borrow() {
+            Task::Pending(_) => "<future (pending)>".to_string(),
+            Task::Completed(value) => {
+                format!("<future (completed): {}>", value_to_string(value))
+            }
+            Task::Failed(error, _) => {
+                format!("<future (failed): {}>", value_to_string(error))
             }
         },
     }

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, vec};
+use std::{
+    collections::{HashMap, VecDeque},
+    vec,
+};
 
 use gc_arena::{
     Arena, Collect, Gc, Mutation, Rootable, StaticCollect,
@@ -7,7 +10,7 @@ use gc_arena::{
 
 use crate::{
     ModulePath, ParsedProgram,
-    bytecode::Instruction,
+    bytecode::{FunctionData, Instruction},
     gc_interpreter::{
         exception::{
             array_index_out_of_bounds, cannot_instantiate, cyclic_static_initialization,
@@ -19,7 +22,7 @@ use crate::{
         value::{
             ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue,
             FunctionValueType, IntVariant, LazyValue, LocatedError, ModuleTree, StringVariant,
-            Value, value_to_string,
+            Task, Value, value_to_string,
         },
     },
     location::{Located, Location},
@@ -40,7 +43,7 @@ pub struct MyRoot<'a> {
     pub args: Value<'a>,
     pub code: GcRefLock<'a, StaticCollect<Vec<Located<Instruction>>>>,
     pub global_env: Gc<'a, Environment<'a>>,
-    pub exec_ctx: GcRefLock<'a, ExecContext<'a>>,
+    pub executor: GcRefLock<'a, Executor<'a>>,
 }
 
 pub struct Context<'a> {
@@ -82,15 +85,17 @@ pub fn interpret_global(
             ),
         ));
         let code = Vec::new();
+        let mut executor = Executor::new();
         let mut exec_ctx = ExecContext::new();
         exec_ctx.push_frame(Frame::Simple, global_env);
+        executor.enqueue(GcRefLock::new(mc, RefLock::new(Task::Pending(exec_ctx))));
         MyRoot {
             root_module: Gc::new(mc, RefLock::new(root_module)),
             pwd,
             args: args_value,
             code: GcRefLock::new(mc, RefLock::new(StaticCollect(code))),
             global_env,
-            exec_ctx: GcRefLock::new(mc, RefLock::new(exec_ctx)),
+            executor: GcRefLock::new(mc, RefLock::new(executor)),
         }
     });
     arena.mutate(move |mc, root| {
@@ -101,7 +106,7 @@ pub fn interpret_global(
     interpret(arena)
 }
 
-fn convert_error<'a>(ctx: &Context<'a>, e: LocatedError<'a>) -> Located<String> {
+fn convert_error<'a>(ctx: &Context<'a>, e: &LocatedError<'a>) -> Located<String> {
     let msg = match &e.data {
         Value::ClassInstance(ci) => {
             let ci_ref = ci.borrow();
@@ -115,7 +120,7 @@ fn convert_error<'a>(ctx: &Context<'a>, e: LocatedError<'a>) -> Located<String> 
     };
     return Located {
         data: format!("Uncaught exception: {}", msg),
-        location: e.location,
+        location: e.location.clone(),
     };
 }
 
@@ -126,18 +131,48 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Located<
             if let Some(res) = arena.mutate(|mc, root| {
                 let ctx = Context { mc, root };
                 let code = ctx.root.code.borrow();
-                let mut exec_ctx = ctx.root.exec_ctx.borrow_mut(mc);
+                let mut executor = ctx.root.executor.borrow_mut(mc);
 
-                match eval_instruction(&ctx, &mut exec_ctx, &code) {
-                    Ok(false) => return Some(Ok(())),
-                    Ok(true) => {}
-                    Err(e) => {
-                        return Some(
-                            bubble_error(&mut exec_ctx, Err(e)).map_err(|e| convert_error(&ctx, e)),
-                        );
+                let Some(front) = executor.queue.front() else {
+                    panic!("Executor queue is empty");
+                };
+                let mut task = front.borrow_mut(mc);
+                let Task::Pending(exec_ctx) = &mut *task else {
+                    panic!("Executor contained non-pending task");
+                };
+
+                match eval_instruction(&ctx, exec_ctx, &code) {
+                    Ok(EvalResult::Exit(val)) => {
+                        *task = Task::Completed(val);
+                        executor.queue.pop_front();
+                        if executor.queue.is_empty() {
+                            return Some(Ok(()));
+                        }
                     }
+                    Ok(EvalResult::Continue) => {
+                        exec_ctx.advance();
+                    }
+                    Ok(EvalResult::Yield) => {
+                        executor.cycle();
+                    }
+                    Ok(EvalResult::AddNewTask(new_task)) => {
+                        executor.enqueue(new_task);
+                        exec_ctx.advance();
+                    }
+                    Err(e) => match bubble_error(exec_ctx, Err(e)) {
+                        None => {
+                            exec_ctx.advance();
+                        }
+                        Some(e) => {
+                            let err = convert_error(&ctx, &e);
+                            *task = Task::Failed(e.data, StaticCollect(e.location));
+                            executor.queue.pop_front();
+                            if executor.queue.is_empty() {
+                                return Some(Err(err));
+                            }
+                        }
+                    },
                 }
-                exec_ctx.advance();
                 None
             }) {
                 return res;
@@ -165,6 +200,7 @@ pub enum Frame<'a> {
         return_ip: usize,
         stack_height: usize,
     },
+    AsyncTask,
 }
 
 #[derive(Collect)]
@@ -177,6 +213,28 @@ pub struct EnvFrame<'a> {
 impl<'a> EnvFrame<'a> {
     fn new(frame: Frame<'a>, env: Gc<'a, Environment<'a>>) -> Self {
         Self { frame, env }
+    }
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub struct Executor<'a> {
+    pub queue: VecDeque<GcRefLock<'a, Task<'a>>>,
+}
+
+impl<'a> Executor<'a> {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+        }
+    }
+    pub fn enqueue(&mut self, task: GcRefLock<'a, Task<'a>>) {
+        self.queue.push_back(task);
+    }
+    pub fn cycle(&mut self) {
+        if let Some(task) = self.queue.pop_front() {
+            self.queue.push_back(task);
+        }
     }
 }
 
@@ -210,6 +268,9 @@ impl<'a> ExecContext<'a> {
     pub fn pop(&mut self) -> Value<'a> {
         self.stack.pop().expect("Stack empty")
     }
+    pub fn peek(&self) -> &Value<'a> {
+        self.stack.last().expect("Stack empty")
+    }
     pub fn jump(&mut self, target: usize) {
         self.ip = target;
         self.jumped = true;
@@ -231,6 +292,20 @@ impl<'a> ExecContext<'a> {
             env,
         );
         self.jump(func);
+    }
+    pub fn call_fn_async(
+        &mut self,
+        env: Gc<'a, Environment<'a>>,
+        func: CodePointer,
+        is_async: bool,
+    ) {
+        if is_async {
+            self.push_frame(Frame::AsyncTask, env);
+            self.ip = func;
+            // no jump flag here since async calls switch to a new task instead of calling "advance"
+        } else {
+            self.call_fn(env, func);
+        }
     }
     pub fn enter_loop(
         &mut self,
@@ -267,7 +342,7 @@ impl<'a> ExecContext<'a> {
 fn bubble_error<'a>(
     exec_ctx: &mut ExecContext<'a>,
     err: Result<Value<'a>, LocatedError<'a>>,
-) -> Result<(), LocatedError<'a>> {
+) -> Option<LocatedError<'a>> {
     let err = err.unwrap_err();
     while !exec_ctx.frame_stack.is_empty() {
         let frame = exec_ctx.pop_frame();
@@ -285,10 +360,12 @@ fn bubble_error<'a>(
             exec_ctx.stack.truncate(stack_height);
             exec_ctx.jump(target);
             exec_ctx.push(err.data);
-            return Ok(());
+            return None;
+        } else if let Frame::AsyncTask = frame.frame {
+            return Some(err);
         }
     }
-    return Err(err);
+    return Some(err);
 }
 fn bubble_control_flow<'a>(
     ctx: &Context<'a>,
@@ -317,6 +394,9 @@ fn bubble_control_flow<'a>(
             Frame::Function { .. } => {
                 return unhandled_control_flow(ctx, location);
             }
+            Frame::AsyncTask => {
+                return unhandled_control_flow(ctx, location);
+            }
             _ => {}
         }
     }
@@ -328,7 +408,7 @@ fn bubble_return<'a>(
     exec_ctx: &mut ExecContext<'a>,
     ret: Value<'a>,
     location: &Location,
-) -> Result<(), LocatedError<'a>> {
+) -> Result<Option<Value<'a>>, LocatedError<'a>> {
     while !exec_ctx.frame_stack.is_empty() {
         let frame = exec_ctx.pop_frame();
         if let Frame::Function {
@@ -340,26 +420,31 @@ fn bubble_return<'a>(
             let target = return_ip;
             exec_ctx.jump(target);
             exec_ctx.push(ret);
-            return Ok(());
+            return Ok(None);
+        } else if let Frame::AsyncTask = frame.frame {
+            return Ok(Some(ret));
         }
     }
     return unhandled_control_flow(ctx, location);
+}
+
+pub enum EvalResult<'a> {
+    Continue,
+    Exit(Value<'a>),
+    Yield,
+    AddNewTask(GcRefLock<'a, Task<'a>>),
 }
 
 pub fn eval_instruction<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
     code: &Vec<Located<Instruction>>,
-) -> Result<bool, LocatedError<'a>> {
+) -> Result<EvalResult<'a>, LocatedError<'a>> {
     let instruction = &code[exec_ctx.ip];
     let location = &instruction.location;
-    let env = exec_ctx.frame_stack.last().expect("Frame stack empty").env;
+    let env = exec_ctx.frame_stack.last().unwrap().env;
 
     /*
-    println!(
-        "IP {}: {:?} at {}:{}",
-        exec_ctx.ip, instruction.data, instruction.location.module, instruction.location.span.start
-    );
     println!(
         "Frames: {:?}",
         exec_ctx
@@ -368,10 +453,14 @@ pub fn eval_instruction<'a>(
             .map(|f| &f.frame)
             .collect::<Vec<_>>()
     );
+    println!(
+        "IP {}: {:?} at {}:{}",
+        exec_ctx.ip, instruction.data, instruction.location.module, instruction.location.span.start
+    );
     */
 
     match &instruction.data {
-        Instruction::Exit => return Ok(false),
+        Instruction::Exit => return Ok(EvalResult::Exit(exec_ctx.pop())),
         Instruction::InitializeModule(path) => {
             let module = ModuleTree::get(ctx.root.root_module, path);
             let Some(module) = module else {
@@ -494,10 +583,11 @@ pub fn eval_instruction<'a>(
                 location: location.clone(),
             });
         }
-        Instruction::PushFunction {
+        Instruction::PushFunction(FunctionData {
             parameters,
             body_pointer,
-        } => {
+            is_async,
+        }) => {
             let func = Value::Function(ctx.gc_lock(FunctionValue::new(
                 ctx,
                 FunctionValueType::Function {
@@ -505,6 +595,7 @@ pub fn eval_instruction<'a>(
                     body: *body_pointer,
                     env,
                 },
+                *is_async,
             )));
             exec_ctx.push(func);
         }
@@ -524,44 +615,47 @@ pub fn eval_instruction<'a>(
             };
             let class = Value::Class(
                 ctx.gc_lock(ClassValue {
-                    constructor: constructor.as_ref().map(|(params, constructor)| {
+                    constructor: constructor.as_ref().map(|func_data| {
                         ctx.gc_lock(FunctionValue::new(
                             ctx,
                             FunctionValueType::Function {
-                                parameters: StaticCollect(params.clone()),
-                                body: *constructor,
+                                parameters: StaticCollect(func_data.parameters.clone()),
+                                body: func_data.body_pointer,
                                 env,
                             },
+                            func_data.is_async,
                         ))
                     }),
                     methods: methods
                         .iter()
-                        .map(|(name, params, body)| {
+                        .map(|(name, func_data)| {
                             (
                                 name.clone(),
                                 ctx.gc_lock(FunctionValue::new(
                                     ctx,
                                     FunctionValueType::Function {
-                                        parameters: StaticCollect(params.clone()),
-                                        body: *body,
+                                        parameters: StaticCollect(func_data.parameters.clone()),
+                                        body: func_data.body_pointer,
                                         env,
                                     },
+                                    func_data.is_async,
                                 )),
                             )
                         })
                         .collect(),
                     static_methods: static_methods
                         .iter()
-                        .map(|(name, params, body)| {
+                        .map(|(name, func_data)| {
                             (
                                 name.clone(),
                                 ctx.gc_lock(FunctionValue::new(
                                     ctx,
                                     FunctionValueType::Function {
-                                        parameters: StaticCollect(params.clone()),
-                                        body: *body,
+                                        parameters: StaticCollect(func_data.parameters.clone()),
+                                        body: func_data.body_pointer,
                                         env,
                                     },
+                                    func_data.is_async,
                                 )),
                             )
                         })
@@ -587,7 +681,10 @@ pub fn eval_instruction<'a>(
         }
         Instruction::Return => {
             let ret = exec_ctx.pop();
-            bubble_return(ctx, exec_ctx, ret, &location)?;
+            match bubble_return(ctx, exec_ctx, ret, &location)? {
+                Some(val) => return Ok(EvalResult::Exit(val)),
+                None => {}
+            }
         }
         Instruction::Jump(target) => {
             exec_ctx.jump(*target);
@@ -643,11 +740,26 @@ pub fn eval_instruction<'a>(
                 debug_assert_eq!(exec_ctx.stack.len(), stack_height + 1);
             }
             Frame::Simple => {}
+            Frame::AsyncTask => {
+                debug_assert_eq!(exec_ctx.stack.len(), 1); // Plus return value
+                return Ok(EvalResult::Exit(exec_ctx.pop()));
+            }
         },
         Instruction::CallFunction(args) => {
             let args = pop_spread_args(ctx, exec_ctx, location, args)?;
             let function = exec_ctx.pop();
-            call_function(ctx, exec_ctx, location, env, args, &function)?;
+            let Value::Function(f) = function else {
+                return type_error(ctx, "Attempted to call a non-function value", location);
+            };
+            if f.borrow().is_async {
+                let mut new_exec_ctx = ExecContext::new(); //IP will be set by call_function
+                call_function(ctx, &mut new_exec_ctx, location, env, args, &function)?;
+                let new_task = ctx.gc_lock(Task::Pending(new_exec_ctx));
+                exec_ctx.push(Value::Future(new_task));
+                return Ok(EvalResult::AddNewTask(new_task));
+            } else {
+                call_function(ctx, exec_ctx, location, env, args, &function)?;
+            }
         }
         Instruction::TryShortCircuit(op, target) => {
             if interpret_short_circuit(op, exec_ctx.stack.last().expect("Stack empty")) {
@@ -757,8 +869,32 @@ pub fn eval_instruction<'a>(
                 }
             }
         }
+        Instruction::Await => {
+            let future = exec_ctx.peek();
+            let Value::Future(future_ref) = future else {
+                return type_error(ctx, "Attempted to await a non-future value", location);
+            };
+            let future_borrow = future_ref.borrow();
+            match &*future_borrow {
+                Task::Completed(value) => {
+                    println!("Future completed with value {:?}", value);
+                    exec_ctx.pop();
+                    exec_ctx.push(value.clone());
+                }
+                Task::Failed(error, error_location) => {
+                    exec_ctx.pop();
+                    return Err(LocatedError {
+                        data: error.clone(),
+                        location: error_location.0.clone(),
+                    });
+                }
+                Task::Pending(_) => {
+                    return Ok(EvalResult::Yield);
+                }
+            }
+        }
     };
-    Ok(true)
+    Ok(EvalResult::Continue)
 }
 
 fn pop_spread_args<'a>(
@@ -877,6 +1013,7 @@ fn call_function<'a>(
         return type_error(ctx, "Attempted to call a non-function value", location);
     };
     let f_ref = f.borrow();
+    let is_async = f_ref.is_async;
 
     let args = f_ref
         .bound_args
@@ -920,7 +1057,7 @@ fn call_function<'a>(
                         call_env.define(ctx, param, arg);
                     }
                     call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
-                    exec_ctx.call_fn(call_env, body);
+                    exec_ctx.call_fn_async(call_env, body, is_async);
                     Ok(())
                 }
             } else {
@@ -935,7 +1072,7 @@ fn call_function<'a>(
                     for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
                         call_env.define(ctx, param, arg);
                     }
-                    exec_ctx.call_fn(call_env, body);
+                    exec_ctx.call_fn_async(call_env, body, is_async);
                     Ok(())
                 }
             }

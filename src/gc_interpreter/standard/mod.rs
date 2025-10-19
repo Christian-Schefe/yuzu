@@ -237,5 +237,6 @@ fn make_builtin_function<'a>(
         FunctionValueType::Builtin {
             func: StaticCollect(Box::new(func)),
         },
+        false,
     ))
 }

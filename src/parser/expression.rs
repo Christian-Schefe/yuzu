@@ -27,6 +27,7 @@ pub enum Expression {
     FunctionLiteral {
         parameters: FunctionParameters,
         body: Box<LocatedExpression>,
+        is_async: bool,
     },
     ClassLiteral {
         parent: Option<Identifier>,
@@ -84,6 +85,7 @@ pub enum Expression {
         arguments: Vec<(LocatedExpression, bool)>, // bool indicates if the argument is a spread
     },
     Raise(Box<LocatedExpression>),
+    Await(Box<LocatedExpression>),
     New {
         expr: Box<LocatedExpression>,
         arguments: Vec<LocatedExpression>,
@@ -385,6 +387,7 @@ impl LocatedExpression {
             Expression::FunctionLiteral {
                 body,
                 parameters: _,
+                is_async: _,
             } => body.set_module(module_path),
             Expression::ClassLiteral {
                 parent: _,
@@ -485,6 +488,7 @@ impl LocatedExpression {
                 }
             }
             Expression::Raise(expr) => expr.set_module(module_path),
+            Expression::Await(expr) => expr.set_module(module_path),
             Expression::New { expr, arguments } => {
                 expr.set_module(module_path);
                 arguments

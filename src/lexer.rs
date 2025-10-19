@@ -155,6 +155,10 @@ pub enum Token<'a> {
     Continue,
     #[token("raise")]
     Raise,
+    #[token("await")]
+    Await,
+    #[token("async")]
+    Async,
     #[token("static")]
     Static,
 
@@ -268,6 +272,8 @@ impl fmt::Display for Token<'_> {
             Self::Break => write!(f, "break"),
             Self::Continue => write!(f, "continue"),
             Self::Raise => write!(f, "raise"),
+            Self::Await => write!(f, "await"),
+            Self::Async => write!(f, "async"),
             Self::Static => write!(f, "static"),
             Self::New => write!(f, "new"),
             Self::Try => write!(f, "try"),

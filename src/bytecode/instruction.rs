@@ -29,15 +29,12 @@ pub enum Instruction {
     PushArray(Vec<bool>), // bool indicates if the element is a spread element
     PushObject(Vec<Option<String>>), // Option indicates if the value is a spread element
     Raise,
-    PushFunction {
-        parameters: FunctionParameters,
-        body_pointer: CodePointer,
-    },
+    PushFunction(FunctionData),
     PushClass {
         parent: bool,
-        methods: Vec<(String, FunctionParameters, CodePointer)>,
-        static_methods: Vec<(String, FunctionParameters, CodePointer)>,
-        constructor: Option<(FunctionParameters, CodePointer)>,
+        methods: Vec<(String, FunctionData)>,
+        static_methods: Vec<(String, FunctionData)>,
+        constructor: Option<FunctionData>,
     },
     Break,
     Continue,
@@ -60,4 +57,12 @@ pub enum Instruction {
     UnaryOp(UnaryOp),
     CallConstructor(usize), // number of arguments
     MakeInstance,
+    Await,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionData {
+    pub parameters: FunctionParameters,
+    pub body_pointer: CodePointer,
+    pub is_async: bool,
 }

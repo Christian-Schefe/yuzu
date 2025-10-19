@@ -48,7 +48,11 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             }
             code.push(located(Instruction::PushObject(entries), expression));
         }
-        Expression::FunctionLiteral { parameters, body } => {
+        Expression::FunctionLiteral {
+            parameters,
+            body,
+            is_async,
+        } => {
             let jump_index = code.len();
             code.push(located(Instruction::Jump(0), expression));
             let body_pointer = code.len();
@@ -60,10 +64,11 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             };
             *target = cur_index;
             code.push(located(
-                Instruction::PushFunction {
+                Instruction::PushFunction(FunctionData {
                     parameters: parameters.clone(),
                     body_pointer,
-                },
+                    is_async: *is_async,
+                }),
                 expression,
             ));
         }
@@ -332,31 +337,49 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             let mut static_methods = Vec::new();
 
             for (name, property, kind) in properties {
-                let Expression::FunctionLiteral { parameters, body } = &property.data else {
+                let Expression::FunctionLiteral {
+                    parameters,
+                    body,
+                    is_async,
+                } = &property.data
+                else {
                     panic!("Only functions are allowed as class methods");
                 };
                 let body_pointer = code.len();
                 compile(body, code);
                 code.push(located(Instruction::ExitFrame, expression));
-                match kind {
-                    ClassMemberKind::Method => {
-                        methods.push((name.clone(), parameters.clone(), body_pointer))
-                    }
-                    ClassMemberKind::StaticMethod => {
-                        static_methods.push((name.clone(), parameters.clone(), body_pointer))
-                    }
+                let vec = match kind {
+                    ClassMemberKind::Method => &mut methods,
+                    ClassMemberKind::StaticMethod => &mut static_methods,
                 };
+                vec.push((
+                    name.clone(),
+                    FunctionData {
+                        parameters: parameters.clone(),
+                        body_pointer,
+                        is_async: *is_async,
+                    },
+                ));
             }
 
             let constructor = if let Some(constructor) = constructor {
-                let Expression::FunctionLiteral { parameters, body } = &constructor.data else {
+                let Expression::FunctionLiteral {
+                    parameters,
+                    body,
+                    is_async,
+                } = &constructor.data
+                else {
                     panic!("Only functions are allowed as constructors");
                 };
                 let constructor_pointer = code.len();
                 compile(body, code);
                 code.push(located(Instruction::ExitFrame, expression));
 
-                Some((parameters.clone(), constructor_pointer))
+                Some(FunctionData {
+                    parameters: parameters.clone(),
+                    body_pointer: constructor_pointer,
+                    is_async: *is_async,
+                })
             } else {
                 None
             };
@@ -431,6 +454,10 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
         Expression::Raise(expr) => {
             compile(expr, code);
             code.push(located(Instruction::Raise, expression));
+        }
+        Expression::Await(expr) => {
+            compile(expr, code);
+            code.push(located(Instruction::Await, expression));
         }
         Expression::New { expr, arguments } => {
             compile(expr, code);

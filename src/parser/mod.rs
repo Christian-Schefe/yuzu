@@ -278,6 +278,7 @@ where
                     Expression::FunctionLiteral {
                         parameters: params,
                         body: Box::new(body),
+                        is_async: false
                     },
                     extra.span(),
                 ))
@@ -426,16 +427,24 @@ where
                     .map_with(|expr, extra| {
                         located(Expression::Raise(Box::new(expr)), extra.span())
                     }),
+                just(Token::Await)
+                    .ignore_then(expr.clone())
+                    .map_with(|expr, extra| {
+                        located(Expression::Await(Box::new(expr)), extra.span())
+                    }),
                 let_.clone(),
-                parameter_list
+                just(Token::Async)
+                    .or_not()
+                    .then(parameter_list)
                     .delimited_by(just(Token::LParen), just(Token::RParen))
                     .then_ignore(just(Token::DoubleArrow))
                     .then(expr.clone())
-                    .map_with(|(params, body), extra| {
+                    .map_with(|((is_async, params), body), extra| {
                         located(
                             Expression::FunctionLiteral {
                                 parameters: params,
                                 body: Box::new(body),
+                                is_async: is_async.is_some(),
                             },
                             extra.span(),
                         )
@@ -691,11 +700,14 @@ where
             })
             .boxed();
 
-        let function = just(Token::Fn)
-            .ignore_then(ident.clone())
-            .map_with(|name, extra| located(Pattern::Ident(name), extra.span()))
+        let function =  just(Token::Async)
+            .or_not()
+            .then_ignore(just(Token::Fn))
+            .then(ident.clone())
+            .map_with(|(is_async , name), extra| (is_async.is_some(), located(Pattern::Ident(name), extra.span())))
             .then(function_literal.clone())
-            .map_with(|(pattern, func), extra| {
+            .map_with(|((is_async, pattern), mut func), extra| {
+                set_function_literal_async(&mut func, is_async);
                 located(
                     Expression::Define {
                         pattern,
@@ -925,4 +937,11 @@ fn get_duplicates(items: impl Iterator<Item = String>) -> HashSet<String> {
         }
     }
     duplicates
+}
+
+fn set_function_literal_async(expr: &mut Box<Located<Expression>>, set_async: bool) {
+    let Expression::FunctionLiteral { is_async, .. } = &mut expr.data else {
+        panic!("Expected function literal")
+    };
+    *is_async = set_async;
 }
