@@ -8,13 +8,14 @@ use crate::{
         exception::{function_argument_error, type_error},
         standard::{
             array::define_array_globals, buffer::define_typed_buffer_globals,
-            object::define_object_globals, rand::define_rand_globals,
-            resource::define_resource_globals, string::define_string_globals,
-            system::define_system_globals,
+            future::define_future_globals, object::define_object_globals,
+            rand::define_rand_globals, resource::define_resource_globals,
+            string::define_string_globals, system::define_system_globals,
         },
         value::{
             BufferValue, ClassInstanceValue, ClassValue, Environment, FunctionValue,
-            FunctionValueType, IntVariant, LocatedError, StringVariant, Value, value_to_string,
+            FunctionValueType, FutureValue, IntVariant, LocatedError, StringVariant, Value,
+            value_to_string,
         },
     },
     location::Location,
@@ -22,6 +23,7 @@ use crate::{
 
 mod array;
 mod buffer;
+mod future;
 mod object;
 mod rand;
 mod resource;
@@ -36,6 +38,7 @@ pub fn define_intrinsics<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>) {
     define_typed_buffer_globals(ctx, env);
     define_array_globals(ctx, env);
     define_object_globals(ctx, env);
+    define_future_globals(ctx, env);
 }
 
 pub fn define_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>) {
@@ -129,6 +132,22 @@ fn expect_object_arg<'a>(
                 "Expected argument to be an Object, got {}",
                 value.get_type()
             ),
+            expr,
+        )
+    }
+}
+
+fn expect_future_arg<'a>(
+    ctx: &Context<'a>,
+    value: &Value<'a>,
+    expr: &Location,
+) -> Result<GcRefLock<'a, FutureValue<'a>>, LocatedError<'a>> {
+    if let Value::Future(f) = value {
+        Ok(f.clone())
+    } else {
+        type_error(
+            ctx,
+            &format!("Expected argument to be a Future, got {}", value.get_type()),
             expr,
         )
     }

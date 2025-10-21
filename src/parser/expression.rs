@@ -85,7 +85,7 @@ pub enum Expression {
         arguments: Vec<(LocatedExpression, bool)>, // bool indicates if the argument is a spread
     },
     Raise(Box<LocatedExpression>),
-    Await(Box<LocatedExpression>),
+    Await(Option<Box<LocatedExpression>>),
     New {
         expr: Box<LocatedExpression>,
         arguments: Vec<LocatedExpression>,
@@ -104,9 +104,8 @@ pub enum ClassMember {
 }
 
 #[derive(Debug, Clone)]
-pub enum ClassMemberKind {
-    Method,
-    StaticMethod,
+pub struct ClassMemberKind {
+    pub is_static: bool,
 }
 
 impl ClassMember {
@@ -126,11 +125,7 @@ impl ClassMember {
                     value,
                     is_static,
                 } => {
-                    if is_static {
-                        properties.push((name, Box::new(value), ClassMemberKind::StaticMethod));
-                    } else {
-                        properties.push((name, Box::new(value), ClassMemberKind::Method));
-                    }
+                    properties.push((name, Box::new(value), ClassMemberKind { is_static }));
                 }
                 ClassMember::Constructor { value } => {
                     constructor = Some(Box::new(value));
@@ -488,7 +483,11 @@ impl LocatedExpression {
                 }
             }
             Expression::Raise(expr) => expr.set_module(module_path),
-            Expression::Await(expr) => expr.set_module(module_path),
+            Expression::Await(expr) => {
+                if let Some(expr) = expr {
+                    expr.set_module(module_path);
+                }
+            }
             Expression::New { expr, arguments } => {
                 expr.set_module(module_path);
                 arguments

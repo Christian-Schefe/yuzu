@@ -58,6 +58,7 @@ pub struct TcpStreamResource {
 impl TcpStreamResource {
     pub fn connect(host: &str, port: u16) -> Result<Self, String> {
         let stream = std::net::TcpStream::connect((host, port)).map_err(|e| e.to_string())?;
+        stream.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok(Self {
             stream: StaticCollect(Some(stream)),
         })
@@ -82,6 +83,18 @@ impl ResourceBase for TcpStreamResource {
         }
     }
 
+    fn try_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, String> {
+        if let Some(stream) = self.stream.as_mut() {
+            match stream.read(buf) {
+                Ok(size) => Ok(Some(size)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            Err("Socket is closed".into())
+        }
+    }
+
     fn write(&mut self, buf: &[u8]) -> Result<usize, String> {
         if let Some(stream) = self.stream.as_mut() {
             stream.write(buf).map_err(|e| e.to_string())
@@ -100,13 +113,20 @@ pub struct TcpListenerResource {
 impl TcpListenerResource {
     pub fn bind(host: &str, port: u16) -> Result<Self, String> {
         let listener = std::net::TcpListener::bind((host, port)).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok(Self {
             listener: StaticCollect(Some(listener)),
         })
     }
-    pub fn accept(&mut self) -> Result<(std::net::TcpStream, std::net::SocketAddr), String> {
+    pub fn accept(
+        &mut self,
+    ) -> Result<Option<(std::net::TcpStream, std::net::SocketAddr)>, String> {
         if let Some(listener) = self.listener.as_mut() {
-            listener.accept().map_err(|e| e.to_string())
+            match listener.accept() {
+                Ok((stream, addr)) => Ok(Some((stream, addr))),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e.to_string()),
+            }
         } else {
             Err("Listener is closed".into())
         }

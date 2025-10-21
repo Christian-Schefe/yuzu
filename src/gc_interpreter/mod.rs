@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    sync::Arc,
     vec,
 };
 
@@ -21,8 +22,8 @@ use crate::{
         resolver::compile_and_setup,
         value::{
             ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue,
-            FunctionValueType, IntVariant, LazyValue, LocatedError, ModuleTree, StringVariant,
-            Task, Value, value_to_string,
+            FunctionValueType, FutureValue, IntVariant, LazyValue, LocatedError, ModuleTree,
+            StringVariant, Task, Value, value_to_string,
         },
     },
     location::{Located, Location},
@@ -41,7 +42,7 @@ pub struct MyRoot<'a> {
     pub root_module: GcRefLock<'a, ModuleTree<'a>>,
     pub pwd: std::path::PathBuf,
     pub args: Value<'a>,
-    pub code: GcRefLock<'a, StaticCollect<Vec<Located<Instruction>>>>,
+    pub code: GcRefLock<'a, StaticCollect<Arc<Vec<Located<Instruction>>>>>,
     pub global_env: Gc<'a, Environment<'a>>,
     pub executor: GcRefLock<'a, Executor<'a>>,
 }
@@ -84,24 +85,27 @@ pub fn interpret_global(
                     .collect(),
             ),
         ));
-        let code = Vec::new();
         let mut executor = Executor::new();
         let mut exec_ctx = ExecContext::new();
         exec_ctx.push_frame(Frame::Simple, global_env);
-        executor.enqueue(GcRefLock::new(mc, RefLock::new(Task::Pending(exec_ctx))));
+        executor.enqueue(GcRefLock::new(
+            mc,
+            RefLock::new(FutureValue::Pending(Task::Exec(exec_ctx))),
+        ));
         MyRoot {
             root_module: Gc::new(mc, RefLock::new(root_module)),
             pwd,
             args: args_value,
-            code: GcRefLock::new(mc, RefLock::new(StaticCollect(code))),
+            code: GcRefLock::new(mc, RefLock::new(StaticCollect(Arc::new(Vec::new())))),
             global_env,
             executor: GcRefLock::new(mc, RefLock::new(executor)),
         }
     });
     arena.mutate(move |mc, root| {
         let ctx = Context { mc, root };
-        let mut code = root.code.borrow_mut(mc);
+        let mut code = Vec::new();
         compile_and_setup(&ctx, &mut program, &mut code, main_module);
+        root.code.borrow_mut(mc).0 = Arc::new(code);
     });
     interpret(arena)
 }
@@ -137,13 +141,13 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Located<
                     panic!("Executor queue is empty");
                 };
                 let mut task = front.borrow_mut(mc);
-                let Task::Pending(exec_ctx) = &mut *task else {
-                    panic!("Executor contained non-pending task");
+                let FutureValue::Pending(Task::Exec(exec_ctx)) = &mut *task else {
+                    panic!("Executor contained non-pending or non-exec task");
                 };
 
                 match eval_instruction(&ctx, exec_ctx, &code) {
                     Ok(EvalResult::Exit(val)) => {
-                        *task = Task::Completed(val);
+                        *task = FutureValue::Completed(val);
                         executor.queue.pop_front();
                         if executor.queue.is_empty() {
                             return Some(Ok(()));
@@ -165,7 +169,7 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Located<
                         }
                         Some(e) => {
                             let err = convert_error(&ctx, &e);
-                            *task = Task::Failed(e.data, StaticCollect(e.location));
+                            *task = FutureValue::Failed(e.data, StaticCollect(e.location));
                             executor.queue.pop_front();
                             if executor.queue.is_empty() {
                                 return Some(Err(err));
@@ -219,7 +223,7 @@ impl<'a> EnvFrame<'a> {
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct Executor<'a> {
-    pub queue: VecDeque<GcRefLock<'a, Task<'a>>>,
+    pub queue: VecDeque<GcRefLock<'a, FutureValue<'a>>>,
 }
 
 impl<'a> Executor<'a> {
@@ -228,7 +232,7 @@ impl<'a> Executor<'a> {
             queue: VecDeque::new(),
         }
     }
-    pub fn enqueue(&mut self, task: GcRefLock<'a, Task<'a>>) {
+    pub fn enqueue(&mut self, task: GcRefLock<'a, FutureValue<'a>>) {
         self.queue.push_back(task);
     }
     pub fn cycle(&mut self) {
@@ -432,7 +436,7 @@ pub enum EvalResult<'a> {
     Continue,
     Exit(Value<'a>),
     Yield,
-    AddNewTask(GcRefLock<'a, Task<'a>>),
+    AddNewTask(GcRefLock<'a, FutureValue<'a>>),
 }
 
 pub fn eval_instruction<'a>(
@@ -754,7 +758,7 @@ pub fn eval_instruction<'a>(
             if f.borrow().is_async {
                 let mut new_exec_ctx = ExecContext::new(); //IP will be set by call_function
                 call_function(ctx, &mut new_exec_ctx, location, env, args, &function)?;
-                let new_task = ctx.gc_lock(Task::Pending(new_exec_ctx));
+                let new_task = ctx.gc_lock(FutureValue::Pending(Task::Exec(new_exec_ctx)));
                 exec_ctx.push(Value::Future(new_task));
                 return Ok(EvalResult::AddNewTask(new_task));
             } else {
@@ -869,6 +873,10 @@ pub fn eval_instruction<'a>(
                 }
             }
         }
+        Instruction::Yield => {
+            exec_ctx.advance(); //advance manually before yielding
+            return Ok(EvalResult::Yield);
+        }
         Instruction::Await => {
             let future = exec_ctx.peek();
             let Value::Future(future_ref) = future else {
@@ -876,19 +884,19 @@ pub fn eval_instruction<'a>(
             };
             let future_borrow = future_ref.borrow();
             match &*future_borrow {
-                Task::Completed(value) => {
+                FutureValue::Completed(value) => {
                     println!("Future completed with value {:?}", value);
                     exec_ctx.pop();
                     exec_ctx.push(value.clone());
                 }
-                Task::Failed(error, error_location) => {
+                FutureValue::Failed(error, error_location) => {
                     exec_ctx.pop();
                     return Err(LocatedError {
                         data: error.clone(),
                         location: error_location.0.clone(),
                     });
                 }
-                Task::Pending(_) => {
+                FutureValue::Pending(_) => {
                     return Ok(EvalResult::Yield);
                 }
             }

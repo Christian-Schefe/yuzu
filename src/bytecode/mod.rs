@@ -1,6 +1,6 @@
 use crate::{
     location::{Located, located},
-    parser::{ClassMemberKind, Expression, LocatedExpression, Pattern},
+    parser::{Expression, LocatedExpression, Pattern},
 };
 
 mod instruction;
@@ -348,9 +348,10 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 let body_pointer = code.len();
                 compile(body, code);
                 code.push(located(Instruction::ExitFrame, expression));
-                let vec = match kind {
-                    ClassMemberKind::Method => &mut methods,
-                    ClassMemberKind::StaticMethod => &mut static_methods,
+                let vec = if kind.is_static {
+                    &mut static_methods
+                } else {
+                    &mut methods
                 };
                 vec.push((
                     name.clone(),
@@ -456,8 +457,12 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             code.push(located(Instruction::Raise, expression));
         }
         Expression::Await(expr) => {
-            compile(expr, code);
-            code.push(located(Instruction::Await, expression));
+            if let Some(expr) = expr {
+                compile(expr, code);
+                code.push(located(Instruction::Await, expression));
+            } else {
+                code.push(located(Instruction::Yield, expression));
+            }
         }
         Expression::New { expr, arguments } => {
             compile(expr, code);

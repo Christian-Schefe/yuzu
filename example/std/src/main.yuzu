@@ -44,6 +44,15 @@ export class Resource {
     fn read(buffer) {
         intrinsics::resource_read(this, buffer)
     }
+    async fn read_async(buffer) {
+        while (true) {
+            let maybe_read = intrinsics::resource_try_read(this, buffer);
+            if (maybe_read != null) {
+                return maybe_read;
+            }
+            await;
+        }
+    }
 }
 
 export class Buffer {
@@ -130,6 +139,20 @@ export class Exception {
     }
 }
 
+export class Option {
+    constructor(has_value, value) if (has_value) {value: value} else null;
+    static fn some(value) new Option(true, value);
+    static fn none() new Option(false, null);
+    fn is_some() this != null;
+    fn is_none() this == null;
+    fn unwrap() {
+        if (this == null) {
+            raise new Exception("Called unwrap on None");
+        }
+        this;
+    }
+}
+
 //initialize lazy statics
 Array;
 Exception;
@@ -143,3 +166,4 @@ Function;
 Object;
 Bool;
 Null;
+Option;

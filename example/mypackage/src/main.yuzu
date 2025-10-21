@@ -10,7 +10,7 @@ async fn test_async() {
     return 55;
 }
 
-fn main() {
+async fn main() {
     print("Hello from main.yuzu");
     print(test_fn(3, 4));
     let obj = new root::mod1::TestClass();
@@ -59,10 +59,11 @@ export let c = b + 10;
 export let b = a + 10;
 
 
+let main = main();
 let fut = test_async();
 print(fut);
 print(await fut);
 print(fut);
 print("After await");
-//main();
 std::std_test();
+await main;

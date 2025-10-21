@@ -428,9 +428,9 @@ where
                         located(Expression::Raise(Box::new(expr)), extra.span())
                     }),
                 just(Token::Await)
-                    .ignore_then(expr.clone())
+                    .ignore_then(expr.clone().or_not())
                     .map_with(|expr, extra| {
-                        located(Expression::Await(Box::new(expr)), extra.span())
+                        located(Expression::Await(expr.map(Box::new)), extra.span())
                     }),
                 let_.clone(),
                 just(Token::Async)
@@ -724,12 +724,13 @@ where
             .then(just(Token::Colon).ignore_then(identifier.clone()).or_not())
             .then(
                 choice((
-                    just(Token::Static)
-                        .or_not()
+                    just(Token::Async).or_not()
+                        .then(just(Token::Static).or_not())
                         .then_ignore(just(Token::Fn))
                         .then(ident.clone())
                         .then(function_literal.clone())
-                        .try_map(|((is_static, name), mut func), span| {
+                        .try_map(|(((is_async, is_static), name), mut func), span| {
+                            set_function_literal_async(&mut func, is_async.is_some());
                             let Expression::FunctionLiteral { parameters, .. } = &mut func.data
                             else {
                                 panic!("Expected function definition in class body")

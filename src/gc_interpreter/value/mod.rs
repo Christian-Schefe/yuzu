@@ -40,23 +40,30 @@ pub enum Value<'a> {
         buffer_type: TypedBufferType,
     },
     Lazy(GcRefLock<'a, LazyValue<'a>>),
-    Future(GcRefLock<'a, Task<'a>>),
+    Future(GcRefLock<'a, FutureValue<'a>>),
+}
+
+#[derive(Collect)]
+#[collect(no_drop)]
+pub enum FutureValue<'a> {
+    Pending(Task<'a>),
+    Completed(Value<'a>),
+    Failed(Value<'a>, StaticCollect<Location>),
 }
 
 #[derive(Collect)]
 #[collect(no_drop)]
 pub enum Task<'a> {
-    Pending(ExecContext<'a>),
-    Completed(Value<'a>),
-    Failed(Value<'a>, StaticCollect<Location>),
+    Exec(ExecContext<'a>),
+    Never,
 }
 
-impl Debug for Task<'_> {
+impl Debug for FutureValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Task::Pending(_) => write!(f, "<pending future>"),
-            Task::Completed(v) => write!(f, "<completed future: {:?}>", v),
-            Task::Failed(e, _) => write!(f, "<failed future: {:?}>", e),
+            FutureValue::Pending(_) => write!(f, "<pending future>"),
+            FutureValue::Completed(v) => write!(f, "<completed future: {:?}>", v),
+            FutureValue::Failed(e, _) => write!(f, "<failed future: {:?}>", e),
         }
     }
 }
@@ -439,6 +446,9 @@ pub trait Resource: ResourceBase + Any {
 pub trait ResourceBase: Collect {
     fn close(&mut self) -> Result<(), String>;
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, String>;
+    fn try_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, String> {
+        self.read(buf).map(Some)
+    }
     fn write(&mut self, buf: &[u8]) -> Result<usize, String>;
 }
 
@@ -764,11 +774,11 @@ pub fn value_to_string(var: &Value) -> String {
             }
         },
         Value::Future(future) => match &*future.borrow() {
-            Task::Pending(_) => "<future (pending)>".to_string(),
-            Task::Completed(value) => {
+            FutureValue::Pending(_) => "<future (pending)>".to_string(),
+            FutureValue::Completed(value) => {
                 format!("<future (completed): {}>", value_to_string(value))
             }
-            Task::Failed(error, _) => {
+            FutureValue::Failed(error, _) => {
                 format!("<future (failed): {}>", value_to_string(error))
             }
         },

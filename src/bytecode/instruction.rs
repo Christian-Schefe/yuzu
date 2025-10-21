@@ -58,6 +58,7 @@ pub enum Instruction {
     CallConstructor(usize), // number of arguments
     MakeInstance,
     Await,
+    Yield,
 }
 
 #[derive(Debug, Clone)]

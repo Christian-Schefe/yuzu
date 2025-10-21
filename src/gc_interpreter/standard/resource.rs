@@ -104,14 +104,17 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     let mut res_ref = res.borrow_mut(ctx.mc);
                     match res_ref.as_any_mut().downcast_mut::<TcpListenerResource>() {
                         Some(listener) => {
-                            let (stream, _) = listener.accept().map_err(|e| {
+                            let Some((stream, _)) = listener.accept().map_err(|e| {
                                 io_error::<()>(
                                     ctx,
                                     &format!("Failed to accept connection: {}", e),
                                     span,
                                 )
                                 .unwrap_err()
-                            })?;
+                            })?
+                            else {
+                                return Ok(Value::Null);
+                            };
                             let socket = TcpStreamResource {
                                 stream: StaticCollect(Some(stream)),
                             };
@@ -173,6 +176,36 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                             .unwrap_err()
                         })?;
                         Ok(Value::Integer(IntVariant::from_u64(bytes_read as u64)))
+                    })
+                }
+                _ => return type_error(ctx, "Read argument must be a resource", span),
+            }
+        })),
+    );
+    env.define_const(
+        ctx,
+        "resource_try_read",
+        Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
+            expect_arg_len(ctx, &args, 2, span)?;
+            match &args[0] {
+                Value::Resource(res) => {
+                    let mut res_ref = res.borrow_mut(ctx.mc);
+                    let buf = expect_buffer_arg(ctx, &args[1], span)?;
+                    buf.with_mut_slice(ctx, |slice| {
+                        let bytes_read = res_ref
+                            .try_read(slice)
+                            .map_err(|e| {
+                                io_error::<()>(
+                                    ctx,
+                                    &format!("Failed to read from resource: {}", e),
+                                    span,
+                                )
+                                .unwrap_err()
+                            })?
+                            .map_or(Value::Null, |n| {
+                                Value::Integer(IntVariant::from_u64(n as u64))
+                            });
+                        Ok(bytes_read)
                     })
                 }
                 _ => return type_error(ctx, "Read argument must be a resource", span),
