@@ -38,10 +38,12 @@ async fn main() {
         print("Caught exception:", e);
     }
 
-    let listener = intrinsics::tcp_listen("127.0.0.1", 8080);
+    1 + "";
+
+    let listener = new std::TcpListener("127.0.0.1", 8080);
     print("Listening on 127.0.0.1:8080");
-    let stream = intrinsics::tcp_accept(listener);
-    print("Accepted connection");
+    let stream = await listener.accept();
+    print("Accepted connection", stream);
     let reader = new std::BufferedReader(stream);
     while (true) {
         let line = reader.readline();
@@ -58,6 +60,7 @@ export let a = 5;
 export let c = b + 10;
 export let b = a + 10;
 
+print("Starting main", std::TcpListener);
 
 let main = main();
 let fut = test_async();

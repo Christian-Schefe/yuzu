@@ -1,4 +1,4 @@
-use gc_arena::{Gc, StaticCollect};
+use gc_arena::Gc;
 
 use crate::gc_interpreter::{
     Context,
@@ -10,8 +10,8 @@ pub fn define_future_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>
     env.define_const(
         ctx,
         "future_new",
-        Value::Function(make_builtin_function(ctx, |ctx, args, span, _| {
-            expect_arg_len(ctx, &args, 0, span)?;
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 0)?;
             Ok(Value::Future(
                 ctx.gc_lock(FutureValue::Pending(Task::Never)),
             ))
@@ -20,9 +20,9 @@ pub fn define_future_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>
     env.define_const(
         ctx,
         "future_resolve",
-        Value::Function(make_builtin_function(ctx, |ctx, mut args, span, _| {
-            expect_arg_len(ctx, &args, 2, span)?;
-            let future = expect_future_arg(ctx, &args[0], span)?;
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, mut args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 2)?;
+            let future = expect_future_arg(ctx, exec_ctx, &args[0])?;
             let mut fut = future.borrow_mut(ctx.mc);
             *fut = FutureValue::Completed(args.pop().unwrap());
             Ok(Value::Null)
@@ -31,11 +31,11 @@ pub fn define_future_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>
     env.define_const(
         ctx,
         "future_reject",
-        Value::Function(make_builtin_function(ctx, |ctx, mut args, span, _| {
-            expect_arg_len(ctx, &args, 2, span)?;
-            let future = expect_future_arg(ctx, &args[0], span)?;
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, mut args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 2)?;
+            let future = expect_future_arg(ctx, exec_ctx, &args[0])?;
             let mut fut = future.borrow_mut(ctx.mc);
-            *fut = FutureValue::Failed(args.pop().unwrap(), StaticCollect(span.clone()));
+            *fut = FutureValue::Failed(args.pop().unwrap());
             Ok(Value::Null)
         })),
     );

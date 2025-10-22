@@ -26,7 +26,7 @@ use crate::{
             StringVariant, Task, Value, value_to_string,
         },
     },
-    location::{Located, Location},
+    location::Located,
     parser::{BinaryOp, Identifier, Pattern, UnaryOp},
 };
 
@@ -36,13 +36,16 @@ mod resource;
 pub mod standard;
 pub mod value;
 
+pub type Location = CodePointer;
+
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MyRoot<'a> {
     pub root_module: GcRefLock<'a, ModuleTree<'a>>,
     pub pwd: std::path::PathBuf,
     pub args: Value<'a>,
-    pub code: GcRefLock<'a, StaticCollect<Arc<Vec<Located<Instruction>>>>>,
+    pub source_map: GcRefLock<'a, StaticCollect<Arc<Vec<crate::location::Location>>>>,
+    pub code: GcRefLock<'a, StaticCollect<Arc<Vec<Instruction>>>>,
     pub global_env: Gc<'a, Environment<'a>>,
     pub executor: GcRefLock<'a, Executor<'a>>,
 }
@@ -97,6 +100,7 @@ pub fn interpret_global(
             pwd,
             args: args_value,
             code: GcRefLock::new(mc, RefLock::new(StaticCollect(Arc::new(Vec::new())))),
+            source_map: GcRefLock::new(mc, RefLock::new(StaticCollect(Arc::new(Vec::new())))),
             global_env,
             executor: GcRefLock::new(mc, RefLock::new(executor)),
         }
@@ -105,27 +109,52 @@ pub fn interpret_global(
         let ctx = Context { mc, root };
         let mut code = Vec::new();
         compile_and_setup(&ctx, &mut program, &mut code, main_module);
+        let (code, source_map) = code
+            .into_iter()
+            .map(|instr| (instr.data, instr.location))
+            .unzip();
         root.code.borrow_mut(mc).0 = Arc::new(code);
+        root.source_map.borrow_mut(mc).0 = Arc::new(source_map);
     });
     interpret(arena)
 }
 
-fn convert_error<'a>(ctx: &Context<'a>, e: &LocatedError<'a>) -> Located<String> {
-    let msg = match &e.data {
+fn convert_error<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
+    err: &Value<'a>,
+) -> Located<String> {
+    println!("Err: {:?}", err);
+    let (msg, stack_trace) = match err {
         Value::ClassInstance(ci) => {
             let ci_ref = ci.borrow();
-            let msg = get_property(ctx, &ci_ref.inner, "message", &e.location);
-            match msg {
-                Ok(v) => value_to_string(&v),
-                _ => value_to_string(&e.data),
-            }
+            let msg = get_property(ctx, exec_ctx, &ci_ref.inner, "message");
+            let stack_trace = get_property(ctx, exec_ctx, &ci_ref.inner, "stack_trace");
+            let msg_str = msg
+                .ok()
+                .map(|v| value_to_string(&v))
+                .unwrap_or_else(|| value_to_string(err));
+            let stack_trace_ips = stack_trace.map_or(Vec::new(), |v| match v {
+                Value::StackTrace(arr) => arr,
+                _ => Vec::new(),
+            });
+            (msg_str, stack_trace_ips)
         }
-        _ => value_to_string(&e.data),
+        _ => (value_to_string(err), Vec::new()),
     };
-    return Located {
-        data: format!("Uncaught exception: {}", msg),
-        location: e.location.clone(),
-    };
+    let source_map = ctx.root.source_map.borrow();
+    let stack_trace_str = stack_trace
+        .into_iter()
+        .map(|ip| {
+            let loc = source_map[ip].clone();
+            format!("  at {}:{}", loc.module, loc.span.start)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Located::new(
+        format!("Uncaught exception: {}\n{}", msg, stack_trace_str),
+        source_map[exec_ctx.ip].clone(),
+    )
 }
 
 pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Located<String>> {
@@ -163,16 +192,16 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Located<
                         executor.enqueue(new_task);
                         exec_ctx.advance();
                     }
-                    Err(e) => match bubble_error(exec_ctx, Err(e)) {
+                    Err(e) => match bubble_error(exec_ctx, e) {
                         None => {
                             exec_ctx.advance();
                         }
-                        Some(e) => {
-                            let err = convert_error(&ctx, &e);
-                            *task = FutureValue::Failed(e.data, StaticCollect(e.location));
+                        Some(err) => {
+                            let err_string = convert_error(&ctx, exec_ctx, &err);
+                            *task = FutureValue::Failed(err);
                             executor.queue.pop_front();
                             if executor.queue.is_empty() {
-                                return Some(Err(err));
+                                return Some(Err(err_string));
                             }
                         }
                     },
@@ -201,10 +230,13 @@ pub enum Frame<'a> {
         stack_height: usize,
     },
     Function {
+        source_ip: usize,
         return_ip: usize,
         stack_height: usize,
     },
-    AsyncTask,
+    AsyncTask {
+        source_ip: usize,
+    },
 }
 
 #[derive(Collect)]
@@ -286,10 +318,28 @@ impl<'a> ExecContext<'a> {
             self.jumped = false;
         }
     }
+    pub fn get_stack_trace(&self) -> Vec<Location> {
+        let mut trace = Vec::new();
+        for frame in self.frame_stack.iter().rev() {
+            match &frame.frame {
+                Frame::Function { source_ip, .. } => {
+                    trace.push(*source_ip);
+                }
+                Frame::AsyncTask { source_ip } => {
+                    trace.push(*source_ip);
+                    // TODO: go into parent exec ctx if possible
+                }
+                _ => {}
+            }
+        }
+        trace.push(self.ip);
+        trace
+    }
     pub fn call_fn(&mut self, env: Gc<'a, Environment<'a>>, func: CodePointer) {
         let return_ip = self.ip + 1;
         self.push_frame(
             Frame::Function {
+                source_ip: self.ip,
                 return_ip,
                 stack_height: self.stack.len(),
             },
@@ -304,7 +354,7 @@ impl<'a> ExecContext<'a> {
         is_async: bool,
     ) {
         if is_async {
-            self.push_frame(Frame::AsyncTask, env);
+            self.push_frame(Frame::AsyncTask { source_ip: self.ip }, env);
             self.ip = func;
             // no jump flag here since async calls switch to a new task instead of calling "advance"
         } else {
@@ -343,11 +393,7 @@ impl<'a> ExecContext<'a> {
     }
 }
 
-fn bubble_error<'a>(
-    exec_ctx: &mut ExecContext<'a>,
-    err: Result<Value<'a>, LocatedError<'a>>,
-) -> Option<LocatedError<'a>> {
-    let err = err.unwrap_err();
+fn bubble_error<'a>(exec_ctx: &mut ExecContext<'a>, err: Value<'a>) -> Option<Value<'a>> {
     while !exec_ctx.frame_stack.is_empty() {
         let frame = exec_ctx.pop_frame();
         if let Frame::Catch {
@@ -357,15 +403,15 @@ fn bubble_error<'a>(
         } = frame.frame
         {
             if let Some(filter_class) = filter_class {
-                if !is_instance_of(&err.data, filter_class) {
+                if !is_instance_of(&err, filter_class) {
                     continue; // Keep bubbling
                 }
             }
             exec_ctx.stack.truncate(stack_height);
             exec_ctx.jump(target);
-            exec_ctx.push(err.data);
+            exec_ctx.push(err);
             return None;
-        } else if let Frame::AsyncTask = frame.frame {
+        } else if let Frame::AsyncTask { .. } = frame.frame {
             return Some(err);
         }
     }
@@ -375,7 +421,6 @@ fn bubble_control_flow<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
     is_break: bool,
-    location: &Location,
 ) -> Result<(), LocatedError<'a>> {
     while !exec_ctx.frame_stack.is_empty() {
         let frame = exec_ctx.pop_frame();
@@ -396,26 +441,26 @@ fn bubble_control_flow<'a>(
                 return Ok(());
             }
             Frame::Function { .. } => {
-                return unhandled_control_flow(ctx, location);
+                return Err(unhandled_control_flow(ctx, exec_ctx));
             }
-            Frame::AsyncTask => {
-                return unhandled_control_flow(ctx, location);
+            Frame::AsyncTask { .. } => {
+                return Err(unhandled_control_flow(ctx, exec_ctx));
             }
             _ => {}
         }
     }
-    return unhandled_control_flow(ctx, location);
+    return Err(unhandled_control_flow(ctx, exec_ctx));
 }
 
 fn bubble_return<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
     ret: Value<'a>,
-    location: &Location,
 ) -> Result<Option<Value<'a>>, LocatedError<'a>> {
     while !exec_ctx.frame_stack.is_empty() {
         let frame = exec_ctx.pop_frame();
         if let Frame::Function {
+            source_ip: _,
             return_ip,
             stack_height,
         } = frame.frame
@@ -425,11 +470,11 @@ fn bubble_return<'a>(
             exec_ctx.jump(target);
             exec_ctx.push(ret);
             return Ok(None);
-        } else if let Frame::AsyncTask = frame.frame {
+        } else if let Frame::AsyncTask { .. } = frame.frame {
             return Ok(Some(ret));
         }
     }
-    return unhandled_control_flow(ctx, location);
+    return Err(unhandled_control_flow(ctx, exec_ctx));
 }
 
 pub enum EvalResult<'a> {
@@ -442,33 +487,41 @@ pub enum EvalResult<'a> {
 pub fn eval_instruction<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    code: &Vec<Located<Instruction>>,
+    code: &Vec<Instruction>,
 ) -> Result<EvalResult<'a>, LocatedError<'a>> {
     let instruction = &code[exec_ctx.ip];
-    let location = &instruction.location;
     let env = exec_ctx.frame_stack.last().unwrap().env;
 
     /*
-    println!(
-        "Frames: {:?}",
-        exec_ctx
-            .frame_stack
-            .iter()
-            .map(|f| &f.frame)
-            .collect::<Vec<_>>()
-    );
-    println!(
-        "IP {}: {:?} at {}:{}",
-        exec_ctx.ip, instruction.data, instruction.location.module, instruction.location.span.start
-    );
+        println!(
+            "Frames: {:?}",
+            exec_ctx
+                .frame_stack
+                .iter()
+                .map(|f| &f.frame)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "Stack: {:?}",
+            exec_ctx
+                .stack
+                .iter()
+                .map(|f| value_to_string(f))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "IP {}: {:?} at {}",
+            exec_ctx.ip,
+            instruction,
+            ctx.root.source_map.borrow()[exec_ctx.ip].module
+        );
     */
-
-    match &instruction.data {
+    match instruction {
         Instruction::Exit => return Ok(EvalResult::Exit(exec_ctx.pop())),
         Instruction::InitializeModule(path) => {
             let module = ModuleTree::get(ctx.root.root_module, path);
             let Some(module) = module else {
-                return undefined_variable(ctx, &path.to_string(), location);
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             };
             let mut mod_ref = module.borrow_mut(ctx.mc);
             if !mod_ref.is_initialized
@@ -485,18 +538,18 @@ pub fn eval_instruction<'a>(
             let val = exec_ctx.stack[stack_len - n..].to_vec();
             exec_ctx.stack.extend(val);
         }
-        Instruction::Load(ident) => eval_identifier(ctx, exec_ctx, ident, env, location)?,
+        Instruction::Load(ident) => eval_identifier(ctx, exec_ctx, ident, env)?,
         Instruction::Store(ident) => {
             let val = exec_ctx.pop();
-            assign_identifier(ctx, ident, env, location, &val)?;
+            assign_identifier(ctx, exec_ctx, ident, env, &val)?;
             exec_ctx.push(val);
         }
         Instruction::Define(pattern) => {
             let value = exec_ctx.pop();
-            let pattern = resolve_pattern(ctx, pattern, location, value)?;
+            let pattern = resolve_pattern(ctx, exec_ctx, pattern, value)?;
             for (name, val) in pattern {
                 if !env.define(ctx, name, val) {
-                    return duplicate_variable_definition(ctx, name, location);
+                    return Err(duplicate_variable_definition(ctx, exec_ctx, name));
                 }
             }
         }
@@ -510,31 +563,35 @@ pub fn eval_instruction<'a>(
                 env: mod_env,
             }));
             if !mod_env.define_const(ctx, &canonical_path.item, item) {
-                return duplicate_variable_definition(ctx, &canonical_path.item, location);
+                return Err(duplicate_variable_definition(
+                    ctx,
+                    exec_ctx,
+                    &canonical_path.item,
+                ));
             }
         }
         Instruction::LoadProperty(field) => {
             let object = exec_ctx.pop();
-            let val = get_property(ctx, &object, field, location)?;
+            let val = get_property(ctx, exec_ctx, &object, field)?;
             exec_ctx.push(val);
         }
         Instruction::StoreProperty(field) => {
             let val = exec_ctx.pop();
             let object = exec_ctx.pop();
-            set_property(ctx, location, &object, field, &val)?;
+            set_property(ctx, exec_ctx, &object, field, &val)?;
             exec_ctx.push(val);
         }
         Instruction::LoadIndex => {
             let index = exec_ctx.pop();
             let array = exec_ctx.pop();
-            let res = get_at_index(ctx, location, &array, index)?;
+            let res = get_at_index(ctx, exec_ctx, &array, index)?;
             exec_ctx.push(res);
         }
         Instruction::StoreIndex => {
             let val = exec_ctx.pop();
             let index = exec_ctx.pop();
             let array = exec_ctx.pop();
-            set_at_index(ctx, location, &array, index, &val)?;
+            set_at_index(ctx, exec_ctx, &array, index, &val)?;
             exec_ctx.push(val);
         }
         Instruction::Pop => {
@@ -550,7 +607,7 @@ pub fn eval_instruction<'a>(
             exec_ctx.push(Value::String(ctx.gc(StringVariant::from_string(s))))
         }
         Instruction::PushArray(items) => {
-            let item_vec = pop_spread_args(ctx, exec_ctx, location, items)?;
+            let item_vec = pop_spread_args(ctx, exec_ctx, items)?;
             exec_ctx.push(Value::Array(ctx.gc_lock(item_vec)));
         }
         Instruction::PushObject(items) => {
@@ -570,11 +627,11 @@ pub fn eval_instruction<'a>(
                             entry_map.insert(k.clone(), v.clone());
                         }
                     } else {
-                        return type_error(
+                        return Err(type_error(
                             ctx,
+                            exec_ctx,
                             "Spread operator can only be applied to objects",
-                            &location,
-                        );
+                        ));
                     };
                 }
             }
@@ -582,10 +639,7 @@ pub fn eval_instruction<'a>(
         }
         Instruction::Raise => {
             let err = exec_ctx.pop();
-            return Err(LocatedError {
-                data: err,
-                location: location.clone(),
-            });
+            return Err(err);
         }
         Instruction::PushFunction(FunctionData {
             parameters,
@@ -611,7 +665,7 @@ pub fn eval_instruction<'a>(
         } => {
             let parent = if *parent {
                 let Value::Class(parent) = exec_ctx.pop() else {
-                    return type_error(ctx, "Parent must be a class", &location);
+                    return Err(type_error(ctx, exec_ctx, "Parent must be a class"));
                 };
                 Some(parent)
             } else {
@@ -672,20 +726,24 @@ pub fn eval_instruction<'a>(
         Instruction::MakeInstance => {
             let inner = exec_ctx.pop();
             let Value::Class(class) = exec_ctx.pop() else {
-                return type_error(ctx, "Attempted to instantiate a non-class value", &location);
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Attempted to instantiate a non-class value",
+                ));
             };
             let instance = Value::ClassInstance(ctx.gc_lock(ClassInstanceValue { inner, class }));
             exec_ctx.push(instance);
         }
         Instruction::Break => {
-            bubble_control_flow(ctx, exec_ctx, true, &location)?;
+            bubble_control_flow(ctx, exec_ctx, true)?;
         }
         Instruction::Continue => {
-            bubble_control_flow(ctx, exec_ctx, false, &location)?;
+            bubble_control_flow(ctx, exec_ctx, false)?;
         }
         Instruction::Return => {
             let ret = exec_ctx.pop();
-            match bubble_return(ctx, exec_ctx, ret, &location)? {
+            match bubble_return(ctx, exec_ctx, ret)? {
                 Some(val) => return Ok(EvalResult::Exit(val)),
                 None => {}
             }
@@ -700,7 +758,7 @@ pub fn eval_instruction<'a>(
                     exec_ctx.jump(*target);
                 }
             } else {
-                return type_error(ctx, "Condition must be a boolean", &location);
+                return Err(type_error(ctx, exec_ctx, "Condition must be a boolean"));
             };
         }
         Instruction::EnterBlock => {
@@ -719,7 +777,11 @@ pub fn eval_instruction<'a>(
         } => {
             let filter_class = if *filtered {
                 let Value::Class(class) = exec_ctx.pop() else {
-                    return type_error(ctx, "Expected class for exception filter", location);
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "Expected class for exception filter",
+                    ));
                 };
                 Some(class)
             } else {
@@ -729,6 +791,7 @@ pub fn eval_instruction<'a>(
         }
         Instruction::ExitFrame => match exec_ctx.pop_frame().frame {
             Frame::Function {
+                source_ip: _,
                 return_ip,
                 stack_height,
             } => {
@@ -744,25 +807,29 @@ pub fn eval_instruction<'a>(
                 debug_assert_eq!(exec_ctx.stack.len(), stack_height + 1);
             }
             Frame::Simple => {}
-            Frame::AsyncTask => {
+            Frame::AsyncTask { .. } => {
                 debug_assert_eq!(exec_ctx.stack.len(), 1); // Plus return value
                 return Ok(EvalResult::Exit(exec_ctx.pop()));
             }
         },
         Instruction::CallFunction(args) => {
-            let args = pop_spread_args(ctx, exec_ctx, location, args)?;
+            let args = pop_spread_args(ctx, exec_ctx, args)?;
             let function = exec_ctx.pop();
             let Value::Function(f) = function else {
-                return type_error(ctx, "Attempted to call a non-function value", location);
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Attempted to call a non-function value",
+                ));
             };
             if f.borrow().is_async {
                 let mut new_exec_ctx = ExecContext::new(); //IP will be set by call_function
-                call_function(ctx, &mut new_exec_ctx, location, env, args, &function)?;
+                call_function(ctx, &mut new_exec_ctx, env, args, &function)?;
                 let new_task = ctx.gc_lock(FutureValue::Pending(Task::Exec(new_exec_ctx)));
                 exec_ctx.push(Value::Future(new_task));
                 return Ok(EvalResult::AddNewTask(new_task));
             } else {
-                call_function(ctx, exec_ctx, location, env, args, &function)?;
+                call_function(ctx, exec_ctx, env, args, &function)?;
             }
         }
         Instruction::TryShortCircuit(op, target) => {
@@ -773,11 +840,11 @@ pub fn eval_instruction<'a>(
         Instruction::BinaryOp(op) => {
             let right = exec_ctx.pop();
             let left = exec_ctx.pop();
-            interpret_binary_op(ctx, exec_ctx, op, left, right, location, env)?;
+            interpret_binary_op(ctx, exec_ctx, op, left, right, env)?;
         }
         Instruction::UnaryOp(op) => {
             let val = exec_ctx.pop();
-            interpret_unary_op(ctx, exec_ctx, op, val, location, env)?;
+            interpret_unary_op(ctx, exec_ctx, op, val, env)?;
         }
         Instruction::CallConstructor(arg_count) => {
             let mut args = Vec::with_capacity(*arg_count);
@@ -786,27 +853,24 @@ pub fn eval_instruction<'a>(
             }
             args.reverse();
             let Value::Class(class) = exec_ctx.pop() else {
-                return type_error(
+                return Err(type_error(
                     ctx,
+                    exec_ctx,
                     "Attempted to call constructor on a non-class value",
-                    location,
-                );
+                ));
             };
             let class_ref = class.borrow();
             let Some(constructor) = &class_ref.constructor else {
-                return cannot_instantiate(ctx, "Class does not have a constructor", location);
+                return Err(cannot_instantiate(
+                    ctx,
+                    exec_ctx,
+                    "Class does not have a constructor",
+                ));
             };
 
             exec_ctx.push(Value::Class(class));
 
-            call_function(
-                ctx,
-                exec_ctx,
-                location,
-                env,
-                args,
-                &Value::Function(*constructor),
-            )?;
+            call_function(ctx, exec_ctx, env, args, &Value::Function(*constructor))?;
         }
         Instruction::StartInitializeLazy(path) => {
             let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
@@ -814,29 +878,33 @@ pub fn eval_instruction<'a>(
                 let env = module_tree.borrow().env;
                 env.get(&path.item)
             } else {
-                return undefined_variable(ctx, &path.to_string(), location);
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             };
             let Some(lazy) = lazy else {
-                return undefined_variable(ctx, &path.to_string(), location);
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             };
             let Value::Lazy(lazy_ref) = lazy else {
-                return type_error(ctx, "Attempted to initialize a non-lazy value", location);
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Attempted to initialize a non-lazy value",
+                ));
             };
             let mut lazy_borrow = lazy_ref.borrow_mut(ctx.mc);
             match &*lazy_borrow {
                 LazyValue::Initialized(_) => {
-                    return type_error(
+                    return Err(type_error(
                         ctx,
+                        exec_ctx,
                         "Attempted to initialize an already initialized lazy value",
-                        location,
-                    );
+                    ));
                 }
                 LazyValue::BeingInitialized => {
-                    return cyclic_static_initialization(
+                    return Err(cyclic_static_initialization(
                         ctx,
+                        exec_ctx,
                         &Identifier::Scoped(path.clone()),
-                        location,
-                    );
+                    ));
                 }
                 _ => {
                     *lazy_borrow = LazyValue::BeingInitialized;
@@ -849,23 +917,27 @@ pub fn eval_instruction<'a>(
                 let env = module_tree.borrow().env;
                 env.get(&path.item)
             } else {
-                return undefined_variable(ctx, &path.to_string(), location);
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             };
             let Some(lazy) = lazy else {
-                return undefined_variable(ctx, &path.to_string(), location);
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             };
             let Value::Lazy(lazy_ref) = lazy else {
-                return type_error(ctx, "Attempted to initialize a non-lazy value", location);
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Attempted to initialize a non-lazy value",
+                ));
             };
             let value = exec_ctx.pop();
             let mut lazy_borrow = lazy_ref.borrow_mut(ctx.mc);
             match &*lazy_borrow {
                 LazyValue::Initialized(_) => {
-                    return type_error(
+                    return Err(type_error(
                         ctx,
+                        exec_ctx,
                         "Attempted to initialize an already initialized lazy value",
-                        location,
-                    );
+                    ));
                 }
                 _ => {
                     *lazy_borrow = LazyValue::Initialized(value.clone());
@@ -880,7 +952,11 @@ pub fn eval_instruction<'a>(
         Instruction::Await => {
             let future = exec_ctx.peek();
             let Value::Future(future_ref) = future else {
-                return type_error(ctx, "Attempted to await a non-future value", location);
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Attempted to await a non-future value",
+                ));
             };
             let future_borrow = future_ref.borrow();
             match &*future_borrow {
@@ -889,12 +965,9 @@ pub fn eval_instruction<'a>(
                     exec_ctx.pop();
                     exec_ctx.push(value.clone());
                 }
-                FutureValue::Failed(error, error_location) => {
+                FutureValue::Failed(error) => {
                     exec_ctx.pop();
-                    return Err(LocatedError {
-                        data: error.clone(),
-                        location: error_location.0.clone(),
-                    });
+                    return Err(error.clone());
                 }
                 FutureValue::Pending(_) => {
                     return Ok(EvalResult::Yield);
@@ -908,7 +981,6 @@ pub fn eval_instruction<'a>(
 fn pop_spread_args<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    location: &Location,
     items: &Vec<bool>,
 ) -> Result<Vec<Value<'a>>, LocatedError<'a>> {
     let mut items: Vec<(Value<'a>, bool)> = items
@@ -924,11 +996,11 @@ fn pop_spread_args<'a>(
                 let arr_ref = arr.borrow();
                 item_vec.extend_from_slice(&arr_ref);
             } else {
-                return type_error(
+                return Err(type_error(
                     ctx,
+                    exec_ctx,
                     "Spread operator can only be applied to arrays",
-                    &location,
-                );
+                ));
             }
         } else {
             item_vec.push(item);
@@ -939,7 +1011,7 @@ fn pop_spread_args<'a>(
 
 fn set_at_index<'a>(
     ctx: &Context<'a>,
-    location: &Location,
+    exec_ctx: &ExecContext<'a>,
     array: &Value<'a>,
     index: Value<'a>,
     result: &Value<'a>,
@@ -956,7 +1028,7 @@ fn set_at_index<'a>(
     match array {
         Value::Array(arr) => {
             let Value::Integer(i) = index else {
-                return type_error(ctx, "Array index must be an integer", location);
+                return Err(type_error(ctx, exec_ctx, "Array index must be an integer"));
             };
             let mut arr_ref = arr.borrow_mut(ctx.mc);
             if let Some(index) = i.try_to_usize()
@@ -965,18 +1037,18 @@ fn set_at_index<'a>(
                 arr_ref[index] = result.clone();
                 Ok(())
             } else {
-                array_index_out_of_bounds(ctx, i, location)
+                Err(array_index_out_of_bounds(ctx, exec_ctx, i))
             }
         }
-        Value::String(_) => type_error(
+        Value::String(_) => Err(type_error(
             ctx,
+            exec_ctx,
             "Strings are immutable; cannot assign to index",
-            location,
-        ),
+        )),
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             let Value::String(s) = index else {
-                return type_error(ctx, "Object index must be an string", location);
+                return Err(type_error(ctx, exec_ctx, "Object index must be an string"));
             };
             let s = s.to_string();
             if obj_ref.contains_key(&s) {
@@ -985,7 +1057,7 @@ fn set_at_index<'a>(
                 obj_ref.insert(s, result.clone());
                 Ok(())
             } else {
-                field_access_error(ctx, &s, location)
+                Err(field_access_error(ctx, exec_ctx, &s))
             }
         }
         Value::TypedBuffer {
@@ -993,32 +1065,43 @@ fn set_at_index<'a>(
             buffer_type,
         } => {
             let Value::Integer(i) = index else {
-                return type_error(ctx, "Array index must be an integer", location);
+                return Err(type_error(ctx, exec_ctx, "Array index must be an integer"));
             };
             if let Some(index) = i.try_to_usize() {
                 if let Some(_) = buffer_type.try_write_buffer(ctx, *buffer, index, result) {
                     Ok(())
                 } else {
-                    type_error(ctx, "Failed to write value to typed buffer", location)
+                    Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "Failed to write value to typed buffer",
+                    ))
                 }
             } else {
-                array_index_out_of_bounds(ctx, i, location)
+                Err(array_index_out_of_bounds(ctx, exec_ctx, i))
             }
         }
-        _ => type_error(ctx, "Attempted to index a non-array value", location),
+        _ => Err(type_error(
+            ctx,
+            exec_ctx,
+            "Attempted to index a non-array value",
+        )),
     }
 }
 
 fn call_function<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    location: &Location,
     env: Gc<'a, Environment<'a>>,
     args: Vec<Value<'a>>,
     function: &Value<'a>,
 ) -> Result<(), LocatedError<'a>> {
     let Value::Function(f) = function else {
-        return type_error(ctx, "Attempted to call a non-function value", location);
+        return Err(type_error(
+            ctx,
+            exec_ctx,
+            "Attempted to call a non-function value",
+        ));
     };
     let f_ref = f.borrow();
     let is_async = f_ref.is_async;
@@ -1034,7 +1117,7 @@ fn call_function<'a>(
     match *func {
         FunctionValueType::Builtin { ref func } => {
             // No call environment for builtin functions, as they won't define variables
-            exec_ctx.push(func(ctx, args, location, env)?);
+            exec_ctx.push(func(ctx, exec_ctx, args, env)?);
             Ok(())
         }
         FunctionValueType::Function {
@@ -1046,14 +1129,14 @@ fn call_function<'a>(
             let param_len = parameters.parameters.len();
             if let Some(rest) = &parameters.rest_parameter {
                 if args_len < param_len {
-                    type_error(
+                    Err(type_error(
                         ctx,
+                        exec_ctx,
                         &format!(
                             "Expected at least {} arguments, got {}",
                             param_len, args_len
                         ),
-                        location,
-                    )
+                    ))
                 } else {
                     let call_env = ctx.gc(Environment::new(ctx, func_env));
                     let mut args_iter = args.into_iter();
@@ -1070,11 +1153,11 @@ fn call_function<'a>(
                 }
             } else {
                 if args_len != param_len {
-                    type_error(
+                    Err(type_error(
                         ctx,
+                        exec_ctx,
                         &format!("Expected {} arguments, got {}", param_len, args_len),
-                        location,
-                    )
+                    ))
                 } else {
                     let call_env = ctx.gc(Environment::new(ctx, func_env));
                     for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
@@ -1103,31 +1186,32 @@ fn interpret_unary_op<'a>(
     exec_ctx: &mut ExecContext<'a>,
     op: &UnaryOp,
     value: Value<'a>,
-    location: &Location,
     env: Gc<'a, Environment<'a>>,
 ) -> Result<(), LocatedError<'a>> {
     if let Value::ClassInstance(_) = &value {
-        if let Ok(method) = get_property(ctx, &value, op.method_name(), location) {
-            return call_function(ctx, exec_ctx, location, env, vec![], &method);
+        if let Ok(method) = get_property(ctx, exec_ctx, &value, op.method_name()) {
+            return call_function(ctx, exec_ctx, env, vec![], &method);
         }
     }
-    let res = interpret_simple_unary_op(ctx, op, value, location)?;
+    let res = interpret_simple_unary_op(ctx, exec_ctx, op, value)?;
     exec_ctx.push(res);
     Ok(())
 }
 
 fn interpret_simple_unary_op<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     op: &UnaryOp,
     value: Value<'a>,
-    location: &Location,
 ) -> Result<Value<'a>, LocatedError<'a>> {
     Ok(match (op, value) {
         (UnaryOp::Negate, Value::Number(v)) => Value::Number(-v),
         (UnaryOp::Negate, Value::Integer(v)) => Value::Integer(v.neg()),
         (UnaryOp::Not, Value::Integer(v)) => Value::Integer(v.invert()),
         (UnaryOp::Not, Value::Bool(v)) => Value::Bool(!v),
-        (_, v) => return unsupported_unary_operation(ctx, op, &v, location),
+        (_, v) => {
+            return Err(unsupported_unary_operation(ctx, exec_ctx, op, &v));
+        }
     })
 }
 
@@ -1137,25 +1221,24 @@ fn interpret_binary_op<'a>(
     op: &BinaryOp,
     left: Value<'a>,
     right: Value<'a>,
-    location: &Location,
     env: Gc<'a, Environment<'a>>,
 ) -> Result<(), LocatedError<'a>> {
     if let Value::ClassInstance(_) = &left {
-        if let Ok(method) = get_property(ctx, &left, op.method_name(), location) {
-            return call_function(ctx, exec_ctx, location, env, vec![right], &method);
+        if let Ok(method) = get_property(ctx, exec_ctx, &left, op.method_name()) {
+            return call_function(ctx, exec_ctx, env, vec![right], &method);
         }
     }
-    let res = interpret_simple_binary_op(ctx, op, left, right, location)?;
+    let res = interpret_simple_binary_op(ctx, exec_ctx, op, left, right)?;
     exec_ctx.push(res);
     Ok(())
 }
 
 fn interpret_simple_binary_op<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     op: &BinaryOp,
     left: Value<'a>,
     right: Value<'a>,
-    location: &Location,
 ) -> Result<Value<'a>, LocatedError<'a>> {
     Ok(match (op, left, right) {
         (BinaryOp::Add, Value::Number(l), Value::Number(r)) => Value::Number(l + r),
@@ -1174,18 +1257,16 @@ fn interpret_simple_binary_op<'a>(
         (BinaryOp::Multiply, Value::Number(l), Value::Integer(r)) => Value::Number(l * r.to_f64()),
 
         (BinaryOp::Divide, Value::Number(l), Value::Number(r)) => Value::Number(l / r),
-        (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => Value::Integer(
-            l.div(r)
-                .ok_or_else(|| division_by_zero::<Value<'a>>(ctx, location).unwrap_err())?,
-        ),
+        (BinaryOp::Divide, Value::Integer(l), Value::Integer(r)) => {
+            Value::Integer(l.div(r).ok_or_else(|| division_by_zero(ctx, exec_ctx))?)
+        }
         (BinaryOp::Divide, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() / r),
         (BinaryOp::Divide, Value::Number(l), Value::Integer(r)) => Value::Number(l / r.to_f64()),
 
         (BinaryOp::Modulo, Value::Number(l), Value::Number(r)) => Value::Number(l % r),
-        (BinaryOp::Modulo, Value::Integer(l), Value::Integer(r)) => Value::Integer(
-            l.rem(r)
-                .ok_or_else(|| division_by_zero::<Value<'a>>(ctx, location).unwrap_err())?,
-        ),
+        (BinaryOp::Modulo, Value::Integer(l), Value::Integer(r)) => {
+            Value::Integer(l.rem(r).ok_or_else(|| division_by_zero(ctx, exec_ctx))?)
+        }
         (BinaryOp::Modulo, Value::Integer(l), Value::Number(r)) => Value::Number(l.to_f64() % r),
         (BinaryOp::Modulo, Value::Number(l), Value::Integer(r)) => Value::Number(l % r.to_f64()),
 
@@ -1218,7 +1299,9 @@ fn interpret_simple_binary_op<'a>(
         }
 
         (_, left, right) => {
-            return unsupported_binary_operation(ctx, op, &left, &right, location);
+            return Err(unsupported_binary_operation(
+                ctx, exec_ctx, op, &left, &right,
+            ));
         }
     })
 }
@@ -1269,9 +1352,9 @@ fn get_classes<'a>(
 
 fn get_property<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     target: &Value<'a>,
     field: &str,
-    location: &Location,
 ) -> Result<Value<'a>, LocatedError<'a>> {
     let inner_target = if let Value::ClassInstance(instance) = target {
         let mut cur = *instance;
@@ -1336,13 +1419,13 @@ fn get_property<'a>(
     {
         res
     } else {
-        field_access_error(ctx, field, location)
+        Err(field_access_error(ctx, exec_ctx, field))
     }
 }
 
 fn get_at_index<'a>(
     ctx: &Context<'a>,
-    location: &Location,
+    exec_ctx: &ExecContext<'a>,
     array: &Value<'a>,
     index: Value<'a>,
 ) -> Result<Value<'a>, LocatedError<'a>> {
@@ -1358,7 +1441,7 @@ fn get_at_index<'a>(
     match array {
         Value::Array(arr) => {
             let Value::Integer(i) = index else {
-                return type_error(ctx, "Array index must be an integer", location);
+                return Err(type_error(ctx, exec_ctx, "Array index must be an integer"));
             };
             let arr_ref = arr.borrow();
             if let Some(index) = i.try_to_usize()
@@ -1367,20 +1450,20 @@ fn get_at_index<'a>(
                 let value = arr_ref[index].clone();
                 Ok(value)
             } else {
-                array_index_out_of_bounds(ctx, i, location)
+                Err(array_index_out_of_bounds(ctx, exec_ctx, i))
             }
         }
         Value::String(s) => {
             let Value::Integer(i) = index else {
-                return type_error(ctx, "String index must be an integer", location);
+                return Err(type_error(ctx, exec_ctx, "String index must be an integer"));
             };
             if let Some(index) = i.try_to_usize() {
                 let Some(value) = StringVariant::slice(ctx, *s, index, 1) else {
-                    return array_index_out_of_bounds(ctx, i, location);
+                    return Err(array_index_out_of_bounds(ctx, exec_ctx, i));
                 };
                 Ok(Value::String(value))
             } else {
-                array_index_out_of_bounds(ctx, i, location)
+                Err(array_index_out_of_bounds(ctx, exec_ctx, i))
             }
         }
         Value::TypedBuffer {
@@ -1388,41 +1471,45 @@ fn get_at_index<'a>(
             buffer_type,
         } => {
             let Value::Integer(i) = index else {
-                return type_error(ctx, "Array index must be an integer", location);
+                return Err(type_error(ctx, exec_ctx, "Array index must be an integer"));
             };
             if let Some(index) = i.try_to_usize() {
                 if let Some(value) = buffer_type.try_read_buffer(*buffer, index) {
                     Ok(value)
                 } else {
-                    type_error(ctx, "Failed to read value from typed slice", location)
+                    Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "Failed to read value from typed slice",
+                    ))
                 }
             } else {
-                array_index_out_of_bounds(ctx, i, &location)
+                Err(array_index_out_of_bounds(ctx, exec_ctx, i))
             }
         }
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             let Value::String(s) = index else {
-                return type_error(ctx, "Object index must be an string", location);
+                return Err(type_error(ctx, exec_ctx, "Object index must be an string"));
             };
             let s = s.to_string();
             if let Some(value) = obj_ref.get(&s).cloned() {
                 Ok(value)
             } else {
-                field_access_error(ctx, &s, location)
+                Err(field_access_error(ctx, exec_ctx, &s))
             }
         }
-        _ => type_error(
+        _ => Err(type_error(
             ctx,
+            exec_ctx,
             &format!("Attempted to index a value of type: {}", array.get_type()),
-            &location,
-        ),
+        )),
     }
 }
 
 fn set_property<'a>(
     ctx: &Context<'a>,
-    location: &Location,
+    exec_ctx: &ExecContext<'a>,
     object: &Value<'a>,
     field: &String,
     result: &Value<'a>,
@@ -1441,11 +1528,11 @@ fn set_property<'a>(
             obj.borrow_mut(ctx.mc).insert(field.clone(), result.clone());
             Ok(())
         }
-        _ => type_error(
+        _ => Err(type_error(
             ctx,
+            exec_ctx,
             "Attempted to assign field on non-object value",
-            &location,
-        ),
+        )),
     }
 }
 
@@ -1468,7 +1555,6 @@ fn eval_identifier<'a>(
     exec_ctx: &mut ExecContext<'a>,
     ident: &Identifier,
     env: Gc<'a, Environment<'a>>,
-    location: &Location,
 ) -> Result<(), LocatedError<'a>> {
     let val = match ident {
         Identifier::Simple(name) => env.get(name),
@@ -1478,21 +1564,21 @@ fn eval_identifier<'a>(
                 let env = module_tree.borrow().env;
                 env.get(&path.item)
             } else {
-                return undefined_variable(ctx, &path.to_string(), location);
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             }
         }
     };
     let Some(val) = val else {
         let mut idents = Vec::new();
         env.collect_known_identifiers(&mut idents);
-        return undefined_identifier(ctx, ident, location);
+        return Err(undefined_identifier(ctx, exec_ctx, ident));
     };
     match val {
         Value::Lazy(lazy) => {
             let lazy_ref = lazy.borrow();
             match &*lazy_ref {
                 LazyValue::BeingInitialized => {
-                    return cyclic_static_initialization(ctx, ident, location);
+                    return Err(cyclic_static_initialization(ctx, exec_ctx, ident));
                 }
                 LazyValue::Initialized(v) => {
                     exec_ctx.push(v.clone());
@@ -1512,20 +1598,20 @@ fn eval_identifier<'a>(
 
 fn assign_identifier<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     ident: &Identifier,
     env: Gc<'a, Environment<'a>>,
-    location: &Location,
     value: &Value<'a>,
 ) -> Result<(), LocatedError<'a>> {
     match ident {
-        Identifier::Simple(name) => Environment::set(ctx, env, name, value.clone(), &location),
+        Identifier::Simple(name) => Environment::set(ctx, exec_ctx, env, name, value.clone()),
         Identifier::Scoped(path) => {
             let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
             if let Some(module_tree) = module_tree {
                 let env = module_tree.borrow().env;
-                Environment::set(ctx, env, &path.item, value.clone(), &location)
+                Environment::set(ctx, exec_ctx, env, &path.item, value.clone())
             } else {
-                undefined_variable(ctx, &path.to_string(), location)
+                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
             }
         }
     }
@@ -1533,27 +1619,31 @@ fn assign_identifier<'a>(
 
 fn resolve_pattern<'a, 'b>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     pattern: &'b Pattern,
-    location: &Location,
     value: Value<'a>,
 ) -> Result<Vec<(&'b String, Value<'a>)>, LocatedError<'a>> {
-    let mut stack = vec![(pattern, location, value)];
+    let mut stack = vec![(pattern, value)];
     let mut result = Vec::new();
-    while let Some((pattern, location, value)) = stack.pop() {
+    while let Some((pattern, value)) = stack.pop() {
         match &pattern {
             Pattern::Wildcard => continue,
             Pattern::Ident(name) => result.push((name, value.clone())),
             Pattern::Object { entries, rest } => {
                 let Value::Object(obj) = &value else {
-                    return type_error(ctx, "Expected object value for object pattern", location);
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "Expected object value for object pattern",
+                    ));
                 };
                 let obj_ref = obj.borrow();
                 let mut remaining_fields = obj_ref.clone();
                 for (item, pattern) in entries {
                     let Some(val) = remaining_fields.remove(item) else {
-                        return field_access_error(ctx, item, location);
+                        return Err(field_access_error(ctx, exec_ctx, item));
                     };
-                    stack.push((&pattern.data, &pattern.location, val.clone()));
+                    stack.push((&pattern.data, val.clone()));
                 }
                 if let Some(rest) = rest {
                     let rest_obj = Value::Object(ctx.gc_lock(remaining_fields));
@@ -1562,14 +1652,18 @@ fn resolve_pattern<'a, 'b>(
             }
             Pattern::Array { items, rest } => {
                 let Value::Array(arr) = &value else {
-                    return type_error(ctx, "Expected array value for array pattern", location);
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "Expected array value for array pattern",
+                    ));
                 };
                 let arr_ref = arr.borrow();
                 for (i, pattern) in items.iter().enumerate() {
                     let Some(val) = arr_ref.get(i) else {
-                        return index_out_of_bounds(ctx, i, location);
+                        return Err(index_out_of_bounds(ctx, exec_ctx, i));
                     };
-                    stack.push((&pattern.data, &pattern.location, val.clone()));
+                    stack.push((&pattern.data, val.clone()));
                 }
                 if let Some(rest) = rest
                     && items.len() <= arr_ref.len()

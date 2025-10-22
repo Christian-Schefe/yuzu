@@ -2,14 +2,18 @@ use std::collections::HashMap;
 
 use crate::{
     gc_interpreter::{
-        Context, Value, get_class_maybe_lazy, get_std_env,
-        value::{ClassInstanceValue, IntVariant, LocatedError, StringVariant},
+        Context, ExecContext, Value, get_class_maybe_lazy, get_std_env,
+        value::{ClassInstanceValue, IntVariant, StringVariant},
     },
-    location::HasLocation,
     parser::{BinaryOp, Identifier, UnaryOp},
 };
 
-fn make_exception<'a>(ctx: &Context<'a>, msg: &str, variant: &str) -> Value<'a> {
+pub fn runtime_error<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
+    msg: &str,
+    variant: &str,
+) -> Value<'a> {
     let std_env = get_std_env(ctx);
     let p = if let Some(c) = get_class_maybe_lazy(std_env, variant) {
         c
@@ -20,167 +24,144 @@ fn make_exception<'a>(ctx: &Context<'a>, msg: &str, variant: &str) -> Value<'a> 
         p
     };
 
+    let stack_trace = exec_ctx.get_stack_trace();
     let mut map = HashMap::new();
     map.insert(
         "message".to_string(),
         Value::String(ctx.gc(StringVariant::from_string(msg))),
     );
+    map.insert("stack_trace".to_string(), Value::StackTrace(stack_trace));
     Value::ClassInstance(ctx.gc_lock(ClassInstanceValue {
         inner: Value::Object(ctx.gc_lock(map)),
         class: p,
     }))
 }
 
-pub fn runtime_error<'a, T>(
-    ctx: &Context<'a>,
-    msg: &str,
-    variant: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    let exception = make_exception(ctx, msg, variant);
-    Err(LocatedError {
-        data: exception,
-        location: expr.location().clone(),
-    })
+pub fn type_error<'a>(ctx: &Context<'a>, exec_ctx: &ExecContext<'a>, msg: &str) -> Value<'a> {
+    runtime_error(ctx, exec_ctx, msg, "TypeError")
 }
 
-pub fn type_error<'a, T>(
+pub fn array_index_out_of_bounds<'a>(
     ctx: &Context<'a>,
-    msg: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(ctx, msg, "TypeError", expr)
-}
-
-pub fn array_index_out_of_bounds<'a, T>(
-    ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     index: IntVariant,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Array index out of bounds: {}", index),
         "ArrayIndexOutOfBounds",
-        expr,
     )
 }
 
-pub fn index_out_of_bounds<'a, T>(
+pub fn index_out_of_bounds<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     index: usize,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Array index out of bounds: {}", index),
         "ArrayIndexOutOfBounds",
-        expr,
     )
 }
 
-pub fn function_argument_error<'a, T>(
+pub fn function_argument_error<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     msg: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(ctx, msg, "FunctionArgumentError", expr)
+) -> Value<'a> {
+    runtime_error(ctx, exec_ctx, msg, "FunctionArgumentError")
 }
 
-pub fn io_error<'a, T>(
-    ctx: &Context<'a>,
-    msg: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(ctx, msg, "IOError", expr)
+pub fn io_error<'a>(ctx: &Context<'a>, exec_ctx: &ExecContext<'a>, msg: &str) -> Value<'a> {
+    runtime_error(ctx, exec_ctx, msg, "IOError")
 }
 
-pub fn unhandled_control_flow<'a, T>(
-    ctx: &Context<'a>,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(ctx, "Unhandled control flow", "RuntimeError", expr)
+pub fn unhandled_control_flow<'a>(ctx: &Context<'a>, exec_ctx: &ExecContext<'a>) -> Value<'a> {
+    runtime_error(ctx, exec_ctx, "Unhandled control flow", "RuntimeError")
 }
 
-pub fn field_access_error<'a, T>(
+pub fn field_access_error<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     field: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Field access error: {}", field),
         "FieldAccessError",
-        expr,
     )
 }
 
-pub fn cyclic_static_initialization<'a, T>(
+pub fn cyclic_static_initialization<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     name: &Identifier,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Cyclic static initialization: {}", name),
         "CyclicStaticInitialization",
-        expr,
     )
 }
 
-pub fn undefined_variable<'a, T>(
+pub fn undefined_variable<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     name: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Undefined variable: {}", name),
         "UndefinedVariable",
-        expr,
     )
 }
-pub fn undefined_identifier<'a, T>(
+
+pub fn undefined_identifier<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     name: &Identifier,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Undefined variable: {}", name),
         "UndefinedVariable",
-        expr,
     )
 }
 
-pub fn duplicate_variable_definition<'a, T>(
+pub fn duplicate_variable_definition<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     name: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Duplicate variable definition: {}", name),
         "DuplicateVariableDefinition",
-        expr,
     )
 }
 
-pub fn division_by_zero<'a, T>(
-    ctx: &Context<'a>,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(ctx, "Division by zero", "DivisionByZero", expr)
+pub fn division_by_zero<'a>(ctx: &Context<'a>, exec_ctx: &ExecContext<'a>) -> Value<'a> {
+    runtime_error(ctx, exec_ctx, "Division by zero", "DivisionByZero")
 }
 
-pub fn unsupported_binary_operation<'a, T>(
+pub fn unsupported_binary_operation<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     op: &BinaryOp,
     left: &Value<'a>,
     right: &Value<'a>,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!(
             "Unsupported operation: {} between {} and {}",
             op,
@@ -188,40 +169,39 @@ pub fn unsupported_binary_operation<'a, T>(
             right.get_type()
         ),
         "UnsupportedOperation",
-        expr,
     )
 }
-pub fn unsupported_unary_operation<'a, T>(
+pub fn unsupported_unary_operation<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     op: &UnaryOp,
     val: &Value<'a>,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Unsupported operation: {} on {}", op, val.get_type()),
         "UnsupportedOperation",
-        expr,
     )
 }
 
-pub fn cannot_assign_to_constant<'a, T>(
+pub fn cannot_assign_to_constant<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     name: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
+) -> Value<'a> {
     runtime_error(
         ctx,
+        exec_ctx,
         &format!("Cannot assign to constant: {}", name),
         "AssignmentToConstant",
-        expr,
     )
 }
 
-pub fn cannot_instantiate<'a, T>(
+pub fn cannot_instantiate<'a>(
     ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
     msg: &str,
-    expr: impl HasLocation,
-) -> Result<T, LocatedError<'a>> {
-    runtime_error(ctx, msg, "CannotInstantiate", expr)
+) -> Value<'a> {
+    runtime_error(ctx, exec_ctx, msg, "CannotInstantiate")
 }

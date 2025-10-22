@@ -461,6 +461,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
                 compile(expr, code);
                 code.push(located(Instruction::Await, expression));
             } else {
+                code.push(located(Instruction::PushNull, expression));
                 code.push(located(Instruction::Yield, expression));
             }
         }

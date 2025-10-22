@@ -153,6 +153,24 @@ export class Option {
     }
 }
 
+export class TcpListener {
+    constructor(address, port) {
+        let listener = intrinsics::tcp_listen(address, port);
+        {listener: listener}
+    }
+    async fn accept() {
+        while (true) {
+            let stream = intrinsics::tcp_accept(this.listener);
+            if (stream != null) {
+                return stream;
+            }
+            await;
+        }
+    }
+}
+
+print("Loading std.yuzu", TcpListener);
+
 //initialize lazy statics
 Array;
 Exception;

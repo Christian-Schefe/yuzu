@@ -10,7 +10,6 @@ use crate::{
         Context, ExecContext,
         exception::{cannot_assign_to_constant, undefined_variable},
     },
-    location::{Located, Location},
     parser::FunctionParameters,
 };
 
@@ -41,6 +40,7 @@ pub enum Value<'a> {
     },
     Lazy(GcRefLock<'a, LazyValue<'a>>),
     Future(GcRefLock<'a, FutureValue<'a>>),
+    StackTrace(Vec<CodePointer>),
 }
 
 #[derive(Collect)]
@@ -48,7 +48,7 @@ pub enum Value<'a> {
 pub enum FutureValue<'a> {
     Pending(Task<'a>),
     Completed(Value<'a>),
-    Failed(Value<'a>, StaticCollect<Location>),
+    Failed(Value<'a>),
 }
 
 #[derive(Collect)]
@@ -63,7 +63,7 @@ impl Debug for FutureValue<'_> {
         match self {
             FutureValue::Pending(_) => write!(f, "<pending future>"),
             FutureValue::Completed(v) => write!(f, "<completed future: {:?}>", v),
-            FutureValue::Failed(e, _) => write!(f, "<failed future: {:?}>", e),
+            FutureValue::Failed(e) => write!(f, "<failed future: {:?}>", e),
         }
     }
 }
@@ -488,8 +488,8 @@ pub enum FunctionValueType<'a> {
             Box<
                 dyn for<'b> Fn(
                     &Context<'b>,
+                    &ExecContext<'b>,
                     Vec<Value<'b>>,
-                    &Location,
                     Gc<'b, Environment<'b>>,
                 ) -> Result<Value<'b>, LocatedError<'b>>,
             >,
@@ -597,20 +597,20 @@ impl<'a> Environment<'a> {
 
     pub fn set(
         ctx: &Context<'a>,
+        exec_ctx: &ExecContext<'a>,
         env: Gc<'a, Environment<'a>>,
         name: &str,
         value: Value<'a>,
-        location: &Location,
     ) -> Result<(), LocatedError<'a>> {
         if let Some(EnvValue::Value(v)) = env.values.borrow_mut(ctx.mc).get_mut(name) {
             *v = value;
             Ok(())
         } else if let Some(_) = env.values.borrow_mut(ctx.mc).get_mut(name) {
-            cannot_assign_to_constant(ctx, name, location)
+            Err(cannot_assign_to_constant(ctx, exec_ctx, name))
         } else if let Some(parent) = &env.parent {
-            Environment::set(ctx, *parent, name, value, location)
+            Environment::set(ctx, exec_ctx, *parent, name, value)
         } else {
-            undefined_variable(ctx, name, location)
+            Err(undefined_variable(ctx, exec_ctx, name))
         }
     }
 
@@ -660,6 +660,7 @@ impl<'a> Value<'a> {
             Value::TypedBuffer { .. } => "TypedSlice",
             Value::Lazy(_) => "Lazy",
             Value::Future(_) => "Future",
+            Value::StackTrace(_) => "StackTrace",
         }
     }
 }
@@ -778,14 +779,17 @@ pub fn value_to_string(var: &Value) -> String {
             FutureValue::Completed(value) => {
                 format!("<future (completed): {}>", value_to_string(value))
             }
-            FutureValue::Failed(error, _) => {
+            FutureValue::Failed(error) => {
                 format!("<future (failed): {}>", value_to_string(error))
             }
         },
+        Value::StackTrace(trace) => {
+            format!("<stack trace: {:?}>", trace)
+        }
     }
 }
 
-pub type LocatedError<'a> = Located<Value<'a>>;
+pub type LocatedError<'a> = Value<'a>;
 
 #[derive(Collect)]
 #[collect(no_drop)]

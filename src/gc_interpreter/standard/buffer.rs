@@ -37,9 +37,9 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
         env.define_const(
             ctx,
             &format!("{}_of", name),
-            Value::Function(make_builtin_function(ctx, move |ctx, args, span, _| {
-                expect_arg_len(ctx, &args, 1, span)?;
-                let buf = expect_buffer_arg(ctx, &args[0], span)?;
+            Value::Function(make_builtin_function(ctx, move |ctx, exec_ctx, args, _| {
+                expect_arg_len(ctx, exec_ctx, &args, 1)?;
+                let buf = expect_buffer_arg(ctx, exec_ctx, &args[0])?;
                 Ok(Value::TypedBuffer {
                     buffer: buf.clone(),
                     buffer_type: buffer_type.clone(),
@@ -51,13 +51,13 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
     env.define_const(
         ctx,
         "typed_buffer_length",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             if args.len() != 1 {
-                return function_argument_error(
+                return Err(function_argument_error(
                     ctx,
+                    exec_ctx,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    expr,
-                );
+                ));
             }
             match &args[0] {
                 Value::TypedBuffer {
@@ -68,7 +68,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     Ok(Value::Integer(IntVariant::from_u64(length as u64)))
                 }
                 _ => {
-                    return type_error(ctx, "length can only be called on TypedSlice", expr);
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "length can only be called on TypedSlice",
+                    ));
                 }
             }
         })),
@@ -77,28 +81,28 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
     env.define_const(
         ctx,
         "buffer_length",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             if args.len() != 1 {
-                return function_argument_error(
+                return Err(function_argument_error(
                     ctx,
+                    exec_ctx,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    expr,
-                );
+                ));
             }
-            let buf = expect_buffer_arg(ctx, &args[0], expr)?;
+            let buf = expect_buffer_arg(ctx, exec_ctx, &args[0])?;
             Ok(Value::Integer(IntVariant::from_u64(buf.length as u64)))
         })),
     );
     env.define_const(
         ctx,
         "buffer_slice",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
-            expect_arg_len(ctx, &args, 3, expr)?;
-            let buf = expect_buffer_arg(ctx, &args[0], expr)?;
-            let start = expect_usize_arg(ctx, &args[1], expr)?;
-            let length = expect_usize_arg(ctx, &args[2], expr)?;
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 3)?;
+            let buf = expect_buffer_arg(ctx, exec_ctx, &args[0])?;
+            let start = expect_usize_arg(ctx, exec_ctx, &args[1])?;
+            let length = expect_usize_arg(ctx, exec_ctx, &args[2])?;
             let Some(slice) = buf.slice(start, length) else {
-                return index_out_of_bounds(ctx, start + length, expr);
+                return Err(index_out_of_bounds(ctx, exec_ctx, start + length));
             };
             Ok(Value::Buffer(ctx.gc(slice)))
         })),
@@ -107,13 +111,13 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
     env.define_const(
         ctx,
         "buffer_to_string",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             if args.len() != 1 {
-                return function_argument_error(
+                return Err(function_argument_error(
                     ctx,
+                    exec_ctx,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    expr,
-                );
+                ));
             }
             match &args[0] {
                 Value::Buffer(buf) => buf.with_slice(|slice| {
@@ -121,7 +125,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     Ok(Value::String(ctx.gc(StringVariant::from_string(&s))))
                 }),
                 _ => {
-                    return type_error(ctx, "to_string can only be called on Buffer", expr);
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "to_string can only be called on Buffer",
+                    ));
                 }
             }
         })),
@@ -129,13 +137,13 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
     env.define_const(
         ctx,
         "buffer_from_string",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             if args.len() != 1 {
-                return function_argument_error(
+                return Err(function_argument_error(
                     ctx,
+                    exec_ctx,
                     &format!("Expected 1 argument, got {}", args.len()),
-                    expr,
-                );
+                ));
             }
             match &args[0] {
                 Value::String(s) => {
@@ -147,7 +155,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     })))
                 }
                 _ => {
-                    return type_error(ctx, "from_string can only be called on String", expr);
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "from_string can only be called on String",
+                    ));
                 }
             }
         })),
@@ -155,9 +167,9 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
     env.define_const(
         ctx,
         "buffer_with_size",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
-            expect_arg_len(ctx, &args, 1, expr)?;
-            let size = expect_usize_arg(ctx, &args[0], expr)?;
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 1)?;
+            let size = expect_usize_arg(ctx, exec_ctx, &args[0])?;
             let buf = vec![0u8; size];
             Ok(Value::Buffer(ctx.gc(BufferValue {
                 buffer: ctx.gc_lock(buf),
@@ -169,16 +181,16 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
     env.define_const(
         ctx,
         "buffer_copy",
-        Value::Function(make_builtin_function(ctx, |ctx, args, expr, _| {
-            expect_arg_len(ctx, &args, 2, expr)?;
-            let src_buf = expect_buffer_arg(ctx, &args[0], expr)?;
-            let dst_buf = expect_buffer_arg(ctx, &args[1], expr)?;
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 2)?;
+            let src_buf = expect_buffer_arg(ctx, exec_ctx, &args[0])?;
+            let dst_buf = expect_buffer_arg(ctx, exec_ctx, &args[1])?;
             if src_buf.length != dst_buf.length {
-                return type_error(
+                return Err(type_error(
                     ctx,
+                    exec_ctx,
                     "Source and destination buffers must be the same length",
-                    expr,
-                );
+                ));
             }
             dst_buf.with_mut_slice(ctx, |dst_slice| {
                 src_buf.with_slice(|src_slice| {
