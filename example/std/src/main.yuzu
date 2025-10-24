@@ -123,11 +123,40 @@ export class BufferedReader {
         this.buffer.clear();
         line
     }
+    async fn readline_async() {
+        let has_read = false;
+        while (true) {
+            let buffer = intrinsics::buffer_with_size(1);
+            let bytes_read = await this.resource.read_async(buffer);
+            if (bytes_read == 0) {
+                break;
+            }
+            has_read = true;
+            let uint8_buffer = intrinsics::uint8_array_of(buffer);
+            let byte = uint8_buffer[0];
+            print("Read byte:", bytes_read, byte);
+            //ignore carriage returns
+            if (byte == 13) { // carriage return
+                continue;
+            }
+            if (byte == 10) { // newline
+                break;
+            }
+            this.buffer.push(byte);
+        }
+        if (!has_read) {
+            return null;
+        }
+        let line = intrinsics::buffer_to_string(this.buffer.as_slice());
+        this.buffer.clear();
+        line
+    }
 }
 
 export class Array {
     fn length() intrinsics::array_length(this);
     fn iter() new IndexIterator(this);
+    fn push(value) intrinsics::array_push(this, value);
 }
 
 export class Object {}

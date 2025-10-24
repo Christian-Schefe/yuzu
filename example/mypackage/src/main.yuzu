@@ -38,15 +38,22 @@ async fn main() {
         print("Caught exception:", e);
     }
 
-    1 + "";
+    let connections = [];
 
     let listener = new std::TcpListener("127.0.0.1", 8080);
     print("Listening on 127.0.0.1:8080");
-    let stream = await listener.accept();
-    print("Accepted connection", stream);
+    while (true) {
+        print("Waiting for connection...");
+        let stream = await listener.accept();
+        print("Accepted connection", connections.length(), stream);
+        connections.push(handle_connection(stream));
+    }
+}
+
+async fn handle_connection(stream) {
     let reader = new std::BufferedReader(stream);
     while (true) {
-        let line = reader.readline();
+        let line = await reader.readline_async();
         if (line == null) {
             break;
         }

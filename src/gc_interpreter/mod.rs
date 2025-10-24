@@ -128,7 +128,6 @@ fn convert_error<'a>(
     exec_ctx: &ExecContext<'a>,
     err: &Value<'a>,
 ) -> InterpretError {
-    println!("Err: {:?}", err);
     let (msg, stack_trace) = match err {
         Value::ClassInstance(ci) => {
             let ci_ref = ci.borrow();
@@ -165,7 +164,7 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Interpre
             if let Some(res) = arena.mutate(|mc, root| {
                 let ctx = Context { mc, root };
                 let code = ctx.root.code.borrow();
-                let mut executor = ctx.root.executor.borrow_mut(mc);
+                let executor = ctx.root.executor.borrow();
 
                 let Some(front) = executor.queue.front() else {
                     panic!("Executor queue is empty");
@@ -175,7 +174,11 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Interpre
                     panic!("Executor contained non-pending or non-exec task");
                 };
 
-                match eval_instruction(&ctx, exec_ctx, &code) {
+                drop(executor);
+                let res = eval_instruction(&ctx, exec_ctx, &code);
+                let mut executor = ctx.root.executor.borrow_mut(mc);
+
+                match res {
                     Ok(EvalResult::Exit(val)) => {
                         *task = FutureValue::Completed(val);
                         executor.queue.pop_front();
@@ -188,10 +191,6 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Interpre
                     }
                     Ok(EvalResult::Yield) => {
                         executor.cycle();
-                    }
-                    Ok(EvalResult::AddNewTask(new_task)) => {
-                        executor.enqueue(new_task);
-                        exec_ctx.advance();
                     }
                     Err(e) => match bubble_error(exec_ctx, e) {
                         None => {
@@ -478,7 +477,6 @@ pub enum EvalResult<'a> {
     Continue,
     Exit(Value<'a>),
     Yield,
-    AddNewTask(GcRefLock<'a, FutureValue<'a>>),
 }
 
 pub fn eval_instruction<'a>(
@@ -812,20 +810,7 @@ pub fn eval_instruction<'a>(
         Instruction::CallFunction(args) => {
             let args = pop_spread_args(ctx, exec_ctx, args)?;
             let function = exec_ctx.pop();
-            let Value::Function(f) = function else {
-                return Err(type_error(
-                    ctx,
-                    exec_ctx,
-                    "Attempted to call a non-function value",
-                ));
-            };
-            if f.borrow().is_async {
-                let new_task = call_async_function(ctx, exec_ctx, args, &function)?;
-                exec_ctx.push(Value::Future(new_task));
-                return Ok(EvalResult::AddNewTask(new_task));
-            } else {
-                call_function(ctx, exec_ctx, env, args, &function)?;
-            }
+            call_function(ctx, exec_ctx, env, args, &function)?;
         }
         Instruction::TryShortCircuit(op, target) => {
             if interpret_short_circuit(op, exec_ctx.stack.last().expect("Stack empty")) {
@@ -1099,13 +1084,7 @@ fn call_function<'a>(
         ));
     };
     let f_ref = f.borrow();
-    if f_ref.is_async {
-        return Err(type_error(
-            ctx,
-            exec_ctx,
-            "Attempted to call an async function in a non-async context",
-        ));
-    }
+    let is_async = f_ref.is_async;
 
     let args = f_ref
         .bound_args
@@ -1115,89 +1094,11 @@ fn call_function<'a>(
         .collect();
     let func = f_ref.func;
     drop(f_ref);
-    match *func {
+    let async_exec_ctx = match *func {
         FunctionValueType::Builtin { ref func } => {
             // No call environment for builtin functions, as they won't define variables
             exec_ctx.push(func(ctx, exec_ctx, args, env)?);
-            Ok(())
-        }
-        FunctionValueType::Function {
-            ref parameters,
-            body,
-            env: func_env,
-        } => {
-            let args_len = args.len();
-            let param_len = parameters.parameters.len();
-            if let Some(rest) = &parameters.rest_parameter {
-                if args_len < param_len {
-                    Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        &format!(
-                            "Expected at least {} arguments, got {}",
-                            param_len, args_len
-                        ),
-                    ))
-                } else {
-                    let call_env = ctx.gc(Environment::new(ctx, func_env));
-                    let mut args_iter = args.into_iter();
-                    for (param, arg) in parameters
-                        .parameters
-                        .iter()
-                        .zip(args_iter.by_ref().take(param_len))
-                    {
-                        call_env.define(ctx, param, arg);
-                    }
-                    call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
-                    exec_ctx.call_fn(call_env, body);
-                    Ok(())
-                }
-            } else {
-                if args_len != param_len {
-                    Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        &format!("Expected {} arguments, got {}", param_len, args_len),
-                    ))
-                } else {
-                    let call_env = ctx.gc(Environment::new(ctx, func_env));
-                    for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
-                        call_env.define(ctx, param, arg);
-                    }
-                    exec_ctx.call_fn(call_env, body);
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
-fn call_async_function<'a>(
-    ctx: &Context<'a>,
-    exec_ctx: &mut ExecContext<'a>,
-    args: Vec<Value<'a>>,
-    function: &Value<'a>,
-) -> Result<GcRefLock<'a, FutureValue<'a>>, LocatedError<'a>> {
-    let Value::Function(f) = function else {
-        return Err(type_error(
-            ctx,
-            exec_ctx,
-            "Attempted to call a non-function value",
-        ));
-    };
-    let f_ref = f.borrow();
-
-    let args = f_ref
-        .bound_args
-        .iter()
-        .cloned()
-        .chain(args.into_iter())
-        .collect::<Vec<_>>();
-    let func = f_ref.func;
-    drop(f_ref);
-    let new_exec_ctx = match *func {
-        FunctionValueType::Builtin { .. } => {
-            unreachable!("Builtin functions cannot be async");
+            return Ok(());
         }
         FunctionValueType::Function {
             ref parameters,
@@ -1227,6 +1128,10 @@ fn call_async_function<'a>(
                         call_env.define(ctx, param, arg);
                     }
                     call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
+                    if !is_async {
+                        exec_ctx.call_fn(call_env, body);
+                        return Ok(());
+                    }
                     exec_ctx.call_fn_async(call_env, body)
                 }
             } else {
@@ -1241,13 +1146,21 @@ fn call_async_function<'a>(
                     for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
                         call_env.define(ctx, param, arg);
                     }
+                    if !is_async {
+                        exec_ctx.call_fn(call_env, body);
+                        return Ok(());
+                    }
                     exec_ctx.call_fn_async(call_env, body)
                 }
             }
         }
     };
-    let new_task = ctx.gc_lock(FutureValue::Pending(Task::Exec(new_exec_ctx)));
-    Ok(new_task)
+
+    let new_task = ctx.gc_lock(FutureValue::Pending(Task::Exec(async_exec_ctx)));
+    exec_ctx.push(Value::Future(new_task));
+    let mut executor = ctx.root.executor.borrow_mut(ctx.mc);
+    executor.enqueue(new_task);
+    Ok(())
 }
 
 fn interpret_short_circuit<'a>(op: &BinaryOp, left: &Value<'a>) -> bool {
