@@ -26,7 +26,6 @@ use crate::{
             StringVariant, Task, Value, value_to_string,
         },
     },
-    location::Located,
     parser::{BinaryOp, Identifier, Pattern, UnaryOp},
 };
 
@@ -71,12 +70,17 @@ impl<'a> Context<'a> {
     }
 }
 
+pub struct InterpretError {
+    pub message: String,
+    pub trace: Vec<crate::location::Location>,
+}
+
 pub fn interpret_global(
     mut program: ParsedProgram,
     pwd: std::path::PathBuf,
     args: Vec<String>,
     main_module: String,
-) -> Result<(), Located<String>> {
+) -> Result<(), InterpretError> {
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
         let global_env = Gc::new(mc, Environment::new_global(mc));
         let root_module = ModuleTree::new(mc, global_env);
@@ -123,7 +127,7 @@ fn convert_error<'a>(
     ctx: &Context<'a>,
     exec_ctx: &ExecContext<'a>,
     err: &Value<'a>,
-) -> Located<String> {
+) -> InterpretError {
     println!("Err: {:?}", err);
     let (msg, stack_trace) = match err {
         Value::ClassInstance(ci) => {
@@ -143,21 +147,18 @@ fn convert_error<'a>(
         _ => (value_to_string(err), Vec::new()),
     };
     let source_map = ctx.root.source_map.borrow();
-    let stack_trace_str = stack_trace
+
+    let stack_trace = stack_trace
         .into_iter()
-        .map(|ip| {
-            let loc = source_map[ip].clone();
-            format!("  at {}:{}", loc.module, loc.span.start)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Located::new(
-        format!("Uncaught exception: {}\n{}", msg, stack_trace_str),
-        source_map[exec_ctx.ip].clone(),
-    )
+        .filter_map(|ip| source_map.0.get(ip).cloned())
+        .collect();
+    InterpretError {
+        message: msg,
+        trace: stack_trace,
+    }
 }
 
-pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Located<String>> {
+pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), InterpretError> {
     let instruction_batch_size = 1000;
     loop {
         for _ in 0..instruction_batch_size {
@@ -351,15 +352,11 @@ impl<'a> ExecContext<'a> {
         &mut self,
         env: Gc<'a, Environment<'a>>,
         func: CodePointer,
-        is_async: bool,
-    ) {
-        if is_async {
-            self.push_frame(Frame::AsyncTask { source_ip: self.ip }, env);
-            self.ip = func;
-            // no jump flag here since async calls switch to a new task instead of calling "advance"
-        } else {
-            self.call_fn(env, func);
-        }
+    ) -> ExecContext<'a> {
+        let mut new_exec_ctx = ExecContext::new();
+        new_exec_ctx.ip = func;
+        new_exec_ctx.push_frame(Frame::AsyncTask { source_ip: self.ip }, env);
+        new_exec_ctx
     }
     pub fn enter_loop(
         &mut self,
@@ -823,9 +820,7 @@ pub fn eval_instruction<'a>(
                 ));
             };
             if f.borrow().is_async {
-                let mut new_exec_ctx = ExecContext::new(); //IP will be set by call_function
-                call_function(ctx, &mut new_exec_ctx, env, args, &function)?;
-                let new_task = ctx.gc_lock(FutureValue::Pending(Task::Exec(new_exec_ctx)));
+                let new_task = call_async_function(ctx, exec_ctx, args, &function)?;
                 exec_ctx.push(Value::Future(new_task));
                 return Ok(EvalResult::AddNewTask(new_task));
             } else {
@@ -1104,7 +1099,13 @@ fn call_function<'a>(
         ));
     };
     let f_ref = f.borrow();
-    let is_async = f_ref.is_async;
+    if f_ref.is_async {
+        return Err(type_error(
+            ctx,
+            exec_ctx,
+            "Attempted to call an async function in a non-async context",
+        ));
+    }
 
     let args = f_ref
         .bound_args
@@ -1148,7 +1149,7 @@ fn call_function<'a>(
                         call_env.define(ctx, param, arg);
                     }
                     call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
-                    exec_ctx.call_fn_async(call_env, body, is_async);
+                    exec_ctx.call_fn(call_env, body);
                     Ok(())
                 }
             } else {
@@ -1163,12 +1164,90 @@ fn call_function<'a>(
                     for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
                         call_env.define(ctx, param, arg);
                     }
-                    exec_ctx.call_fn_async(call_env, body, is_async);
+                    exec_ctx.call_fn(call_env, body);
                     Ok(())
                 }
             }
         }
     }
+}
+
+fn call_async_function<'a>(
+    ctx: &Context<'a>,
+    exec_ctx: &mut ExecContext<'a>,
+    args: Vec<Value<'a>>,
+    function: &Value<'a>,
+) -> Result<GcRefLock<'a, FutureValue<'a>>, LocatedError<'a>> {
+    let Value::Function(f) = function else {
+        return Err(type_error(
+            ctx,
+            exec_ctx,
+            "Attempted to call a non-function value",
+        ));
+    };
+    let f_ref = f.borrow();
+
+    let args = f_ref
+        .bound_args
+        .iter()
+        .cloned()
+        .chain(args.into_iter())
+        .collect::<Vec<_>>();
+    let func = f_ref.func;
+    drop(f_ref);
+    let new_exec_ctx = match *func {
+        FunctionValueType::Builtin { .. } => {
+            unreachable!("Builtin functions cannot be async");
+        }
+        FunctionValueType::Function {
+            ref parameters,
+            body,
+            env: func_env,
+        } => {
+            let args_len = args.len();
+            let param_len = parameters.parameters.len();
+            if let Some(rest) = &parameters.rest_parameter {
+                if args_len < param_len {
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        &format!(
+                            "Expected at least {} arguments, got {}",
+                            param_len, args_len
+                        ),
+                    ));
+                } else {
+                    let call_env = ctx.gc(Environment::new(ctx, func_env));
+                    let mut args_iter = args.into_iter();
+                    for (param, arg) in parameters
+                        .parameters
+                        .iter()
+                        .zip(args_iter.by_ref().take(param_len))
+                    {
+                        call_env.define(ctx, param, arg);
+                    }
+                    call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
+                    exec_ctx.call_fn_async(call_env, body)
+                }
+            } else {
+                if args_len != param_len {
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        &format!("Expected {} arguments, got {}", param_len, args_len),
+                    ));
+                } else {
+                    let call_env = ctx.gc(Environment::new(ctx, func_env));
+                    for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
+                        call_env.define(ctx, param, arg);
+                    }
+                    exec_ctx.call_fn_async(call_env, body)
+                }
+            }
+        }
+    };
+    let new_task = ctx.gc_lock(FutureValue::Pending(Task::Exec(new_exec_ctx)));
+    Ok(new_task)
 }
 
 fn interpret_short_circuit<'a>(op: &BinaryOp, left: &Value<'a>) -> bool {

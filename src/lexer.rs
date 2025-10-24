@@ -2,6 +2,8 @@ use std::fmt;
 
 use logos::Logos;
 
+use crate::location::{LineIndex, Located, Location, Position};
+
 #[derive(Default, Debug, Clone, PartialEq)]
 pub enum LexingError {
     InvalidChar(String),
@@ -292,21 +294,32 @@ impl fmt::Display for Token<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LocatedToken<'a> {
-    pub token: Token<'a>,
-    pub span: core::ops::Range<usize>,
-}
+pub type LocatedToken<'a> = Located<Token<'a>>;
 
-pub fn lex(input: &str) -> Result<Vec<LocatedToken>, LocatedLexingError> {
+pub fn lex<'a>(
+    input: &'a str,
+    line_index: &LineIndex,
+) -> Result<Vec<LocatedToken<'a>>, LocatedLexingError> {
     let mut lexer = Token::lexer(input);
     let mut tokens = Vec::new();
     while let Some(token) = lexer.next() {
         let span = lexer.span();
-        let token = LocatedToken {
-            token: token?,
-            span,
+        let start_pos = line_index.line_col(span.start);
+        let end_pos = line_index.line_col(span.end);
+        let start_pos = Position {
+            index: span.start,
+            line: start_pos.0,
+            column: start_pos.1,
         };
+        let end_pos = Position {
+            index: span.end,
+            line: end_pos.0,
+            column: end_pos.1,
+        };
+        let token = Located::new(
+            token?,
+            Location::new(start_pos, end_pos, String::new(), String::new()),
+        );
         tokens.push(token);
     }
     Ok(tokens)

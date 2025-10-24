@@ -67,16 +67,29 @@ fn main() {
 
     let interpreted = gc_interpreter::interpret_global(parsed, pwd, args.other, main_module);
     if let Err(err) = interpreted {
-        let err_message = err.data;
+        let traceback_msg = err
+            .trace
+            .iter()
+            .rev()
+            .map(|loc| {
+                format!(
+                    "  at File \"{}\", line {}, module {}",
+                    loc.file_path, loc.start.line, loc.module
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let traceback_msg = format!("{}\n{}", err.message, traceback_msg);
+        let location = err.trace.last().expect("Traceback empty").clone();
         Report::build(
             ReportKind::Error,
-            (err.location.module.clone(), err.location.span.clone()),
+            (location.module.clone(), location.span()),
         )
         .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-        .with_message(err_message.clone())
+        .with_message(traceback_msg.clone())
         .with_label(
-            Label::new((err.location.module, err.location.span))
-                .with_message(err_message)
+            Label::new((location.module.clone(), location.span()))
+                .with_message(err.message)
                 .with_color(Color::Red),
         )
         .finish()

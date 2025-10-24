@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::{
     CanonicalPath,
-    location::Located,
+    location::{LineIndex, Located},
     parser::{BinaryOp, UnaryOp},
 };
 
@@ -319,17 +319,20 @@ pub fn desugar_iter_loop(
 }
 
 impl Located<Pattern> {
-    pub fn set_module(&mut self, module_path: &str) {
+    pub fn set_module(&mut self, module_path: &str, file_path: &str, line_index: &LineIndex) {
         self.location.module = module_path.to_string();
+        self.location.file_path = file_path.to_string();
+        self.location.update_position(line_index);
+
         match &mut self.data {
             Pattern::Wildcard => {}
             Pattern::Ident(_) => {}
             Pattern::Object { entries, rest: _ } => entries
                 .iter_mut()
-                .for_each(|(_, p)| p.set_module(module_path)),
-            Pattern::Array { items, rest: _ } => {
-                items.iter_mut().for_each(|e| e.set_module(module_path))
-            }
+                .for_each(|(_, p)| p.set_module(module_path, file_path, line_index)),
+            Pattern::Array { items, rest: _ } => items
+                .iter_mut()
+                .for_each(|e| e.set_module(module_path, file_path, line_index)),
         }
     }
 }
@@ -365,8 +368,11 @@ impl Display for FunctionParameters {
 }
 
 impl LocatedExpression {
-    pub fn set_module(&mut self, module_path: &str) {
+    pub fn set_module(&mut self, module_path: &str, file_path: &str, line_index: &LineIndex) {
         self.location.module = module_path.to_string();
+        self.location.file_path = file_path.to_string();
+        self.location.update_position(line_index);
+
         match &mut self.data {
             Expression::Number(_) => {}
             Expression::Integer(_) => {}
@@ -374,16 +380,18 @@ impl LocatedExpression {
             Expression::String(_) => {}
             Expression::ArrayLiteral(elements) => elements
                 .iter_mut()
-                .for_each(|e| e.0.set_module(module_path)),
+                .for_each(|e| e.0.set_module(module_path, file_path, line_index)),
             Expression::ObjectLiteral(fields) => fields
                 .iter_mut()
-                .for_each(|(_, v)| v.set_module(module_path)),
-            Expression::CanonicDefine { value, .. } => value.set_module(module_path),
+                .for_each(|(_, v)| v.set_module(module_path, file_path, line_index)),
+            Expression::CanonicDefine { value, .. } => {
+                value.set_module(module_path, file_path, line_index)
+            }
             Expression::FunctionLiteral {
                 body,
                 parameters: _,
                 is_async: _,
-            } => body.set_module(module_path),
+            } => body.set_module(module_path, file_path, line_index),
             Expression::ClassLiteral {
                 parent: _,
                 constructor,
@@ -391,9 +399,9 @@ impl LocatedExpression {
             } => {
                 properties
                     .iter_mut()
-                    .for_each(|(_, v, _)| v.set_module(module_path));
+                    .for_each(|(_, v, _)| v.set_module(module_path, file_path, line_index));
                 if let Some(constructor) = constructor {
-                    constructor.set_module(module_path);
+                    constructor.set_module(module_path, file_path, line_index);
                 }
             }
             Expression::Null => {}
@@ -402,22 +410,26 @@ impl LocatedExpression {
                 value,
                 op: _,
             } => {
-                target.set_module(module_path);
-                value.set_module(module_path);
+                target.set_module(module_path, file_path, line_index);
+                value.set_module(module_path, file_path, line_index);
             }
             Expression::BinaryOp { op: _, left, right } => {
-                left.set_module(module_path);
-                right.set_module(module_path);
+                left.set_module(module_path, file_path, line_index);
+                right.set_module(module_path, file_path, line_index);
             }
-            Expression::UnaryOp { op: _, expr } => expr.set_module(module_path),
+            Expression::UnaryOp { op: _, expr } => {
+                expr.set_module(module_path, file_path, line_index)
+            }
             Expression::Define { pattern, value } => {
-                pattern.set_module(module_path);
-                value.set_module(module_path);
+                pattern.set_module(module_path, file_path, line_index);
+                value.set_module(module_path, file_path, line_index);
             }
             Expression::Block(exprs, ret) => {
-                exprs.iter_mut().for_each(|e| e.set_module(module_path));
+                exprs
+                    .iter_mut()
+                    .for_each(|e| e.set_module(module_path, file_path, line_index));
                 if let Some(ret) = ret {
-                    ret.set_module(module_path);
+                    ret.set_module(module_path, file_path, line_index);
                 }
             }
             Expression::If {
@@ -425,10 +437,10 @@ impl LocatedExpression {
                 then_branch,
                 else_branch,
             } => {
-                condition.set_module(module_path);
-                then_branch.set_module(module_path);
+                condition.set_module(module_path, file_path, line_index);
+                then_branch.set_module(module_path, file_path, line_index);
                 if let Some(else_branch) = else_branch {
-                    else_branch.set_module(module_path);
+                    else_branch.set_module(module_path, file_path, line_index);
                 }
             }
             Expression::TryCatch {
@@ -437,11 +449,11 @@ impl LocatedExpression {
                 exception_var: _,
                 catch_block,
             } => {
-                try_block.set_module(module_path);
+                try_block.set_module(module_path, file_path, line_index);
                 if let Some(exception_prototype) = exception_prototype {
-                    exception_prototype.set_module(module_path);
+                    exception_prototype.set_module(module_path, file_path, line_index);
                 }
-                catch_block.set_module(module_path);
+                catch_block.set_module(module_path, file_path, line_index);
             }
             Expression::Loop {
                 init,
@@ -450,49 +462,49 @@ impl LocatedExpression {
                 body,
             } => {
                 if let Some(init) = init {
-                    init.set_module(module_path);
+                    init.set_module(module_path, file_path, line_index);
                 }
-                condition.set_module(module_path);
+                condition.set_module(module_path, file_path, line_index);
                 if let Some(increment) = increment {
-                    increment.set_module(module_path);
+                    increment.set_module(module_path, file_path, line_index);
                 }
-                body.set_module(module_path);
+                body.set_module(module_path, file_path, line_index);
             }
             Expression::Ident(_) => {}
             Expression::ArrayIndex { array, index } => {
-                array.set_module(module_path);
-                index.set_module(module_path);
+                array.set_module(module_path, file_path, line_index);
+                index.set_module(module_path, file_path, line_index);
             }
             Expression::FieldAccess { object, field: _ } => {
-                object.set_module(module_path);
+                object.set_module(module_path, file_path, line_index);
             }
             Expression::FunctionCall {
                 function,
                 arguments,
             } => {
-                function.set_module(module_path);
+                function.set_module(module_path, file_path, line_index);
                 arguments.into_iter().for_each(|(arg, _)| {
-                    arg.set_module(module_path);
+                    arg.set_module(module_path, file_path, line_index);
                 });
             }
             Expression::Break => {}
             Expression::Continue => {}
             Expression::Return(expr) => {
                 if let Some(expr) = expr {
-                    expr.set_module(module_path);
+                    expr.set_module(module_path, file_path, line_index);
                 }
             }
-            Expression::Raise(expr) => expr.set_module(module_path),
+            Expression::Raise(expr) => expr.set_module(module_path, file_path, line_index),
             Expression::Await(expr) => {
                 if let Some(expr) = expr {
-                    expr.set_module(module_path);
+                    expr.set_module(module_path, file_path, line_index);
                 }
             }
             Expression::New { expr, arguments } => {
-                expr.set_module(module_path);
+                expr.set_module(module_path, file_path, line_index);
                 arguments
                     .into_iter()
-                    .for_each(|arg| arg.set_module(module_path));
+                    .for_each(|arg| arg.set_module(module_path, file_path, line_index));
             }
         }
     }

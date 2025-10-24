@@ -7,7 +7,9 @@ use ariadne::{Color, Label, Report, ReportKind};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ModulePath, ParsedModuleTree, lexer,
+    ModulePath, ParsedModuleTree,
+    lexer::{self},
+    location::LineIndex,
     parser::{self, ParsedModuleItem},
 };
 
@@ -95,7 +97,13 @@ fn parse_module_tree(
     file_path: &PathBuf,
 ) -> Result<ParsedModuleTree, ()> {
     let contents = std::fs::read_to_string(&file_path).unwrap();
-    let pm = parse_string(&contents, path.get_root().to_string(), path.to_string())?;
+    let canonic_path_str = file_path.to_string_lossy().to_string();
+    let pm = parse_string(
+        &contents,
+        path.get_root().to_string(),
+        path.to_string(),
+        &canonic_path_str,
+    )?;
     let mut children = HashMap::new();
     let mut expressions = Vec::new();
     let mut exported_expressions = Vec::new();
@@ -125,7 +133,7 @@ fn parse_module_tree(
         if visited_files.contains(&child_file_path_str) {
             Report::build(
                 ReportKind::Error,
-                (child.location.module.clone(), child.location.span.clone()),
+                (child.location.module.clone(), child.location.span()),
             )
             .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
             .with_message(format!(
@@ -133,7 +141,7 @@ fn parse_module_tree(
                 child_module_path
             ))
             .with_label(
-                Label::new((child.location.module.clone(), child.location.span))
+                Label::new((child.location.module.clone(), child.location.span()))
                     .with_message("Module imported multiple times here")
                     .with_color(Color::Red),
             )
@@ -166,39 +174,48 @@ fn parse_module_tree(
 fn parse_string(
     input: &str,
     root_name: String,
-    location: String,
+    module_path: String,
+    file_path: &str,
 ) -> Result<Vec<ParsedModuleItem>, ()> {
-    let lexed = lexer::lex(input);
+    let line_index = LineIndex::new(input);
+    let lexed = lexer::lex(input, &line_index);
     if let Err(err) = lexed {
-        Report::build(ReportKind::Error, (location.clone(), err.span.clone()))
+        Report::build(ReportKind::Error, (module_path.clone(), err.span.clone()))
             .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
             .with_message(err.error.to_string())
             .with_label(
-                Label::new((location.clone(), err.span))
+                Label::new((module_path.clone(), err.span))
                     .with_message(err.error.to_string())
                     .with_color(Color::Red),
             )
             .finish()
-            .eprint(ariadne::sources(vec![(location.clone(), input)]))
+            .eprint(ariadne::sources(vec![(module_path.clone(), input)]))
             .unwrap();
         return Err(());
     }
-    match parser::parse(input, root_name, &location, lexed.unwrap()) {
+    match parser::parse(
+        input,
+        &line_index,
+        root_name,
+        &module_path,
+        file_path,
+        lexed.unwrap(),
+    ) {
         Err(errs) => {
             for err in errs {
                 Report::build(
                     ReportKind::Error,
-                    (location.clone(), err.span().into_range()),
+                    (module_path.clone(), err.span().into_range()),
                 )
                 .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
                 .with_message(err.to_string())
                 .with_label(
-                    Label::new((location.clone(), err.span().into_range()))
+                    Label::new((module_path.clone(), err.span().into_range()))
                         .with_message(err.reason().to_string())
                         .with_color(Color::Red),
                 )
                 .finish()
-                .eprint(ariadne::sources(vec![(location.clone(), input)]))
+                .eprint(ariadne::sources(vec![(module_path.clone(), input)]))
                 .unwrap();
             }
             Err(())

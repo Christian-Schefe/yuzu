@@ -10,7 +10,7 @@ use chumsky::{
 use crate::{
     CanonicalPath, ModulePath,
     lexer::{LocatedToken, Token},
-    location::{Located, Location},
+    location::{LineIndex, Located, Location, Position},
 };
 
 mod expression;
@@ -18,7 +18,20 @@ mod expression;
 pub use expression::*;
 
 fn located<T>(expr: T, span: SimpleSpan) -> Located<T> {
-    Located::new(expr, Location::new(span.into_range(), "".to_string()))
+    let start = Position {
+        index: span.start,
+        line: 0,
+        column: 0,
+    };
+    let end = Position {
+        index: span.end,
+        line: 0,
+        column: 0,
+    };
+    Located::new(
+        expr,
+        Location::new(start, end, String::new(), String::new()),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -891,22 +904,35 @@ where
 
 pub fn parse<'a>(
     source: &str,
+    line_index: &LineIndex,
     root_name: String,
+    module_path: &str,
     file_path: &str,
     tokens: Vec<LocatedToken<'a>>,
 ) -> Result<Vec<ParsedModuleItem>, Vec<Rich<'a, Token<'a>>>> {
-    let token_iter = tokens.into_iter().map(|lt| (lt.token, lt.span.into()));
+    let token_iter = tokens
+        .into_iter()
+        .map(|lt| (lt.data, lt.location.span().into()));
+    let source_len = source.len();
     let token_stream =
-        Stream::from_iter(token_iter).map((0..source.len()).into(), |(t, s): (_, _)| (t, s));
+        Stream::from_iter(token_iter).map((source_len..source_len).into(), |(t, s): (_, _)| (t, s));
     parser(root_name)
         .parse(token_stream)
         .into_result()
         .map(|mut pm| {
             for item in &mut pm {
                 match item {
-                    ParsedModuleItem::Expression(e) => e.set_module(file_path),
-                    ParsedModuleItem::ExportedExpression(e) => e.set_module(file_path),
-                    ParsedModuleItem::Module(m) => m.location.module = file_path.to_string(),
+                    ParsedModuleItem::Expression(e) => {
+                        e.set_module(module_path, file_path, line_index)
+                    }
+                    ParsedModuleItem::ExportedExpression(e) => {
+                        e.set_module(module_path, file_path, line_index)
+                    }
+                    ParsedModuleItem::Module(m) => {
+                        m.location.module = module_path.to_string();
+                        m.location.file_path = file_path.to_string();
+                        m.location.update_position(line_index);
+                    }
                 }
             }
             pm
