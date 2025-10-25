@@ -1,6 +1,5 @@
 use std::{collections::HashMap, path::PathBuf, vec};
 
-use ariadne::{Color, Label, Report, ReportKind};
 use clap::Parser;
 
 use crate::{
@@ -22,7 +21,8 @@ struct Args {
     other: Vec<String>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = match Args::try_parse() {
         Ok(a) => a,
         Err(e) => {
@@ -63,40 +63,7 @@ fn main() {
 
     let parsed = ParsedProgram { children: map };
 
-    let sources = parsed.get_sources();
-
-    let interpreted = gc_interpreter::interpret_global(parsed, pwd, args.other, main_module);
-    if let Err(err) = interpreted {
-        let traceback_msg = err
-            .trace
-            .iter()
-            .rev()
-            .map(|loc| {
-                format!(
-                    "  at File \"{}\", line {}, module {}",
-                    loc.file_path, loc.start.line, loc.module
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let traceback_msg = format!("{}\n{}", err.message, traceback_msg);
-        let location = err.trace.last().expect("Traceback empty").clone();
-        Report::build(
-            ReportKind::Error,
-            (location.module.clone(), location.span()),
-        )
-        .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-        .with_message(traceback_msg.clone())
-        .with_label(
-            Label::new((location.module.clone(), location.span()))
-                .with_message(err.message)
-                .with_color(Color::Red),
-        )
-        .finish()
-        .eprint(ariadne::sources(sources))
-        .unwrap();
-        std::process::exit(1);
-    }
+    gc_interpreter::interpret_global(parsed, pwd, args.other, main_module).await;
 }
 
 #[derive(Clone, Debug)]

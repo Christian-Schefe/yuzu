@@ -13,7 +13,8 @@ use crate::gc_interpreter::{
     },
     value::{
         BufferValue, ClassInstanceValue, ClassValue, Environment, FunctionValue, FunctionValueType,
-        FutureValue, IntVariant, LocatedError, StringVariant, Value, value_to_string,
+        FutureHandle, FutureValue, IntVariant, LocatedError, StringVariant, Task, Value,
+        value_to_string,
     },
 };
 
@@ -253,4 +254,34 @@ fn make_builtin_function<'a>(
         },
         false,
     ))
+}
+
+pub fn do_async<'a, T: 'static, F>(
+    ctx: &Context<'a>,
+    exec_ctx: &ExecContext<'a>,
+    fut: impl Future<Output = T> + 'static,
+    values: Vec<Value<'a>>,
+    handler: F,
+) -> Result<Value<'a>, Value<'a>>
+where
+    F: for<'b> Fn(
+            &Context<'b>,
+            &ExecContext<'b>,
+            T,
+            Vec<Value<'b>>,
+        ) -> Result<Value<'b>, Value<'b>>
+        + 'static,
+{
+    let ip = exec_ctx.ip;
+    let mut arena = ctx.root.future_arena.borrow_mut();
+    let future_id = arena.add_future(fut);
+    let handle = FutureHandle::new(future_id, values, move |ctx, values, res| {
+        let mut fake_exec_ctx = ExecContext::new();
+        fake_exec_ctx.ip = ip;
+
+        handler(ctx, &fake_exec_ctx, *res.downcast::<T>().unwrap(), values)
+    });
+    let task = ctx.gc_lock(FutureValue::Pending(Task::Future(handle)));
+    ctx.root.executor.borrow_mut(ctx.mc).enqueue(task);
+    Ok(Value::Future(task))
 }

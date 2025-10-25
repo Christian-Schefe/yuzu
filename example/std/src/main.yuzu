@@ -37,21 +37,21 @@ export class Integer {
 }
 export class String {}
 
+export class AsyncResource {
+    async fn close() {
+        await intrinsics::resource_close_async(this);
+    }
+    async fn read(buffer) {
+        await intrinsics::resource_read_async(this, buffer)
+    }
+}
+
 export class Resource {
     fn close() {
         intrinsics::resource_close(this);
     }
     fn read(buffer) {
         intrinsics::resource_read(this, buffer)
-    }
-    async fn read_async(buffer) {
-        while (true) {
-            let maybe_read = intrinsics::resource_try_read(this, buffer);
-            if (maybe_read != null) {
-                return maybe_read;
-            }
-            await;
-        }
     }
 }
 
@@ -127,7 +127,7 @@ export class BufferedReader {
         let has_read = false;
         while (true) {
             let buffer = intrinsics::buffer_with_size(1);
-            let bytes_read = await this.resource.read_async(buffer);
+            let bytes_read = await this.resource.read(buffer);
             if (bytes_read == 0) {
                 break;
             }
@@ -183,18 +183,13 @@ export class Option {
 }
 
 export class TcpListener {
-    constructor(address, port) {
-        let listener = intrinsics::tcp_listen(address, port);
-        {listener: listener}
+    constructor(listener) {listener: listener};
+    async static fn bind(address, port) {
+        new TcpListener(await intrinsics::tcp_listen_async(address, port))
     }
-    async fn accept() {
-        while (true) {
-            let stream = intrinsics::tcp_accept(this.listener);
-            if (stream != null) {
-                return stream;
-            }
-            await;
-        }
+    fn accept() {
+        print(this.listener);
+        intrinsics::tcp_accept_async(this.listener)
     }
 }
 
@@ -209,6 +204,7 @@ String;
 ClassInstance;
 Class;
 Resource;
+AsyncResource;
 Function;
 Object;
 Bool;

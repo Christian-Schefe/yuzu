@@ -1,9 +1,12 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
+    rc::Rc,
     sync::Arc,
     vec,
 };
 
+use ariadne::{Color, Label, Report, ReportKind};
 use gc_arena::{
     Arena, Collect, Gc, Mutation, Rootable, StaticCollect,
     lock::{GcRefLock, RefLock},
@@ -22,8 +25,8 @@ use crate::{
         resolver::compile_and_setup,
         value::{
             ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue,
-            FunctionValueType, FutureValue, IntVariant, LazyValue, LocatedError, ModuleTree,
-            StringVariant, Task, Value, value_to_string,
+            FunctionValueType, FutureArena, FutureValue, IntVariant, LazyValue, LocatedError,
+            ModuleTree, StringVariant, Task, Value, value_to_string,
         },
     },
     parser::{BinaryOp, Identifier, Pattern, UnaryOp},
@@ -47,6 +50,8 @@ pub struct MyRoot<'a> {
     pub code: GcRefLock<'a, StaticCollect<Arc<Vec<Instruction>>>>,
     pub global_env: Gc<'a, Environment<'a>>,
     pub executor: GcRefLock<'a, Executor<'a>>,
+    pub future_arena: Rc<RefCell<FutureArena>>,
+    pub sources: StaticCollect<Vec<(String, String)>>,
 }
 
 pub struct Context<'a> {
@@ -75,12 +80,12 @@ pub struct InterpretError {
     pub trace: Vec<crate::location::Location>,
 }
 
-pub fn interpret_global(
+pub async fn interpret_global(
     mut program: ParsedProgram,
     pwd: std::path::PathBuf,
     args: Vec<String>,
     main_module: String,
-) -> Result<(), InterpretError> {
+) {
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
         let global_env = Gc::new(mc, Environment::new_global(mc));
         let root_module = ModuleTree::new(mc, global_env);
@@ -107,6 +112,8 @@ pub fn interpret_global(
             source_map: GcRefLock::new(mc, RefLock::new(StaticCollect(Arc::new(Vec::new())))),
             global_env,
             executor: GcRefLock::new(mc, RefLock::new(executor)),
+            future_arena: Rc::new(RefCell::new(FutureArena::new())),
+            sources: StaticCollect(program.get_sources()),
         }
     });
     arena.mutate(move |mc, root| {
@@ -120,7 +127,7 @@ pub fn interpret_global(
         root.code.borrow_mut(mc).0 = Arc::new(code);
         root.source_map.borrow_mut(mc).0 = Arc::new(source_map);
     });
-    interpret(arena)
+    interpret(arena).await;
 }
 
 fn convert_error<'a>(
@@ -157,22 +164,47 @@ fn convert_error<'a>(
     }
 }
 
-pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), InterpretError> {
+pub async fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) {
     let instruction_batch_size = 1000;
     loop {
         for _ in 0..instruction_batch_size {
-            if let Some(res) = arena.mutate(|mc, root| {
+            tokio::task::yield_now().await;
+            if let Some(_) = arena.mutate(|mc, root| {
                 let ctx = Context { mc, root };
                 let code = ctx.root.code.borrow();
-                let executor = ctx.root.executor.borrow();
+                let mut executor = ctx.root.executor.borrow_mut(mc);
 
                 let Some(front) = executor.queue.front() else {
                     panic!("Executor queue is empty");
                 };
                 let mut task = front.borrow_mut(mc);
+
+                if let FutureValue::Pending(Task::Future(fut)) = &mut *task {
+                    if let Some(val) = fut.poll(&ctx) {
+                        *task = match val {
+                            Ok(v) => FutureValue::Completed(v),
+                            Err(e) => FutureValue::Failed(e),
+                        };
+                        executor.queue.pop_front();
+                        if executor.queue.is_empty() {
+                            return Some(());
+                        }
+                        return None;
+                    }
+                    executor.cycle();
+                    return None;
+                }
+
                 let FutureValue::Pending(Task::Exec(exec_ctx)) = &mut *task else {
                     panic!("Executor contained non-pending or non-exec task");
                 };
+
+                /*println!(
+                    "Tasks: {:?}, IP: {}, Loc: {:?}",
+                    executor.queue,
+                    exec_ctx.ip,
+                    root.source_map.borrow().0[exec_ctx.ip]
+                );*/
 
                 drop(executor);
                 let res = eval_instruction(&ctx, exec_ctx, &code);
@@ -180,10 +212,11 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Interpre
 
                 match res {
                     Ok(EvalResult::Exit(val)) => {
+                        println!("Task completed with value: {:?}", value_to_string(&val));
                         *task = FutureValue::Completed(val);
                         executor.queue.pop_front();
                         if executor.queue.is_empty() {
-                            return Some(Ok(()));
+                            return Some(());
                         }
                     }
                     Ok(EvalResult::Continue) => {
@@ -196,19 +229,53 @@ pub fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) -> Result<(), Interpre
                         None => {
                             exec_ctx.advance();
                         }
-                        Some(err) => {
-                            let err_string = convert_error(&ctx, exec_ctx, &err);
-                            *task = FutureValue::Failed(err);
+                        Some(err_val) => {
+                            println!("Uncaught error: {:?}", err_val);
+                            let err = convert_error(&ctx, exec_ctx, &err_val);
+                            *task = FutureValue::Failed(err_val);
                             executor.queue.pop_front();
+                            let traceback_msg = err
+                                .trace
+                                .iter()
+                                .rev()
+                                .map(|loc| {
+                                    format!(
+                                        "  at File \"{}\", line {}, module {}",
+                                        loc.file_path, loc.start.line, loc.module
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let traceback_msg = format!("{}\n{}", err.message, traceback_msg);
+                            let location = err.trace.last().expect("Traceback empty").clone();
+                            Report::build(
+                                ReportKind::Error,
+                                (location.module.clone(), location.span()),
+                            )
+                            .with_config(
+                                ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
+                            )
+                            .with_message(traceback_msg.clone())
+                            .with_label(
+                                Label::new((location.module.clone(), location.span()))
+                                    .with_message(err.message)
+                                    .with_color(Color::Red),
+                            )
+                            .finish()
+                            .eprint(ariadne::sources(
+                                ctx.root.sources.0.iter().map(|(a, b)| (a.clone(), b)),
+                            ))
+                            .unwrap();
+
                             if executor.queue.is_empty() {
-                                return Some(Err(err_string));
+                                return Some(());
                             }
                         }
                     },
                 }
                 None
             }) {
-                return res;
+                return;
             }
         }
         arena.collect_debt();
@@ -265,6 +332,7 @@ impl<'a> Executor<'a> {
         }
     }
     pub fn enqueue(&mut self, task: GcRefLock<'a, FutureValue<'a>>) {
+        println!("Enqueuing task: {:?}", task);
         self.queue.push_back(task);
     }
     pub fn cycle(&mut self) {
@@ -348,7 +416,7 @@ impl<'a> ExecContext<'a> {
         self.jump(func);
     }
     pub fn call_fn_async(
-        &mut self,
+        &self,
         env: Gc<'a, Environment<'a>>,
         func: CodePointer,
     ) -> ExecContext<'a> {

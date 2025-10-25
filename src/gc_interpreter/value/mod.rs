@@ -13,11 +13,14 @@ use crate::{
     parser::FunctionParameters,
 };
 
+mod future;
 mod number;
 
+pub use future::*;
 pub use number::IntVariant;
 
 pub type CodePointer = usize;
+pub type FutureId = usize;
 
 #[derive(Clone, Collect, Debug)]
 #[collect(no_drop)]
@@ -33,6 +36,7 @@ pub enum Value<'a> {
     Function(GcRefLock<'a, FunctionValue<'a>>),
     Class(GcRefLock<'a, ClassValue<'a>>),
     Resource(GcRefLock<'a, Box<dyn Resource>>),
+    AsyncResource(Gc<'a, StaticCollect<Box<dyn AsyncResource>>>),
     Buffer(Gc<'a, BufferValue<'a>>),
     TypedBuffer {
         buffer: Gc<'a, BufferValue<'a>>,
@@ -55,6 +59,7 @@ pub enum FutureValue<'a> {
 #[collect(no_drop)]
 pub enum Task<'a> {
     Exec(ExecContext<'a>),
+    Future(FutureHandle<'a>),
     Never,
 }
 
@@ -446,9 +451,6 @@ pub trait Resource: ResourceBase + Any {
 pub trait ResourceBase: Collect {
     fn close(&mut self) -> Result<(), String>;
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, String>;
-    fn try_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, String> {
-        self.read(buf).map(Some)
-    }
     fn write(&mut self, buf: &[u8]) -> Result<usize, String>;
 }
 
@@ -462,6 +464,43 @@ impl<T: Any + 'static + ResourceBase> Resource for T {
 }
 
 impl std::fmt::Debug for dyn Resource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<resource>")
+    }
+}
+
+pub fn get_async_resource<T: 'static>(val: &Box<dyn AsyncResource>) -> Option<T> {
+    val.into_any().downcast::<T>().map(|b| *b).ok()
+}
+
+#[allow(unused)]
+pub trait AsyncResource: AsyncResourceBase + Any {
+    fn into_any(&self) -> Box<dyn Any>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+#[async_trait::async_trait]
+pub trait AsyncResourceBase {
+    async fn close(&self) -> Result<(), String>;
+    async fn read(&self, buf: &mut [u8]) -> Result<usize, String>;
+    async fn write(&self, buf: &[u8]) -> Result<usize, String>;
+    fn clone(&self) -> Box<dyn AsyncResource>;
+}
+
+impl<T: Any + 'static + AsyncResourceBase> AsyncResource for T {
+    fn into_any(&self) -> Box<dyn Any> {
+        self.clone()
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+impl std::fmt::Debug for dyn AsyncResource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<resource>")
     }
@@ -656,6 +695,7 @@ impl<'a> Value<'a> {
             Value::Function(_) => "Function",
             Value::Class(_) => "Class",
             Value::Resource(_) => "Resource",
+            Value::AsyncResource(_) => "AsyncResource",
             Value::Buffer(_) => "Buffer",
             Value::TypedBuffer { .. } => "TypedSlice",
             Value::Lazy(_) => "Lazy",
@@ -673,6 +713,7 @@ pub fn value_to_string(var: &Value) -> String {
         Value::String(s) => s.to_string(),
         Value::Null => "null".to_string(),
         Value::Resource(_) => "<resource>".to_string(),
+        Value::AsyncResource(_) => "<async resource>".to_string(),
         Value::Object(entries) => {
             let entries = entries
                 .borrow()

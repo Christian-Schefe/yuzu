@@ -3,12 +3,12 @@ use gc_arena::{Gc, StaticCollect};
 use crate::gc_interpreter::{
     Context,
     exception::{function_argument_error, io_error, type_error},
-    resource::{FileResource, TcpListenerResource, TcpStreamResource},
+    resource::{AsyncFileResource, FileResource, TcpListenerResource, TcpStreamResource},
     standard::{
-        expect_arg_len, expect_buffer_arg, expect_string_arg, expect_usize_arg,
+        do_async, expect_arg_len, expect_buffer_arg, expect_string_arg, expect_usize_arg,
         make_builtin_function,
     },
-    value::{Environment, IntVariant, Value},
+    value::{Environment, IntVariant, Value, get_async_resource},
 };
 
 pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>) {
@@ -31,6 +31,33 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
     );
     env.define_const(
         ctx,
+        "fs_open_async",
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 1)?;
+            let path = expect_string_arg(ctx, exec_ctx, &args[0])?;
+            let path_str = path.to_string();
+
+            let fut = AsyncFileResource::open(path_str.clone());
+
+            do_async(
+                ctx,
+                exec_ctx,
+                fut,
+                Vec::new(),
+                move |ctx, exec_ctx, res, _| match res {
+                    Err(e) => Err(io_error(
+                        ctx,
+                        exec_ctx,
+                        &format!("Failed to open file asynchronously {}: {}", path_str, e),
+                    )),
+                    Ok(res) => Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res))))),
+                },
+            )
+        })),
+    );
+
+    env.define_const(
+        ctx,
         "fs_mkdir",
         Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             expect_arg_len(ctx, exec_ctx, &args, 1)?;
@@ -46,9 +73,10 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             Ok(Value::Resource(ctx.gc_lock(Box::new(file))))
         })),
     );
+
     env.define_const(
         ctx,
-        "tcp_connect",
+        "tcp_connect_async",
         Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             expect_arg_len(ctx, exec_ctx, &args, 2)?;
             let host = expect_string_arg(ctx, exec_ctx, &args[0])?.to_string();
@@ -62,19 +90,26 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     "Port argument must be a valid u16",
                 ));
             };
-            let socket = TcpStreamResource::connect(&host, port).map_err(|e| {
-                io_error(
-                    ctx,
-                    exec_ctx,
-                    &format!("Failed to connect to {}:{}: {}", host, port, e),
-                )
-            })?;
-            Ok(Value::Resource(ctx.gc_lock(Box::new(socket))))
+            let fut = TcpStreamResource::connect(host.clone(), port);
+            do_async(
+                ctx,
+                exec_ctx,
+                fut,
+                Vec::new(),
+                move |ctx, exec_ctx, res, _| match res {
+                    Err(e) => Err(io_error(
+                        ctx,
+                        exec_ctx,
+                        &format!("Failed to connect to {}:{}: {}", host, port, e),
+                    )),
+                    Ok(res) => Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res))))),
+                },
+            )
         })),
     );
     env.define_const(
         ctx,
-        "tcp_listen",
+        "tcp_listen_async",
         Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             expect_arg_len(ctx, exec_ctx, &args, 2)?;
             let addr = expect_string_arg(ctx, exec_ctx, &args[0])?.to_string();
@@ -88,49 +123,56 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     "Port argument must be a valid u16",
                 ));
             };
-            let socket = TcpListenerResource::bind(&addr, port).map_err(|e| {
-                io_error(
-                    ctx,
-                    exec_ctx,
-                    &format!("Failed to listen on {}:{}: {}", addr, port, e),
-                )
-            })?;
-            Ok(Value::Resource(ctx.gc_lock(Box::new(socket))))
+            let fut = TcpListenerResource::bind(addr.clone(), port);
+
+            do_async(
+                ctx,
+                exec_ctx,
+                fut,
+                Vec::new(),
+                move |ctx, exec_ctx, res, _| match res {
+                    Err(e) => Err(io_error(
+                        ctx,
+                        exec_ctx,
+                        &format!("Failed to bind to {}:{}: {}", addr, port, e),
+                    )),
+                    Ok(res) => Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res))))),
+                },
+            )
         })),
     );
     env.define_const(
         ctx,
-        "tcp_accept",
+        "tcp_accept_async",
         Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             expect_arg_len(ctx, exec_ctx, &args, 1)?;
             match &args[0] {
-                Value::Resource(res) => {
-                    let mut res_ref = res.borrow_mut(ctx.mc);
-                    match res_ref.as_any_mut().downcast_mut::<TcpListenerResource>() {
-                        Some(listener) => {
-                            let Some((stream, _)) = listener.accept().map_err(|e| {
-                                io_error(
-                                    ctx,
-                                    exec_ctx,
-                                    &format!("Failed to accept connection: {}", e),
-                                )
-                            })?
-                            else {
-                                return Ok(Value::Null);
-                            };
-                            let socket = TcpStreamResource {
-                                stream: StaticCollect(Some(stream)),
-                            };
-                            Ok(Value::Resource(ctx.gc_lock(Box::new(socket))))
-                        }
-                        None => {
-                            return Err(type_error(
+                Value::AsyncResource(res) => {
+                    let Some(listener) = get_async_resource::<TcpListenerResource>(&res) else {
+                        return Err(type_error(
+                            ctx,
+                            exec_ctx,
+                            "Accept argument must be a TcpListener resource",
+                        ));
+                    };
+                    let fut = listener.accept();
+
+                    do_async(
+                        ctx,
+                        exec_ctx,
+                        fut,
+                        Vec::new(),
+                        |ctx, exec_ctx, res, _| match res {
+                            Err(e) => Err(io_error(
                                 ctx,
                                 exec_ctx,
-                                "Accept argument must be a TcpListener resource",
-                            ));
-                        }
-                    }
+                                &format!("Failed to accept TCP connection: {}", e),
+                            )),
+                            Ok(res) => {
+                                Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res)))))
+                            }
+                        },
+                    )
                 }
                 _ => {
                     return Err(type_error(
@@ -203,34 +245,49 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
     );
     env.define_const(
         ctx,
-        "resource_try_read",
+        "resource_read_async",
         Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
             expect_arg_len(ctx, exec_ctx, &args, 2)?;
             match &args[0] {
-                Value::Resource(res) => {
-                    let mut res_ref = res.borrow_mut(ctx.mc);
+                Value::AsyncResource(res) => {
+                    let resourec = res.0.clone();
                     let buf = expect_buffer_arg(ctx, exec_ctx, &args[1])?;
-                    buf.with_mut_slice(ctx, |slice| {
-                        let bytes_read = res_ref
-                            .try_read(slice)
-                            .map_err(|e| {
-                                io_error(
+                    let len = buf.length;
+                    let fut = async move {
+                        let mut buffer = vec![0u8; len];
+                        let read_fut = resourec.read(&mut buffer);
+                        let bytes_read = read_fut.await;
+                        bytes_read.map(|n| (n, buffer))
+                    };
+                    do_async(
+                        ctx,
+                        exec_ctx,
+                        fut,
+                        vec![Value::Buffer(buf)],
+                        move |ctx, exec_ctx, res, args| {
+                            let Value::Buffer(buf) = &args[0] else {
+                                unreachable!()
+                            };
+
+                            buf.with_mut_slice(ctx, |slice| match res {
+                                Err(e) => Err(io_error(
                                     ctx,
                                     exec_ctx,
                                     &format!("Failed to read from resource: {}", e),
-                                )
-                            })?
-                            .map_or(Value::Null, |n| {
-                                Value::Integer(IntVariant::from_u64(n as u64))
-                            });
-                        Ok(bytes_read)
-                    })
+                                )),
+                                Ok((n, buffer)) => {
+                                    slice[..n].copy_from_slice(&buffer[..n]);
+                                    Ok(Value::Integer(IntVariant::from_u64(n as u64)))
+                                }
+                            })
+                        },
+                    )
                 }
                 _ => {
                     return Err(type_error(
                         ctx,
                         exec_ctx,
-                        "Read argument must be a resource",
+                        "Read argument must be an async resource",
                     ));
                 }
             }
