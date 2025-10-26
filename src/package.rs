@@ -7,10 +7,10 @@ use ariadne::{Color, Label, Report, ReportKind};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ModulePath, ParsedModuleTree,
+    ModulePath,
     lexer::{self},
-    location::LineIndex,
-    parser::{self, ParsedModuleItem},
+    location::{LineIndex, Located},
+    parser::{self, Expression, LocatedExpression, ParsedModuleItem},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +35,8 @@ pub fn try_load_config(folder: &PathBuf) -> Result<PackageConfig, String> {
 
 pub fn parse_package_root(
     folder: &PathBuf,
-    module_tree: &mut HashMap<String, ParsedModuleTree>,
+    module_tree: &mut Vec<LocatedExpression>,
+    sources: &mut HashMap<String, String>,
 ) -> Result<String, ()> {
     let config = try_load_config(folder).map_err(|e| {
         eprintln!("Failed to load package config: {}", e);
@@ -57,18 +58,26 @@ pub fn parse_package_root(
             .to_string_lossy()
             .to_string(),
     );
-    let tree = parse_module_tree(&mut visited_files, root_path.clone(), &file_path)?;
-    module_tree.insert(config.name.clone(), tree);
+    let tree = parse_module_tree(&mut visited_files, root_path.clone(), &file_path, sources)?;
+    let loc = tree.location.clone();
+    module_tree.push(Located::new(
+        Expression::CanonicDefine {
+            name: config.name.clone(),
+            value: Box::new(tree),
+        },
+        loc,
+    ));
     for dep_path in config.dependencies {
         let dep_folder = folder.join(dep_path);
-        parse_package_root(&dep_folder, module_tree)?;
+        parse_package_root(&dep_folder, module_tree, sources)?;
     }
     Ok(config.name)
 }
 
 pub fn parse_fake_package(
     main_file: &PathBuf,
-    module_tree: &mut HashMap<String, ParsedModuleTree>,
+    module_tree: &mut Vec<LocatedExpression>,
+    sources: &mut HashMap<String, String>,
 ) -> Result<String, ()> {
     let mut visited_files = HashSet::new();
     let root_path = ModulePath::from_root("root");
@@ -86,8 +95,15 @@ pub fn parse_fake_package(
             .to_string_lossy()
             .to_string(),
     );
-    let tree = parse_module_tree(&mut visited_files, root_path.clone(), main_file)?;
-    module_tree.insert("root".to_string(), tree);
+    let tree = parse_module_tree(&mut visited_files, root_path.clone(), main_file, sources)?;
+    let loc = tree.location.clone();
+    module_tree.push(Located::new(
+        Expression::CanonicDefine {
+            name: "root".to_string(),
+            value: Box::new(tree),
+        },
+        loc,
+    ));
     Ok("root".to_string())
 }
 
@@ -95,7 +111,8 @@ fn parse_module_tree(
     visited_files: &mut HashSet<String>,
     path: ModulePath,
     file_path: &PathBuf,
-) -> Result<ParsedModuleTree, ()> {
+    sources: &mut HashMap<String, String>,
+) -> Result<LocatedExpression, ()> {
     let contents = std::fs::read_to_string(&file_path).unwrap();
     let canonic_path_str = file_path.to_string_lossy().to_string();
     let pm = parse_string(
@@ -104,9 +121,8 @@ fn parse_module_tree(
         path.to_string(),
         &canonic_path_str,
     )?;
-    let mut children = HashMap::new();
+
     let mut expressions = Vec::new();
-    let mut exported_expressions = Vec::new();
 
     let mut success = true;
     for item in pm {
@@ -115,15 +131,11 @@ fn parse_module_tree(
                 expressions.push(e);
                 continue;
             }
-            ParsedModuleItem::ExportedExpression(e) => {
-                exported_expressions.push(e);
-                continue;
-            }
             ParsedModuleItem::Module(m) => m,
         };
         let child_module_path = path.push(child.data.clone());
         let file_parent = file_path.parent().unwrap();
-        let child_file_path = file_parent.join(format!("{}.yuzu", child.data));
+        let child_file_path = file_parent.join(format!("{}.yuzu", child.data.clone()));
         let child_file_path_str = child_file_path
             .canonicalize()
             .unwrap()
@@ -153,22 +165,34 @@ fn parse_module_tree(
         }
         visited_files.insert(child_file_path_str);
 
-        let child_tree = parse_module_tree(visited_files, child_module_path, &child_file_path);
+        let child_tree =
+            parse_module_tree(visited_files, child_module_path, &child_file_path, sources);
         let Ok(child_tree) = child_tree else {
             success = false;
             continue;
         };
-        children.insert(child.data.clone(), child_tree);
+        let module_expr = Located::new(
+            Expression::CanonicDefine {
+                name: child.data,
+                value: Box::new(child_tree),
+            },
+            child.location.clone(),
+        );
+        expressions.push(module_expr);
     }
     if !success {
         return Err(());
     }
-    Ok(ParsedModuleTree {
-        children,
-        expressions,
-        exported_expressions,
-        source: contents,
-    })
+    let first_loc = expressions.first().unwrap().location.clone();
+    let last_loc = expressions.last().unwrap().location.clone();
+    let module = Located::new(
+        Expression::ModuleLiteral { expressions },
+        first_loc.merge(&last_loc),
+    );
+    if sources.insert(path.to_string(), contents).is_some() {
+        panic!("Duplicate module path detected: {}", path);
+    }
+    Ok(module)
 }
 
 fn parse_string(

@@ -8,7 +8,6 @@ use chumsky::{
 };
 
 use crate::{
-    CanonicalPath, ModulePath,
     lexer::{LocatedToken, Token},
     location::{LineIndex, Located, Location, Position},
 };
@@ -240,6 +239,38 @@ where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
     let ident = select! { Token::Ident(name) => name.to_string() };
+
+    let double_colon_identifier_with_name = ident
+        .clone()
+        .separated_by(just(Token::DoubleColon))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map_with(move |mut parts, extra| {
+            let name = parts.last().unwrap().clone();
+            parts.reverse();
+            let Some(mut top_level) = parts.pop() else {
+                panic!("Unreachable: parts should have at least one element");
+            };
+            if top_level == "root" {
+                top_level = root_name.clone();
+            }
+
+            let mut cur_expr = Expression::Ident(top_level.clone());
+            for part in parts.into_iter().rev() {
+                cur_expr = Expression::FieldAccess {
+                    object: Box::new(located(cur_expr, extra.span())),
+                    field: part,
+                };
+            }
+            (located(cur_expr, extra.span()), name)
+        })
+        .boxed();
+
+    let double_colon_identifier = double_colon_identifier_with_name
+        .clone()
+        .map(|(expr, _)| expr)
+        .boxed();
+
     let pattern = pattern_parser().boxed();
 
     let parameter_list = ident
@@ -298,15 +329,16 @@ where
             })
             .boxed();
 
-        let let_ = just(Token::Let)
-            .ignore_then(pattern.clone())
+        let let_ = just(Token::Let).or(just(Token::Const))
+            .then(pattern.clone())
             .then_ignore(just(Token::Assign))
             .then(expr.clone())
-            .map_with(|(pattern, value), extra| {
+            .map_with(|((is_const, pattern), value), extra| {
                 located(
                     Expression::Define {
                         pattern,
                         value: Box::new(value),
+                        is_const: is_const == Token::Const,
                     },
                     extra.span(),
                 )
@@ -317,26 +349,6 @@ where
             .clone()
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .map_with(|expr, extra| located(expr.data, extra.span()));
-
-        let root_name_clone = root_name.clone();
-        let identifier = ident
-            .clone()
-            .separated_by(just(Token::DoubleColon))
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .map_with(move |mut parts, extra| {
-                let ident = if parts.len() == 1 {
-                    Identifier::Simple(parts[0].clone())
-                } else {
-                    let name = parts.pop().unwrap();
-                    if parts[0] == "root" {
-                        parts[0] = root_name_clone.clone();
-                    }
-                    Identifier::Scoped(CanonicalPath::new(ModulePath::new(parts), name))
-                };
-                located(ident, extra.span())
-            })
-            .boxed();
 
         let inline_expr = {
             let val = select! {
@@ -373,12 +385,8 @@ where
             .collect::<Vec<_>>()
             .boxed();
 
-            let identifier_expr = identifier
-                .clone()
-                .map_with(|id, extra| located(Expression::Ident(id.data), extra.span()));
-
             let new_expr = just(Token::New)
-                .ignore_then(choice((parenthesized.clone(), identifier_expr.clone())))
+                .ignore_then(choice((parenthesized.clone(), double_colon_identifier.clone())))
                 .then(
                     expr.clone()
                         .separated_by(just(Token::Comma))
@@ -398,26 +406,13 @@ where
 
             let import_expr = just(Token::Use)
                 .ignore_then(
-                    ident
-                        .clone()
-                        .separated_by(just(Token::DoubleColon))
-                        .at_least(2)
-                        .collect::<Vec<_>>()
-                        .map_with(move |mut parts, extra| {
-                            let name = parts.pop().unwrap();
-                            if parts[0] == "root" {
-                                parts[0] = root_name.clone();
-                            }
+                    double_colon_identifier_with_name
+                        .map_with(|(expr, name), extra| {
                             located(
                                 Expression::Define {
                                     pattern: located(Pattern::Ident(name.clone()), extra.span()),
-                                    value: Box::new(located(
-                                        Expression::Ident(Identifier::Scoped(CanonicalPath::new(
-                                            ModulePath::new(parts),
-                                            name,
-                                        ))),
-                                        extra.span(),
-                                    )),
+                                    value: Box::new(expr),
+                                    is_const: true,
                                 },
                                 extra.span(),
                             )
@@ -426,7 +421,7 @@ where
                 .boxed();
 
             let atom = choice((
-                identifier_expr,
+                double_colon_identifier,
                 val,
                 new_expr,
                 import_expr,
@@ -568,7 +563,7 @@ where
                 ),
                 postfix(
                     15,
-                    just(Token::Dot)
+                    just(Token::Dot).or(just(Token::DoubleColon))
                         .ignore_then(select! { Token::Ident(name) => name.to_string() }),
                     |lhs, op, extra| {
                         located(
@@ -725,6 +720,7 @@ where
                     Expression::Define {
                         pattern,
                         value: func,
+                        is_const: true,
                     },
                     extra.span(),
                 )
@@ -734,7 +730,7 @@ where
         let class = just(Token::Class)
             .ignore_then(select! { Token::Ident(name) => name.to_string() })
             .map_with(|name, extra| located(Pattern::Ident(name), extra.span()))
-            .then(just(Token::Colon).ignore_then(identifier.clone()).or_not())
+            .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
             .then(
                 choice((
                     just(Token::Async).or_not()
@@ -805,9 +801,10 @@ where
                     Expression::Define {
                         pattern,
                         value: Box::new(located(
-                            ClassMember::make_class_expr(body, parent.map(|p| p.data)),
+                            ClassMember::make_class_expr(body, parent.map(Box::new)),
                             extra.span(),
                         )),
+                        is_const: true,
                     },
                     extra.span(),
                 ))
@@ -885,13 +882,31 @@ where
                     ));
                 };
                 if is_export.is_some() {
-                    let Expression::Define { .. } = data.data else {
+                    let Expression::Define {
+                        pattern,
+                        value,
+                        is_const: _,
+                    } = data.data
+                    else {
                         return Err(chumsky::error::Rich::custom(
                             extra.span(),
                             "Only definitions can be exported",
                         ));
                     };
-                    Ok(ParsedModuleItem::ExportedExpression(data))
+                    let name = match pattern.data {
+                        Pattern::Ident(name) => name,
+                        _ => {
+                            return Err(chumsky::error::Rich::custom(
+                                extra.span(),
+                                "Only simple identifiers can be exported",
+                            ));
+                        }
+                    };
+                    let expr = Expression::CanonicDefine { name, value };
+                    Ok(ParsedModuleItem::Expression(Located::new(
+                        expr,
+                        data.location,
+                    )))
                 } else {
                     Ok(ParsedModuleItem::Expression(data))
                 }
@@ -923,9 +938,6 @@ pub fn parse<'a>(
             for item in &mut pm {
                 match item {
                     ParsedModuleItem::Expression(e) => {
-                        e.set_module(module_path, file_path, line_index)
-                    }
-                    ParsedModuleItem::ExportedExpression(e) => {
                         e.set_module(module_path, file_path, line_index)
                     }
                     ParsedModuleItem::Module(m) => {

@@ -13,23 +13,22 @@ use gc_arena::{
 };
 
 use crate::{
-    ModulePath, ParsedProgram,
     bytecode::{FunctionData, Instruction},
     gc_interpreter::{
         exception::{
             array_index_out_of_bounds, cannot_instantiate, cyclic_static_initialization,
             division_by_zero, duplicate_variable_definition, field_access_error,
-            index_out_of_bounds, type_error, undefined_identifier, undefined_variable,
-            unhandled_control_flow, unsupported_binary_operation, unsupported_unary_operation,
+            index_out_of_bounds, type_error, undefined_variable, unhandled_control_flow,
+            unsupported_binary_operation, unsupported_unary_operation,
         },
         resolver::compile_and_setup,
         value::{
             ClassInstanceValue, ClassValue, CodePointer, Environment, FunctionValue,
             FunctionValueType, FutureArena, FutureValue, IntVariant, LazyValue, LocatedError,
-            ModuleTree, StringVariant, Task, Value, value_to_string,
+            ModuleValue, StringVariant, Task, Value, value_to_string,
         },
     },
-    parser::{BinaryOp, Identifier, Pattern, UnaryOp},
+    parser::{BinaryOp, LocatedExpression, Pattern, UnaryOp},
 };
 
 mod exception;
@@ -43,7 +42,7 @@ pub type Location = CodePointer;
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct MyRoot<'a> {
-    pub root_module: GcRefLock<'a, ModuleTree<'a>>,
+    pub root_module: GcRefLock<'a, Option<GcRefLock<'a, ModuleValue<'a>>>>,
     pub pwd: std::path::PathBuf,
     pub args: Value<'a>,
     pub source_map: GcRefLock<'a, StaticCollect<Arc<Vec<crate::location::Location>>>>,
@@ -81,14 +80,14 @@ pub struct InterpretError {
 }
 
 pub async fn interpret_global(
-    mut program: ParsedProgram,
+    program: LocatedExpression,
+    sources: Vec<(String, String)>,
     pwd: std::path::PathBuf,
     args: Vec<String>,
-    main_module: String,
+    main_module_name: &str,
 ) {
     let arena = Arena::<Rootable![MyRoot<'_>]>::new(|mc| {
         let global_env = Gc::new(mc, Environment::new_global(mc));
-        let root_module = ModuleTree::new(mc, global_env);
         let args_value = Value::Array(Gc::new(
             mc,
             RefLock::new(
@@ -105,7 +104,7 @@ pub async fn interpret_global(
             RefLock::new(FutureValue::Pending(Task::Exec(exec_ctx))),
         ));
         MyRoot {
-            root_module: Gc::new(mc, RefLock::new(root_module)),
+            root_module: Gc::new(mc, RefLock::new(None)),
             pwd,
             args: args_value,
             code: GcRefLock::new(mc, RefLock::new(StaticCollect(Arc::new(Vec::new())))),
@@ -113,13 +112,13 @@ pub async fn interpret_global(
             global_env,
             executor: GcRefLock::new(mc, RefLock::new(executor)),
             future_arena: Rc::new(RefCell::new(FutureArena::new())),
-            sources: StaticCollect(program.get_sources()),
+            sources: StaticCollect(sources),
         }
     });
     arena.mutate(move |mc, root| {
         let ctx = Context { mc, root };
         let mut code = Vec::new();
-        compile_and_setup(&ctx, &mut program, &mut code, main_module);
+        compile_and_setup(&ctx, program, &mut code, main_module_name);
         let (code, source_map) = code
             .into_iter()
             .map(|instr| (instr.data, instr.location))
@@ -300,6 +299,7 @@ pub enum Frame<'a> {
         source_ip: usize,
         return_ip: usize,
         stack_height: usize,
+        keep_return: bool,
     },
     AsyncTask {
         source_ip: usize,
@@ -403,13 +403,14 @@ impl<'a> ExecContext<'a> {
         trace.push(self.ip);
         trace
     }
-    pub fn call_fn(&mut self, env: Gc<'a, Environment<'a>>, func: CodePointer) {
+    pub fn call_fn(&mut self, env: Gc<'a, Environment<'a>>, func: CodePointer, keep_return: bool) {
         let return_ip = self.ip + 1;
         self.push_frame(
             Frame::Function {
                 source_ip: self.ip,
                 return_ip,
                 stack_height: self.stack.len(),
+                keep_return,
             },
             env,
         );
@@ -527,12 +528,15 @@ fn bubble_return<'a>(
             source_ip: _,
             return_ip,
             stack_height,
+            keep_return,
         } = frame.frame
         {
             exec_ctx.stack.truncate(stack_height);
             let target = return_ip;
             exec_ctx.jump(target);
-            exec_ctx.push(ret);
+            if keep_return {
+                exec_ctx.push(ret);
+            }
             return Ok(None);
         } else if let Frame::AsyncTask { .. } = frame.frame {
             return Ok(Some(ret));
@@ -556,46 +560,42 @@ pub fn eval_instruction<'a>(
     let env = exec_ctx.frame_stack.last().unwrap().env;
 
     /*
-        println!(
-            "Frames: {:?}",
-            exec_ctx
-                .frame_stack
-                .iter()
-                .map(|f| &f.frame)
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "Stack: {:?}",
-            exec_ctx
-                .stack
-                .iter()
-                .map(|f| value_to_string(f))
-                .collect::<Vec<_>>()
-        );
-        println!(
-            "IP {}: {:?} at {}",
-            exec_ctx.ip,
-            instruction,
-            ctx.root.source_map.borrow()[exec_ctx.ip].module
-        );
-    */
+    println!(
+        "Frames: {:?}",
+        exec_ctx
+            .frame_stack
+            .iter()
+            .map(|f| &f.frame)
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "Stack: {:?}",
+        exec_ctx
+            .stack
+            .iter()
+            .map(|f| value_to_string(f))
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "IP {}: {:?} at {}, frames: {}",
+        exec_ctx.ip,
+        instruction,
+        ctx.root.source_map.borrow()[exec_ctx.ip].module,
+        exec_ctx.frame_stack.len()
+    );
+     */
     match instruction {
-        Instruction::Exit => return Ok(EvalResult::Exit(exec_ctx.pop())),
-        Instruction::InitializeModule(path) => {
-            let module = ModuleTree::get(ctx.root.root_module, path);
-            let Some(module) = module else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
+        Instruction::SetRootModule => {
+            let Value::Module(module) = exec_ctx.peek() else {
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "SetRootModule can only be applied to modules",
+                ));
             };
-            let mut mod_ref = module.borrow_mut(ctx.mc);
-            if !mod_ref.is_initialized
-                && let Some(pointer) = mod_ref.initializer
-            {
-                mod_ref.is_initialized = true;
-                exec_ctx.call_fn(mod_ref.env, pointer);
-            } else {
-                exec_ctx.push(Value::Null);
-            }
+            ctx.root.root_module.borrow_mut(ctx.mc).replace(*module);
         }
+        Instruction::Exit => return Ok(EvalResult::Exit(exec_ctx.pop())),
         Instruction::DuplicateTopN(n) => {
             let stack_len = exec_ctx.stack.len();
             let val = exec_ctx.stack[stack_len - n..].to_vec();
@@ -604,39 +604,87 @@ pub fn eval_instruction<'a>(
         Instruction::Load(ident) => eval_identifier(ctx, exec_ctx, ident, env)?,
         Instruction::Store(ident) => {
             let val = exec_ctx.pop();
-            assign_identifier(ctx, exec_ctx, ident, env, &val)?;
+            Environment::set(ctx, exec_ctx, env, ident, val.clone())?;
             exec_ctx.push(val);
         }
-        Instruction::Define(pattern) => {
+        Instruction::Define(pattern, is_const) => {
             let value = exec_ctx.pop();
             let pattern = resolve_pattern(ctx, exec_ctx, pattern, value)?;
             for (name, val) in pattern {
-                if !env.define(ctx, name, val) {
+                let res = if *is_const {
+                    env.define_const(ctx, &name, val)
+                } else {
+                    env.define(ctx, &name, val)
+                };
+                if !res {
                     return Err(duplicate_variable_definition(ctx, exec_ctx, name));
                 }
             }
         }
-        Instruction::DefineCanonic(canonical_path, initializer) => {
-            let Some(module) = ModuleTree::get(ctx.root.root_module, &canonical_path.path) else {
-                panic!("Module not found: {}", canonical_path.path)
-            };
-            let mod_env = module.borrow().env;
+        Instruction::DefineLazy(name, initializer) => {
             let item = Value::Lazy(ctx.gc_lock(LazyValue::Uninitialized {
                 body: *initializer,
-                env: mod_env,
+                env,
             }));
-            if !mod_env.define_const(ctx, &canonical_path.item, item) {
-                return Err(duplicate_variable_definition(
+            if !env.define_const(ctx, name, item) {
+                return Err(duplicate_variable_definition(ctx, exec_ctx, &name));
+            }
+        }
+        Instruction::InitModule => {
+            let Value::Module(module) = exec_ctx.pop() else {
+                return Err(type_error(
                     ctx,
                     exec_ctx,
-                    &canonical_path.item,
+                    "InitModule can only be applied to modules",
                 ));
+            };
+
+            let mut module_ref = module.borrow_mut(ctx.mc);
+            if let Some(initializer) = module_ref.initializer
+                && !module_ref.initialized
+            {
+                module_ref.initialized = true;
+                exec_ctx.call_fn(module_ref.env, initializer, true);
+            } else {
+                exec_ctx.push(Value::Null);
             }
         }
         Instruction::LoadProperty(field) => {
             let object = exec_ctx.pop();
+            if let Value::Module(module) = &object {
+                let mut module_ref = module.borrow_mut(ctx.mc);
+                if let Some(initializer) = module_ref.initializer
+                    && !module_ref.initialized
+                {
+                    exec_ctx.push(object);
+                    module_ref.initialized = true;
+                    exec_ctx.ip -= 1; // Retry this instruction after initialization by setting function return ip back by 1
+                    exec_ctx.call_fn(module_ref.env, initializer, false);
+                    return Ok(EvalResult::Continue);
+                }
+            }
             let val = get_property(ctx, exec_ctx, &object, field)?;
-            exec_ctx.push(val);
+            match val {
+                Value::Lazy(lazy) => {
+                    let lazy_ref = lazy.borrow();
+                    match &*lazy_ref {
+                        LazyValue::BeingInitialized => {
+                            return Err(cyclic_static_initialization(ctx, exec_ctx));
+                        }
+                        LazyValue::Initialized(v) => {
+                            exec_ctx.push(v.clone());
+                        }
+                        LazyValue::Uninitialized { body, env } => {
+                            let body = *body;
+                            let env = *env;
+                            let call_env = ctx.gc(Environment::new(ctx, env));
+                            exec_ctx.call_fn(call_env, body, true);
+                            exec_ctx.push(Value::Lazy(lazy));
+                        }
+                    }
+                }
+                _ => exec_ctx.push(val.clone()),
+            }
         }
         Instruction::StoreProperty(field) => {
             let val = exec_ctx.pop();
@@ -659,6 +707,14 @@ pub fn eval_instruction<'a>(
         }
         Instruction::Pop => {
             exec_ctx.pop();
+        }
+        Instruction::PushModule(initializer) => {
+            let module = Value::Module(ctx.gc_lock(ModuleValue::new_with_init(
+                ctx.mc,
+                ctx.root.global_env,
+                *initializer,
+            )));
+            exec_ctx.push(module);
         }
         Instruction::PushNull => exec_ctx.push(Value::Null),
         Instruction::PushBool(b) => exec_ctx.push(Value::Bool(*b)),
@@ -857,10 +913,14 @@ pub fn eval_instruction<'a>(
                 source_ip: _,
                 return_ip,
                 stack_height,
+                keep_return,
             } => {
                 //Truncation is only necessary for control flow jumps, not normal function exits
                 //as the stack should be at the correct height already
                 debug_assert_eq!(exec_ctx.stack.len(), stack_height + 1); // Plus return value
+                if !keep_return {
+                    exec_ctx.pop();
+                }
                 exec_ctx.jump(return_ip);
             }
             Frame::Catch { stack_height, .. } => {
@@ -900,11 +960,15 @@ pub fn eval_instruction<'a>(
                 args.push(exec_ctx.pop());
             }
             args.reverse();
-            let Value::Class(class) = exec_ctx.pop() else {
+            let val = exec_ctx.pop();
+            let Value::Class(class) = val else {
                 return Err(type_error(
                     ctx,
                     exec_ctx,
-                    "Attempted to call constructor on a non-class value",
+                    &format!(
+                        "Attempted to call constructor on a non-class value: {}",
+                        value_to_string(&val)
+                    ),
                 ));
             };
             let class_ref = class.borrow();
@@ -920,17 +984,8 @@ pub fn eval_instruction<'a>(
 
             call_function(ctx, exec_ctx, env, args, &Value::Function(*constructor))?;
         }
-        Instruction::StartInitializeLazy(path) => {
-            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
-            let lazy = if let Some(module_tree) = module_tree {
-                let env = module_tree.borrow().env;
-                env.get(&path.item)
-            } else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
-            };
-            let Some(lazy) = lazy else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
-            };
+        Instruction::StartInitializeLazy => {
+            let lazy = exec_ctx.peek();
             let Value::Lazy(lazy_ref) = lazy else {
                 return Err(type_error(
                     ctx,
@@ -948,28 +1003,16 @@ pub fn eval_instruction<'a>(
                     ));
                 }
                 LazyValue::BeingInitialized => {
-                    return Err(cyclic_static_initialization(
-                        ctx,
-                        exec_ctx,
-                        &Identifier::Scoped(path.clone()),
-                    ));
+                    return Err(cyclic_static_initialization(ctx, exec_ctx));
                 }
                 _ => {
                     *lazy_borrow = LazyValue::BeingInitialized;
                 }
             }
         }
-        Instruction::InitializeLazy(path) => {
-            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
-            let lazy = if let Some(module_tree) = module_tree {
-                let env = module_tree.borrow().env;
-                env.get(&path.item)
-            } else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
-            };
-            let Some(lazy) = lazy else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
-            };
+        Instruction::InitializeLazy => {
+            let value = exec_ctx.pop();
+            let lazy = exec_ctx.pop();
             let Value::Lazy(lazy_ref) = lazy else {
                 return Err(type_error(
                     ctx,
@@ -977,7 +1020,6 @@ pub fn eval_instruction<'a>(
                     "Attempted to initialize a non-lazy value",
                 ));
             };
-            let value = exec_ctx.pop();
             let mut lazy_borrow = lazy_ref.borrow_mut(ctx.mc);
             match &*lazy_borrow {
                 LazyValue::Initialized(_) => {
@@ -1197,7 +1239,7 @@ fn call_function<'a>(
                     }
                     call_env.define(ctx, rest, Value::Array(ctx.gc_lock(args_iter.collect())));
                     if !is_async {
-                        exec_ctx.call_fn(call_env, body);
+                        exec_ctx.call_fn(call_env, body, true);
                         return Ok(());
                     }
                     exec_ctx.call_fn_async(call_env, body)
@@ -1215,7 +1257,7 @@ fn call_function<'a>(
                         call_env.define(ctx, param, arg);
                     }
                     if !is_async {
-                        exec_ctx.call_fn(call_env, body);
+                        exec_ctx.call_fn(call_env, body, true);
                         return Ok(());
                     }
                     exec_ctx.call_fn_async(call_env, body)
@@ -1367,8 +1409,11 @@ fn interpret_simple_binary_op<'a>(
 }
 
 pub fn get_std_env<'a>(ctx: &Context<'a>) -> Gc<'a, Environment<'a>> {
-    let std_tree = ModuleTree::get(ctx.root.root_module, &ModulePath::std()).unwrap();
-    let std_env = std_tree.borrow().env;
+    let root_ref = ctx.root.root_module.borrow();
+    let Some(Value::Module(std)) = root_ref.as_ref().unwrap().borrow().env.get("std") else {
+        panic!("Standard library module not found");
+    };
+    let std_env = std.borrow().env;
     std_env
 }
 
@@ -1430,6 +1475,13 @@ fn get_property<'a>(
         Value::Object(obj) => {
             let obj_ref = obj.borrow();
             if let Some(val) = obj_ref.get(field).cloned() {
+                return Ok(val);
+            }
+        }
+        Value::Module(module) => {
+            let module_ref = module.borrow();
+            let module_env = module_ref.env;
+            if let Some(val) = module_env.get(field) {
                 return Ok(val);
             }
         }
@@ -1613,32 +1665,31 @@ fn is_instance_of<'a>(object: &Value<'a>, class: GcRefLock<'a, ClassValue<'a>>) 
 fn eval_identifier<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    ident: &Identifier,
+    ident: &String,
     env: Gc<'a, Environment<'a>>,
 ) -> Result<(), LocatedError<'a>> {
-    let val = match ident {
-        Identifier::Simple(name) => env.get(name),
-        Identifier::Scoped(path) => {
-            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
-            if let Some(module_tree) = module_tree {
-                let env = module_tree.borrow().env;
-                env.get(&path.item)
-            } else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
-            }
-        }
-    };
-    let Some(val) = val else {
-        let mut idents = Vec::new();
-        env.collect_known_identifiers(&mut idents);
-        return Err(undefined_identifier(ctx, exec_ctx, ident));
+    let val = if let Some(val) = env.get(ident) {
+        val
+    } else if let Some(val) = ctx
+        .root
+        .root_module
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .env
+        .get(ident)
+    {
+        val
+    } else {
+        return Err(undefined_variable(ctx, exec_ctx, ident));
     };
     match val {
         Value::Lazy(lazy) => {
             let lazy_ref = lazy.borrow();
             match &*lazy_ref {
                 LazyValue::BeingInitialized => {
-                    return Err(cyclic_static_initialization(ctx, exec_ctx, ident));
+                    return Err(cyclic_static_initialization(ctx, exec_ctx));
                 }
                 LazyValue::Initialized(v) => {
                     exec_ctx.push(v.clone());
@@ -1647,34 +1698,14 @@ fn eval_identifier<'a>(
                     let body = *body;
                     let env = *env;
                     let call_env = ctx.gc(Environment::new(ctx, env));
-                    exec_ctx.call_fn(call_env, body);
+                    exec_ctx.call_fn(call_env, body, true);
+                    exec_ctx.push(Value::Lazy(lazy));
                 }
             }
         }
         _ => exec_ctx.push(val.clone()),
     }
     Ok(())
-}
-
-fn assign_identifier<'a>(
-    ctx: &Context<'a>,
-    exec_ctx: &ExecContext<'a>,
-    ident: &Identifier,
-    env: Gc<'a, Environment<'a>>,
-    value: &Value<'a>,
-) -> Result<(), LocatedError<'a>> {
-    match ident {
-        Identifier::Simple(name) => Environment::set(ctx, exec_ctx, env, name, value.clone()),
-        Identifier::Scoped(path) => {
-            let module_tree = ModuleTree::get(ctx.root.root_module, &path.path);
-            if let Some(module_tree) = module_tree {
-                let env = module_tree.borrow().env;
-                Environment::set(ctx, exec_ctx, env, &path.item, value.clone())
-            } else {
-                return Err(undefined_variable(ctx, exec_ctx, &path.to_string()));
-            }
-        }
-    }
 }
 
 fn resolve_pattern<'a, 'b>(

@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use crate::{
-    CanonicalPath,
     location::{LineIndex, Located},
     parser::{BinaryOp, UnaryOp},
 };
@@ -15,13 +14,13 @@ pub enum Expression {
     Integer(String),
     Bool(bool),
     String(String),
-    Ident(Identifier),
+    Ident(String),
     Break,
     Continue,
     Return(Option<Box<LocatedExpression>>),
     ArrayLiteral(Vec<(LocatedExpression, bool)>), // bool indicates if the element is a spread
     CanonicDefine {
-        name: CanonicalPath,
+        name: String,
         value: Box<LocatedExpression>,
     },
     FunctionLiteral {
@@ -30,11 +29,14 @@ pub enum Expression {
         is_async: bool,
     },
     ClassLiteral {
-        parent: Option<Identifier>,
+        parent: Option<Box<LocatedExpression>>,
         constructor: Option<Box<LocatedExpression>>,
         properties: Vec<(String, Box<LocatedExpression>, ClassMemberKind)>,
     },
     ObjectLiteral(Vec<(Option<String>, LocatedExpression)>), // if string is None, it's a spread
+    ModuleLiteral {
+        expressions: Vec<LocatedExpression>,
+    },
     Assign {
         target: Box<LocatedExpression>,
         value: Box<LocatedExpression>,
@@ -53,6 +55,7 @@ pub enum Expression {
     Define {
         pattern: Located<Pattern>,
         value: Box<LocatedExpression>,
+        is_const: bool,
     },
     Block(Vec<LocatedExpression>, Option<Box<LocatedExpression>>),
     If {
@@ -115,7 +118,10 @@ impl ClassMember {
             ClassMember::Constructor { value } => value,
         }
     }
-    pub fn make_class_expr(members: Vec<ClassMember>, parent: Option<Identifier>) -> Expression {
+    pub fn make_class_expr(
+        members: Vec<ClassMember>,
+        parent: Option<Box<LocatedExpression>>,
+    ) -> Expression {
         let mut properties = Vec::new();
         let mut constructor = None;
         for member in members {
@@ -142,23 +148,7 @@ impl ClassMember {
 
 pub enum ParsedModuleItem {
     Expression(LocatedExpression),
-    ExportedExpression(LocatedExpression),
     Module(Located<String>),
-}
-
-#[derive(Debug, Clone)]
-pub enum Identifier {
-    Simple(String),
-    Scoped(CanonicalPath),
-}
-
-impl Display for Identifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Identifier::Simple(name) => write!(f, "{}", name),
-            Identifier::Scoped(path) => write!(f, "{}", path),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +216,7 @@ pub fn desugar_iter_loop(
                 iterable.location.clone(),
             ),
             value: Box::new(get_iterable_call),
+            is_const: true,
         },
         iterable.location.clone(),
     );
@@ -235,7 +226,7 @@ pub fn desugar_iter_loop(
             function: Box::new(LocatedExpression::new(
                 Expression::FieldAccess {
                     object: Box::new(LocatedExpression::new(
-                        Expression::Ident(Identifier::Simple("#iterable".to_string())),
+                        Expression::Ident("#iterable".to_string()),
                         iterable.location.clone(),
                     )),
                     field: "next".to_string(),
@@ -253,6 +244,7 @@ pub fn desugar_iter_loop(
                 iterable.location.clone(),
             ),
             value: Box::new(get_item_call.clone()),
+            is_const: false,
         },
         iterable.location.clone(),
     );
@@ -261,7 +253,7 @@ pub fn desugar_iter_loop(
         Expression::BinaryOp {
             op: BinaryOp::NotEqual,
             left: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("#item".to_string())),
+                Expression::Ident("#item".to_string()),
                 iterable.location.clone(),
             )),
             right: Box::new(LocatedExpression::new(
@@ -275,7 +267,7 @@ pub fn desugar_iter_loop(
     let get_inner_item_value = LocatedExpression::new(
         Expression::FieldAccess {
             object: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("#item".to_string())),
+                Expression::Ident("#item".to_string()),
                 iterable.location.clone(),
             )),
             field: "value".to_string(),
@@ -286,13 +278,14 @@ pub fn desugar_iter_loop(
         Expression::Define {
             pattern: Located::new(Pattern::Ident(item.clone()), iterable.location.clone()),
             value: Box::new(get_inner_item_value.clone()),
+            is_const: true,
         },
         iterable.location.clone(),
     );
     let outer_item_update = LocatedExpression::new(
         Expression::Assign {
             target: Box::new(LocatedExpression::new(
-                Expression::Ident(Identifier::Simple("#item".to_string())),
+                Expression::Ident("#item".to_string()),
                 iterable.location.clone(),
             )),
             value: Box::new(get_item_call),
@@ -404,6 +397,11 @@ impl LocatedExpression {
                     constructor.set_module(module_path, file_path, line_index);
                 }
             }
+            Expression::ModuleLiteral { expressions } => {
+                expressions
+                    .iter_mut()
+                    .for_each(|e| e.set_module(module_path, file_path, line_index));
+            }
             Expression::Null => {}
             Expression::Assign {
                 target,
@@ -420,7 +418,11 @@ impl LocatedExpression {
             Expression::UnaryOp { op: _, expr } => {
                 expr.set_module(module_path, file_path, line_index)
             }
-            Expression::Define { pattern, value } => {
+            Expression::Define {
+                pattern,
+                value,
+                is_const: _,
+            } => {
                 pattern.set_module(module_path, file_path, line_index);
                 value.set_module(module_path, file_path, line_index);
             }

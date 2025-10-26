@@ -125,6 +125,8 @@ pub enum Token<'a> {
 
     #[token("let")]
     Let,
+    #[token("const")]
+    Const,
     #[token("fn")]
     Fn,
     #[token("class")]
@@ -259,6 +261,7 @@ impl fmt::Display for Token<'_> {
             Self::DoubleColon => write!(f, "::"),
             Self::Null => write!(f, "null"),
             Self::Let => write!(f, "let"),
+            Self::Const => write!(f, "const"),
             Self::Export => write!(f, "export"),
             Self::Fn => write!(f, "fn"),
             Self::Class => write!(f, "class"),

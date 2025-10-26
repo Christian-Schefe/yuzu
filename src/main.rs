@@ -3,8 +3,9 @@ use std::{collections::HashMap, path::PathBuf, vec};
 use clap::Parser;
 
 use crate::{
+    location::Located,
     package::{parse_fake_package, parse_package_root},
-    parser::LocatedExpression,
+    parser::Expression,
 };
 
 mod bytecode;
@@ -39,31 +40,42 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let mut map = HashMap::new();
-    let (pwd, main_module) = if args.input.is_file() {
-        let pwd = args.input.parent().unwrap().to_path_buf();
+    let mut expressions = Vec::new();
+    let mut sources = HashMap::new();
 
-        let Ok(main_module) = parse_fake_package(&args.input, &mut map) else {
-            std::process::exit(1);
-        };
-        (pwd, main_module)
-    } else {
-        let pwd = args.input.clone();
-
-        let Ok(main_module) = parse_package_root(&args.input, &mut map) else {
-            std::process::exit(1);
-        };
-        (pwd, main_module)
-    };
-
+    //We parse std first so its initializer is run before user code
     let std_path = PathBuf::from("./example/std");
-    let Ok(_) = parse_package_root(&std_path, &mut map) else {
+    let Ok(_) = parse_package_root(&std_path, &mut expressions, &mut sources) else {
         std::process::exit(1);
     };
 
-    let parsed = ParsedProgram { children: map };
+    let (pwd, main_module_name) = if args.input.is_file() {
+        let pwd = args.input.parent().unwrap().to_path_buf();
+        let Ok(main_module_name) = parse_fake_package(&args.input, &mut expressions, &mut sources)
+        else {
+            std::process::exit(1);
+        };
+        (pwd, main_module_name)
+    } else {
+        let pwd = args.input.clone();
+        let Ok(main_module_name) = parse_package_root(&args.input, &mut expressions, &mut sources)
+        else {
+            std::process::exit(1);
+        };
+        (pwd, main_module_name)
+    };
 
-    gc_interpreter::interpret_global(parsed, pwd, args.other, main_module).await;
+    let loc = expressions.first().unwrap().location.clone();
+    let root_module = Located::new(Expression::ModuleLiteral { expressions }, loc);
+
+    gc_interpreter::interpret_global(
+        root_module,
+        sources.into_iter().collect(),
+        pwd,
+        args.other,
+        &main_module_name,
+    )
+    .await;
 }
 
 #[derive(Clone, Debug)]
@@ -130,36 +142,5 @@ impl CanonicalPath {
 impl CanonicalPath {
     pub fn new(path: ModulePath, item: String) -> Self {
         Self { path, item }
-    }
-}
-
-#[derive(Debug)]
-pub struct ParsedModuleTree {
-    source: String,
-    children: HashMap<String, ParsedModuleTree>,
-    expressions: Vec<LocatedExpression>,
-    exported_expressions: Vec<LocatedExpression>,
-}
-
-impl ParsedModuleTree {
-    pub fn get_sources(&self, path: &ModulePath, sources: &mut Vec<(String, String)>) {
-        sources.push((path.to_string(), self.source.clone()));
-        for (name, child) in &self.children {
-            child.get_sources(&path.push(name.clone()), sources);
-        }
-    }
-}
-
-pub struct ParsedProgram {
-    children: HashMap<String, ParsedModuleTree>,
-}
-
-impl ParsedProgram {
-    pub fn get_sources(&self) -> Vec<(String, String)> {
-        let mut sources = Vec::new();
-        for (name, child) in &self.children {
-            child.get_sources(&ModulePath::from_root(name), &mut sources);
-        }
-        sources
     }
 }

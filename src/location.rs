@@ -61,6 +61,14 @@ impl Location {
         self.end.line = end_pos.0;
         self.end.column = end_pos.1;
     }
+    pub fn merge(&self, other: &Location) -> Location {
+        Location {
+            start: self.start.clone(),
+            end: other.end.clone(),
+            module: self.module.clone(),
+            file_path: self.file_path.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

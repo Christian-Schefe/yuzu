@@ -1,7 +1,4 @@
-use crate::{
-    CanonicalPath, ModulePath,
-    parser::{BinaryOp, FunctionParameters, Identifier, Pattern, UnaryOp},
-};
+use crate::parser::{BinaryOp, FunctionParameters, Pattern, UnaryOp};
 
 pub type CodePointer = usize;
 
@@ -9,19 +6,21 @@ pub type CodePointer = usize;
 pub enum Instruction {
     Exit,
     DuplicateTopN(usize), // number of number or elements to duplicate
-    Load(Identifier),
-    Store(Identifier),
-    StartInitializeLazy(CanonicalPath),
-    InitializeLazy(CanonicalPath),
-    InitializeModule(ModulePath),
-    Define(Pattern),
-    DefineCanonic(CanonicalPath, CodePointer),
+    Load(String),
+    Store(String),
+    StartInitializeLazy,
+    InitializeLazy,
+    Define(Pattern, bool),
+    DefineLazy(String, CodePointer),
+    InitModule,
+    SetRootModule,
     LoadProperty(String),
     StoreProperty(String),
     LoadIndex,
     StoreIndex,
     Pop,
     PushNull,
+    PushModule(CodePointer),
     PushBool(bool),
     PushInteger(String),
     PushNumber(f64),

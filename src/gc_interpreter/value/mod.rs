@@ -35,6 +35,7 @@ pub enum Value<'a> {
     ClassInstance(GcRefLock<'a, ClassInstanceValue<'a>>),
     Function(GcRefLock<'a, FunctionValue<'a>>),
     Class(GcRefLock<'a, ClassValue<'a>>),
+    Module(GcRefLock<'a, ModuleValue<'a>>),
     Resource(GcRefLock<'a, Box<dyn Resource>>),
     AsyncResource(Gc<'a, StaticCollect<Box<dyn AsyncResource>>>),
     Buffer(Gc<'a, BufferValue<'a>>),
@@ -691,6 +692,7 @@ impl<'a> Value<'a> {
             Value::Null => "Null",
             Value::Array(_) => "Array",
             Value::Object(_) => "Object",
+            Value::Module(_) => "Module",
             Value::ClassInstance(_) => "ClassInstance",
             Value::Function(_) => "Function",
             Value::Class(_) => "Class",
@@ -723,6 +725,7 @@ pub fn value_to_string(var: &Value) -> String {
                 .join(", ");
             format!("{{{}}}", entries)
         }
+        Value::Module(_) => "<module>".to_string(),
         Value::ClassInstance(class_instance) => {
             let class_instance = class_instance.borrow();
             let inner = value_to_string(&class_instance.inner);
@@ -851,51 +854,61 @@ pub struct ValueClasses<'a> {
     pub typed_slice: GcRefLock<'a, ClassValue<'a>>,
 }
 
-#[derive(Collect)]
+#[derive(Collect, Debug)]
 #[collect(no_drop)]
-pub struct ModuleTree<'a> {
+pub struct ModuleValue<'a> {
     pub env: Gc<'a, Environment<'a>>,
-    children: HashMap<String, GcRefLock<'a, ModuleTree<'a>>>,
+    pub initialized: bool,
     pub initializer: Option<CodePointer>,
-    pub is_initialized: bool,
 }
 
-impl<'a> ModuleTree<'a> {
+impl<'a> ModuleValue<'a> {
     pub fn new(mc: &Mutation<'a>, global_env: Gc<'a, Environment<'a>>) -> Self {
         Self {
             env: Gc::new(mc, Environment::new_child(mc, global_env)),
-            children: HashMap::new(),
+            initialized: true,
             initializer: None,
-            is_initialized: false,
         }
     }
-    pub fn get_or_insert(
+    pub fn new_with_init(
+        mc: &Mutation<'a>,
+        global_env: Gc<'a, Environment<'a>>,
+        initializer: CodePointer,
+    ) -> Self {
+        Self {
+            env: Gc::new(mc, Environment::new_child(mc, global_env)),
+            initialized: false,
+            initializer: Some(initializer),
+        }
+    }
+
+    pub fn insert_new_module(
+        &self,
         ctx: &Context<'a>,
-        tree: GcRefLock<'a, ModuleTree<'a>>,
-        module_path: &ModulePath,
-    ) -> GcRefLock<'a, ModuleTree<'a>> {
-        let mut current = tree;
-        for segment in &module_path.path {
-            current = *current
-                .borrow_mut(ctx.mc)
-                .children
-                .entry(segment.clone())
-                .or_insert_with(|| ctx.gc_lock(ModuleTree::new(ctx.mc, ctx.root.global_env)))
+        name: &str,
+    ) -> Option<GcRefLock<'a, ModuleValue<'a>>> {
+        let module = ctx.gc_lock(ModuleValue::new(ctx.mc, ctx.root.global_env));
+        if self.env.define_const(ctx, name, Value::Module(module)) {
+            Some(module)
+        } else {
+            None
         }
-        current
     }
-    pub fn get(
-        tree: GcRefLock<'a, ModuleTree<'a>>,
-        module_path: &ModulePath,
-    ) -> Option<GcRefLock<'a, ModuleTree<'a>>> {
-        let mut current = tree;
-        for segment in &module_path.path {
-            if let Some(child) = current.borrow().children.get(segment) {
-                current = *child;
-            } else {
-                return None;
+
+    pub fn get_at_path(
+        module: GcRefLock<'a, ModuleValue<'a>>,
+        path: &ModulePath,
+    ) -> Option<GcRefLock<'a, ModuleValue<'a>>> {
+        let mut current_module = module;
+        for segment in path.path.iter() {
+            let val = current_module.borrow().env.get(segment)?;
+            match val {
+                Value::Module(mod_ref) => {
+                    current_module = mod_ref;
+                }
+                _ => return None,
             }
         }
-        Some(current)
+        Some(current_module)
     }
 }

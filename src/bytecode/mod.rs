@@ -85,6 +85,36 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             }
             code.push(located(Instruction::ExitFrame, expression));
         }
+        Expression::ModuleLiteral { expressions } => {
+            let jump_index = code.len();
+            code.push(located(Instruction::Jump(0), expression));
+            let initializer = code.len();
+
+            for expr in expressions {
+                if matches!(&expr.data, Expression::CanonicDefine { .. }) {
+                    compile(expr, code);
+                    code.push(located(Instruction::Pop, expr));
+                }
+            }
+
+            code.push(located(Instruction::EnterBlock, expression));
+            for expr in expressions {
+                if !matches!(&expr.data, Expression::CanonicDefine { .. }) {
+                    compile(expr, code);
+                    code.push(located(Instruction::Pop, expr));
+                }
+            }
+            code.push(located(Instruction::ExitFrame, expression));
+
+            code.push(located(Instruction::PushNull, expression));
+            code.push(located(Instruction::ExitFrame, expression));
+            let cur_index = code.len();
+            let Instruction::Jump(target) = &mut code[jump_index].data else {
+                unreachable!();
+            };
+            *target = cur_index;
+            code.push(located(Instruction::PushModule(initializer), expression));
+        }
         Expression::If {
             condition,
             then_branch,
@@ -161,11 +191,49 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             code.push(located(Instruction::PushNull, expression));
             code.push(located(Instruction::ExitFrame, expression));
         }
-        Expression::Define { pattern, value } => {
+        Expression::Define {
+            pattern,
+            value,
+            is_const,
+        } => {
             compile(value, code);
-            code.push(located(Instruction::Define(pattern.data.clone()), pattern));
+            code.push(located(
+                Instruction::Define(pattern.data.clone(), *is_const),
+                pattern,
+            ));
             code.push(located(Instruction::PushNull, expression));
         }
+        Expression::CanonicDefine { name, value } => match value.data {
+            Expression::ModuleLiteral { .. } | Expression::FunctionLiteral { .. } => {
+                compile(value, code);
+                code.push(located(
+                    Instruction::Define(Pattern::Ident(name.clone()), true),
+                    value.location.clone(),
+                ));
+                code.push(located(Instruction::PushNull, expression));
+            }
+            _ => {
+                let jump_index = code.len();
+                code.push(located(Instruction::Jump(0), expression));
+
+                let body_pointer = code.len();
+                code.push(located(Instruction::StartInitializeLazy, expression));
+                compile(value, code);
+                code.push(located(Instruction::InitializeLazy, expression));
+                code.push(located(Instruction::ExitFrame, expression));
+
+                let cur_index = code.len();
+                let Instruction::Jump(target) = &mut code[jump_index].data else {
+                    unreachable!();
+                };
+                *target = cur_index;
+                code.push(located(
+                    Instruction::DefineLazy(name.clone(), body_pointer),
+                    expression,
+                ));
+                code.push(located(Instruction::PushNull, expression));
+            }
+        },
         Expression::FunctionCall {
             function,
             arguments,
@@ -205,35 +273,6 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             compile(object, code);
             code.push(located(
                 Instruction::LoadProperty(field.clone()),
-                expression,
-            ));
-        }
-        Expression::CanonicDefine { name, value } => {
-            let jump_index = code.len();
-            code.push(located(Instruction::Jump(0), expression));
-            let body_pointer = code.len();
-            code.push(located(
-                Instruction::InitializeModule(name.path.clone()),
-                expression,
-            ));
-            code.push(located(Instruction::Pop, expression));
-            code.push(located(
-                Instruction::StartInitializeLazy(name.clone()),
-                expression,
-            ));
-            compile(value, code);
-            code.push(located(
-                Instruction::InitializeLazy(name.clone()),
-                expression,
-            ));
-            code.push(located(Instruction::ExitFrame, expression));
-            let cur_index = code.len();
-            let Instruction::Jump(target) = &mut code[jump_index].data else {
-                unreachable!();
-            };
-            *target = cur_index;
-            code.push(located(
-                Instruction::DefineCanonic(name.clone(), body_pointer),
                 expression,
             ));
         }
@@ -391,7 +430,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             };
             *target = cur_index;
             if let Some(parent) = parent {
-                code.push(located(Instruction::Load(parent.clone()), expression));
+                compile(parent, code);
             }
             code.push(located(
                 Instruction::PushClass {
@@ -436,7 +475,7 @@ pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instructio
             *catch_target = cur_index;
             code.push(located(Instruction::EnterBlock, expression)); // new scope for catch variable
             code.push(located(
-                Instruction::Define(Pattern::Ident(exception_var.clone())),
+                Instruction::Define(Pattern::Ident(exception_var.clone()), false),
                 expression,
             ));
             compile(catch_block, code);

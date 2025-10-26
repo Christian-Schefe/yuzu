@@ -5,7 +5,7 @@ use crate::{
         Context, ExecContext, Value, get_class_maybe_lazy, get_std_env,
         value::{ClassInstanceValue, IntVariant, StringVariant},
     },
-    parser::{BinaryOp, Identifier, UnaryOp},
+    parser::{BinaryOp, UnaryOp},
 };
 
 pub fn runtime_error<'a>(
@@ -99,12 +99,11 @@ pub fn field_access_error<'a>(
 pub fn cyclic_static_initialization<'a>(
     ctx: &Context<'a>,
     exec_ctx: &ExecContext<'a>,
-    name: &Identifier,
 ) -> Value<'a> {
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Cyclic static initialization: {}", name),
+        &format!("Cyclic static initialization"),
         "CyclicStaticInitialization",
     )
 }
@@ -113,19 +112,6 @@ pub fn undefined_variable<'a>(
     ctx: &Context<'a>,
     exec_ctx: &ExecContext<'a>,
     name: &str,
-) -> Value<'a> {
-    runtime_error(
-        ctx,
-        exec_ctx,
-        &format!("Undefined variable: {}", name),
-        "UndefinedVariable",
-    )
-}
-
-pub fn undefined_identifier<'a>(
-    ctx: &Context<'a>,
-    exec_ctx: &ExecContext<'a>,
-    name: &Identifier,
 ) -> Value<'a> {
     runtime_error(
         ctx,

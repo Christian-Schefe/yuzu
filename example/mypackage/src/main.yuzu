@@ -75,6 +75,8 @@ export let b = a + 10;
 
 print("Starting main", std::TcpListener);
 
+    let obj = new root::mod1::TestClass();
+    
 let main_fut = main();
 print("After starting main");
 let fut = test_async();
