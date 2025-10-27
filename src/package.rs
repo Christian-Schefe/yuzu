@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::Path,
 };
 
 use ariadne::{Color, Label, Report, ReportKind};
@@ -20,7 +20,7 @@ pub struct PackageConfig {
     pub dependencies: Vec<String>,
 }
 
-pub fn try_load_config(folder: &PathBuf) -> Result<PackageConfig, String> {
+pub fn try_load_config(folder: &Path) -> Result<PackageConfig, String> {
     let config_path = folder.join("yuzuconf.json");
     if !config_path.exists() {
         return Err(format!(
@@ -34,12 +34,12 @@ pub fn try_load_config(folder: &PathBuf) -> Result<PackageConfig, String> {
 }
 
 pub fn parse_package_root(
-    folder: &PathBuf,
+    folder: &Path,
     module_tree: &mut Vec<LocatedExpression>,
     sources: &mut HashMap<String, String>,
 ) -> Result<String, ()> {
     let config = try_load_config(folder).map_err(|e| {
-        eprintln!("Failed to load package config: {}", e);
+        eprintln!("Failed to load package config: {e}");
     })?;
     let mut visited_files = HashSet::new();
     let root_path = ModulePath::from_root(&config.name);
@@ -75,7 +75,7 @@ pub fn parse_package_root(
 }
 
 pub fn parse_fake_package(
-    main_file: &PathBuf,
+    main_file: &Path,
     module_tree: &mut Vec<LocatedExpression>,
     sources: &mut HashMap<String, String>,
 ) -> Result<String, ()> {
@@ -110,10 +110,10 @@ pub fn parse_fake_package(
 fn parse_module_tree(
     visited_files: &mut HashSet<String>,
     path: ModulePath,
-    file_path: &PathBuf,
+    file_path: &Path,
     sources: &mut HashMap<String, String>,
 ) -> Result<LocatedExpression, ()> {
-    let contents = std::fs::read_to_string(&file_path).unwrap();
+    let contents = std::fs::read_to_string(file_path).unwrap();
     let canonic_path_str = file_path.to_string_lossy().to_string();
     let pm = parse_string(
         &contents,
@@ -149,8 +149,7 @@ fn parse_module_tree(
             )
             .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
             .with_message(format!(
-                "Module imported multiple times: {}",
-                child_module_path
+                "Module imported multiple times: {child_module_path}"
             ))
             .with_label(
                 Label::new((child.location.module.clone(), child.location.span()))
@@ -190,7 +189,7 @@ fn parse_module_tree(
         first_loc.merge(&last_loc),
     );
     if sources.insert(path.to_string(), contents).is_some() {
-        panic!("Duplicate module path detected: {}", path);
+        panic!("Duplicate module path detected: {path}");
     }
     Ok(module)
 }

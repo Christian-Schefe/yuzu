@@ -23,6 +23,7 @@ impl FileResource {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(|e| e.to_string())?;
         Ok(Self {
@@ -66,6 +67,7 @@ impl AsyncFileResource {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .await
             .map_err(|e| e.to_string())?;
@@ -160,7 +162,7 @@ pub struct TcpListenerResource {
 
 impl TcpListenerResource {
     pub async fn bind(host: String, port: u16) -> Result<Self, String> {
-        println!(">> TCP Listener binding on {}:{}", host, port);
+        println!(">> TCP Listener binding on {host}:{port}");
         let listener = tokio::net::TcpListener::bind((host, port))
             .await
             .map_err(|e| e.to_string())?;

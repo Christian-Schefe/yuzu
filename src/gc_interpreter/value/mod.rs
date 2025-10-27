@@ -2,10 +2,13 @@ use gc_arena::{
     Collect, Gc, Mutation, StaticCollect,
     lock::{GcRefLock, RefLock},
 };
-use std::{any::Any, collections::HashMap, fmt::Debug};
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::{Debug, Display},
+};
 
 use crate::{
-    ModulePath,
     gc_interpreter::{
         Context, ExecContext,
         exception::{cannot_assign_to_constant, undefined_variable},
@@ -68,8 +71,8 @@ impl Debug for FutureValue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FutureValue::Pending(_) => write!(f, "<pending future>"),
-            FutureValue::Completed(v) => write!(f, "<completed future: {:?}>", v),
-            FutureValue::Failed(e) => write!(f, "<failed future: {:?}>", e),
+            FutureValue::Completed(v) => write!(f, "<completed future: {v:?}>"),
+            FutureValue::Failed(e) => write!(f, "<failed future: {e:?}>"),
         }
     }
 }
@@ -133,21 +136,21 @@ pub enum StringVariant<'a> {
 impl Debug for StringVariant<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StringVariant::Ascii(_) => write!(f, "Ascii({})", self.to_string()),
-            StringVariant::Utf16(_) => write!(f, "Utf16({})", self.to_string()),
-            StringVariant::Utf32(_) => write!(f, "Utf32({})", self.to_string()),
+            StringVariant::Ascii(_) => write!(f, "Ascii({self})"),
+            StringVariant::Utf16(_) => write!(f, "Utf16({self})"),
+            StringVariant::Utf32(_) => write!(f, "Utf32({self})"),
             StringVariant::Slice {
                 original,
                 start,
                 length,
-            } => write!(f, "Slice({}, {}, {})", original.to_string(), start, length),
+            } => write!(f, "Slice({original}, {start}, {length})"),
         }
     }
 }
 
-impl<'a> StringVariant<'a> {
-    pub fn to_string(&self) -> String {
-        match self {
+impl<'a> Display for StringVariant<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
             StringVariant::Ascii(v) => v.iter().map(|&b| b as char).collect(),
             StringVariant::Utf16(v) => String::from_utf16_lossy(v),
             StringVariant::Utf32(v) => v.iter().collect(),
@@ -169,8 +172,12 @@ impl<'a> StringVariant<'a> {
                     StringVariant::Slice { .. } => panic!("Nested slices are not allowed"),
                 }
             }
-        }
+        };
+        write!(f, "{s}")
     }
+}
+
+impl<'a> StringVariant<'a> {
     pub fn len(&self) -> usize {
         match self {
             StringVariant::Ascii(v) => v.len(),
@@ -208,7 +215,7 @@ impl<'a> StringVariant<'a> {
         } = &*original
         {
             Some(ctx.gc(StringVariant::Slice {
-                original: inner.clone(),
+                original: *inner,
                 start: inner_start + start,
                 length,
             }))
@@ -394,7 +401,7 @@ impl TypedBufferType {
                     }
                     _ => return None,
                 };
-                return Some(());
+                Some(())
             }
             Value::Number(f) => {
                 let f = *f;
@@ -404,14 +411,14 @@ impl TypedBufferType {
                         buffer[..4].copy_from_slice(&bytes);
                     }
                     TypedBufferType::Float64 => {
-                        let bytes = (f as f64).to_le_bytes();
+                        let bytes = f.to_le_bytes();
                         buffer[..8].copy_from_slice(&bytes);
                     }
                     _ => return None,
                 };
-                return Some(());
+                Some(())
             }
-            _ => return None,
+            _ => None,
         }
     }
 }
@@ -470,13 +477,13 @@ impl std::fmt::Debug for dyn Resource {
     }
 }
 
-pub fn get_async_resource<T: 'static>(val: &Box<dyn AsyncResource>) -> Option<T> {
-    val.into_any().downcast::<T>().map(|b| *b).ok()
+pub fn get_async_resource<T: 'static>(val: &dyn AsyncResource) -> Option<T> {
+    val.as_any_box().downcast::<T>().map(|b| *b).ok()
 }
 
 #[allow(unused)]
 pub trait AsyncResource: AsyncResourceBase + Any {
-    fn into_any(&self) -> Box<dyn Any>;
+    fn as_any_box(&self) -> Box<dyn Any>;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -490,7 +497,7 @@ pub trait AsyncResourceBase {
 }
 
 impl<T: Any + 'static + AsyncResourceBase> AsyncResource for T {
-    fn into_any(&self) -> Box<dyn Any> {
+    fn as_any_box(&self) -> Box<dyn Any> {
         self.clone()
     }
     fn as_any(&self) -> &dyn Any {
@@ -515,6 +522,15 @@ pub struct FunctionValue<'a> {
     pub is_async: bool,
 }
 
+type BuiltinFunction = Box<
+    dyn for<'b> Fn(
+        &Context<'b>,
+        &ExecContext<'b>,
+        Vec<Value<'b>>,
+        Gc<'b, Environment<'b>>,
+    ) -> Result<Value<'b>, LocatedError<'b>>,
+>;
+
 #[derive(Collect)]
 #[collect(no_drop)]
 pub enum FunctionValueType<'a> {
@@ -524,16 +540,7 @@ pub enum FunctionValueType<'a> {
         env: Gc<'a, Environment<'a>>,
     },
     Builtin {
-        func: StaticCollect<
-            Box<
-                dyn for<'b> Fn(
-                    &Context<'b>,
-                    &ExecContext<'b>,
-                    Vec<Value<'b>>,
-                    Gc<'b, Environment<'b>>,
-                ) -> Result<Value<'b>, LocatedError<'b>>,
-            >,
-        >,
+        func: StaticCollect<BuiltinFunction>,
     },
 }
 
@@ -565,7 +572,7 @@ impl std::fmt::Debug for FunctionValueType<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FunctionValueType::Function { parameters, .. } => {
-                write!(f, "<function ({})>", parameters.to_string())
+                write!(f, "<function ({})>", **parameters)
             }
             FunctionValueType::Builtin { .. } => write!(f, "<builtin function>"),
         }
@@ -642,12 +649,14 @@ impl<'a> Environment<'a> {
         name: &str,
         value: Value<'a>,
     ) -> Result<(), LocatedError<'a>> {
-        if let Some(EnvValue::Value(v)) = env.values.borrow_mut(ctx.mc).get_mut(name) {
+        let mut env_mut = env.values.borrow_mut(ctx.mc);
+        if let Some(EnvValue::Value(v)) = env_mut.get_mut(name) {
             *v = value;
             Ok(())
-        } else if let Some(_) = env.values.borrow_mut(ctx.mc).get_mut(name) {
+        } else if env_mut.contains_key(name) {
             Err(cannot_assign_to_constant(ctx, exec_ctx, name))
         } else if let Some(parent) = &env.parent {
+            drop(env_mut);
             Environment::set(ctx, exec_ctx, *parent, name, value)
         } else {
             Err(undefined_variable(ctx, exec_ctx, name))
@@ -670,15 +679,6 @@ impl<'a> Environment<'a> {
         }
         map.insert(name.to_string(), EnvValue::ConstValue(value));
         true
-    }
-
-    pub fn collect_known_identifiers(&self, identifiers: &mut Vec<String>) {
-        for (k, _) in self.values.borrow().iter() {
-            identifiers.push(k.clone());
-        }
-        if let Some(parent) = &self.parent {
-            parent.collect_known_identifiers(identifiers);
-        }
     }
 }
 
@@ -723,13 +723,13 @@ pub fn value_to_string(var: &Value) -> String {
                 .map(|(k, v)| format!("{}: {}", k, value_to_string(v)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{{{}}}", entries)
+            format!("{{{entries}}}")
         }
         Value::Module(_) => "<module>".to_string(),
         Value::ClassInstance(class_instance) => {
             let class_instance = class_instance.borrow();
             let inner = value_to_string(&class_instance.inner);
-            format!("<instance {}>", inner)
+            format!("<instance {inner}>")
         }
         Value::Array(elements) => {
             let elements = elements
@@ -738,13 +738,13 @@ pub fn value_to_string(var: &Value) -> String {
                 .map(|e| value_to_string(e))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("[{}]", elements)
+            format!("[{elements}]")
         }
         Value::Function(f) => match &*f.borrow().func {
             FunctionValueType::Function { parameters, .. } => {
-                format!("<function ({})>", parameters.to_string())
+                format!("<function ({})>", **parameters)
             }
-            FunctionValueType::Builtin { .. } => format!("<builtin function>"),
+            FunctionValueType::Builtin { .. } => "<builtin function>".to_string(),
         },
         Value::Class(p) => {
             let static_methods = p
@@ -765,26 +765,22 @@ pub fn value_to_string(var: &Value) -> String {
                 value_to_string(&Value::Function(ctor))
             });
             let entries = format!(
-                "static methods: {{{}}}, constructor: {}, methods: {{{}}}",
-                static_methods, constructor, methods
+                "static methods: {{{static_methods}}}, constructor: {constructor}, methods: {{{methods}}}"
             );
 
             let parent = if let Some(parent) = &p.borrow().parent {
-                format!(
-                    " extends {}",
-                    value_to_string(&Value::Class(parent.clone()))
-                )
+                format!(" extends {}", value_to_string(&Value::Class(*parent)))
             } else {
                 "".to_string()
             };
-            format!("<prototype {{{}}}{}>", entries, parent)
+            format!("<prototype {{{entries}}}{parent}>")
         }
         Value::Buffer(buf) => {
             let display = if buf.length > 10 {
                 let mut s = buf.with_slice(|slice| {
                     slice[..10]
                         .iter()
-                        .map(|b| format!("{:02x}", b))
+                        .map(|b| format!("{b:02x}"))
                         .collect::<Vec<_>>()
                         .join(" ")
                 });
@@ -794,12 +790,12 @@ pub fn value_to_string(var: &Value) -> String {
                 buf.with_slice(|slice| {
                     slice
                         .iter()
-                        .map(|b| format!("{:02x}", b))
+                        .map(|b| format!("{b:02x}"))
                         .collect::<Vec<_>>()
                         .join(" ")
                 })
             };
-            format!("<buffer [{}]>", display)
+            format!("<buffer [{display}]>")
         }
         Value::TypedBuffer {
             buffer,
@@ -828,7 +824,7 @@ pub fn value_to_string(var: &Value) -> String {
             }
         },
         Value::StackTrace(trace) => {
-            format!("<stack trace: {:?}>", trace)
+            format!("<stack trace: {trace:?}>")
         }
     }
 }
@@ -880,35 +876,5 @@ impl<'a> ModuleValue<'a> {
             initialized: false,
             initializer: Some(initializer),
         }
-    }
-
-    pub fn insert_new_module(
-        &self,
-        ctx: &Context<'a>,
-        name: &str,
-    ) -> Option<GcRefLock<'a, ModuleValue<'a>>> {
-        let module = ctx.gc_lock(ModuleValue::new(ctx.mc, ctx.root.global_env));
-        if self.env.define_const(ctx, name, Value::Module(module)) {
-            Some(module)
-        } else {
-            None
-        }
-    }
-
-    pub fn get_at_path(
-        module: GcRefLock<'a, ModuleValue<'a>>,
-        path: &ModulePath,
-    ) -> Option<GcRefLock<'a, ModuleValue<'a>>> {
-        let mut current_module = module;
-        for segment in path.path.iter() {
-            let val = current_module.borrow().env.get(segment)?;
-            match val {
-                Value::Module(mod_ref) => {
-                    current_module = mod_ref;
-                }
-                _ => return None,
-            }
-        }
-        Some(current_module)
     }
 }

@@ -134,12 +134,6 @@ impl std::fmt::Display for CanonicalPath {
 }
 
 impl CanonicalPath {
-    pub fn to_string(&self) -> String {
-        format!("{}::{}", self.path, self.item)
-    }
-}
-
-impl CanonicalPath {
     pub fn new(path: ModulePath, item: String) -> Self {
         Self { path, item }
     }

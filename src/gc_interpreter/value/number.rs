@@ -14,7 +14,7 @@ pub enum IntVariant {
 impl Display for IntVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IntVariant::Small(i) => write!(f, "{}", i),
+            IntVariant::Small(i) => write!(f, "{i}"),
             IntVariant::Big(b) => write!(f, "{}", **b),
         }
     }
@@ -38,7 +38,7 @@ impl IntVariant {
         } else if let Ok(b) = s.parse::<num_bigint::BigInt>() {
             IntVariant::Big(StaticCollect(b))
         } else {
-            panic!("Invalid integer string: {}", s);
+            panic!("Invalid integer string: {s}");
         }
     }
     pub fn as_big(&self) -> num_bigint::BigInt {

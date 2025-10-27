@@ -51,20 +51,18 @@ impl FutureArena {
     }
 }
 
+type FutureTransform = dyn for<'b> Fn(
+    &Context<'b>,
+    Vec<Value<'b>>,
+    Box<dyn Any>,
+) -> Result<Value<'b>, LocatedError<'b>>;
+
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct FutureHandle<'a> {
     future: FutureId,
     args: Vec<Value<'a>>,
-    transform: StaticCollect<
-        Box<
-            dyn for<'b> Fn(
-                &Context<'b>,
-                Vec<Value<'b>>,
-                Box<dyn Any>,
-            ) -> Result<Value<'b>, LocatedError<'b>>,
-        >,
-    >,
+    transform: StaticCollect<Box<FutureTransform>>,
 }
 
 impl<'a> FutureHandle<'a> {
@@ -85,9 +83,7 @@ impl<'a> FutureHandle<'a> {
     }
     pub fn poll(&mut self, ctx: &Context<'a>) -> Option<Result<Value<'a>, Value<'a>>> {
         let mut arena = ctx.root.future_arena.borrow_mut();
-        let Some(res) = arena.poll_future(self.future) else {
-            return None;
-        };
+        let res = arena.poll_future(self.future)?;
         Some((self.transform.0)(ctx, self.args.clone(), res))
     }
 }

@@ -350,12 +350,12 @@ impl Display for FunctionParameters {
         let params = self.parameters.join(", ");
         if let Some(rest) = &self.rest_parameter {
             if !self.parameters.is_empty() {
-                write!(f, "{}, ...{}", params, rest)
+                write!(f, "{params}, ...{rest}")
             } else {
-                write!(f, "...{}", rest)
+                write!(f, "...{rest}")
             }
         } else {
-            write!(f, "{}", params)
+            write!(f, "{params}")
         }
     }
 }
@@ -485,7 +485,7 @@ impl LocatedExpression {
                 arguments,
             } => {
                 function.set_module(module_path, file_path, line_index);
-                arguments.into_iter().for_each(|(arg, _)| {
+                arguments.iter_mut().for_each(|(arg, _)| {
                     arg.set_module(module_path, file_path, line_index);
                 });
             }
@@ -505,7 +505,7 @@ impl LocatedExpression {
             Expression::New { expr, arguments } => {
                 expr.set_module(module_path, file_path, line_index);
                 arguments
-                    .into_iter()
+                    .iter_mut()
                     .for_each(|arg| arg.set_module(module_path, file_path, line_index));
             }
         }

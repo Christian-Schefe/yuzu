@@ -23,7 +23,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                 io_error(
                     ctx,
                     exec_ctx,
-                    &format!("Failed to open file {}: {}", path_str, e),
+                    &format!("Failed to open file {path_str}: {e}"),
                 )
             })?;
             Ok(Value::Resource(ctx.gc_lock(Box::new(file))))
@@ -48,7 +48,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     Err(e) => Err(io_error(
                         ctx,
                         exec_ctx,
-                        &format!("Failed to open file asynchronously {}: {}", path_str, e),
+                        &format!("Failed to open file asynchronously {path_str}: {e}"),
                     )),
                     Ok(res) => Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res))))),
                 },
@@ -67,7 +67,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                 io_error(
                     ctx,
                     exec_ctx,
-                    &format!("Failed to open file {}: {}", path_str, e),
+                    &format!("Failed to open file {path_str}: {e}"),
                 )
             })?;
             Ok(Value::Resource(ctx.gc_lock(Box::new(file))))
@@ -81,7 +81,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             expect_arg_len(ctx, exec_ctx, &args, 2)?;
             let host = expect_string_arg(ctx, exec_ctx, &args[0])?.to_string();
             let port = expect_usize_arg(ctx, exec_ctx, &args[1])?;
-            let port = if let Some(port) = TryInto::<u16>::try_into(port).ok() {
+            let port = if let Ok(port) = TryInto::<u16>::try_into(port) {
                 port
             } else {
                 return Err(type_error(
@@ -100,7 +100,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     Err(e) => Err(io_error(
                         ctx,
                         exec_ctx,
-                        &format!("Failed to connect to {}:{}: {}", host, port, e),
+                        &format!("Failed to connect to {host}:{port}: {e}"),
                     )),
                     Ok(res) => Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res))))),
                 },
@@ -114,7 +114,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             expect_arg_len(ctx, exec_ctx, &args, 2)?;
             let addr = expect_string_arg(ctx, exec_ctx, &args[0])?.to_string();
             let port = expect_usize_arg(ctx, exec_ctx, &args[1])?;
-            let port = if let Some(port) = TryInto::<u16>::try_into(port).ok() {
+            let port = if let Ok(port) = TryInto::<u16>::try_into(port) {
                 port
             } else {
                 return Err(type_error(
@@ -134,7 +134,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     Err(e) => Err(io_error(
                         ctx,
                         exec_ctx,
-                        &format!("Failed to bind to {}:{}: {}", addr, port, e),
+                        &format!("Failed to bind to {addr}:{port}: {e}"),
                     )),
                     Ok(res) => Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res))))),
                 },
@@ -148,7 +148,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             expect_arg_len(ctx, exec_ctx, &args, 1)?;
             match &args[0] {
                 Value::AsyncResource(res) => {
-                    let Some(listener) = get_async_resource::<TcpListenerResource>(&res) else {
+                    let Some(listener) = get_async_resource::<TcpListenerResource>(&*res.0) else {
                         return Err(type_error(
                             ctx,
                             exec_ctx,
@@ -166,7 +166,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                             Err(e) => Err(io_error(
                                 ctx,
                                 exec_ctx,
-                                &format!("Failed to accept TCP connection: {}", e),
+                                &format!("Failed to accept TCP connection: {e}"),
                             )),
                             Ok(res) => {
                                 Ok(Value::AsyncResource(ctx.gc(StaticCollect(Box::new(res)))))
@@ -174,13 +174,11 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                         },
                     )
                 }
-                _ => {
-                    return Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "Accept argument must be a resource",
-                    ));
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Accept argument must be a resource",
+                )),
             }
         })),
     );
@@ -199,17 +197,15 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                 Value::Resource(res) => {
                     let mut res_ref = res.borrow_mut(ctx.mc);
                     res_ref.close().map_err(|e| {
-                        io_error(ctx, exec_ctx, &format!("Failed to close resource: {}", e))
+                        io_error(ctx, exec_ctx, &format!("Failed to close resource: {e}"))
                     })?;
                     Ok(Value::Null)
                 }
-                _ => {
-                    return Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "Close argument must be a resource",
-                    ));
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Close argument must be a resource",
+                )),
             }
         })),
     );
@@ -224,22 +220,16 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     let buf = expect_buffer_arg(ctx, exec_ctx, &args[1])?;
                     buf.with_mut_slice(ctx, |slice| {
                         let bytes_read = res_ref.read(slice).map_err(|e| {
-                            io_error(
-                                ctx,
-                                exec_ctx,
-                                &format!("Failed to read from resource: {}", e),
-                            )
+                            io_error(ctx, exec_ctx, &format!("Failed to read from resource: {e}"))
                         })?;
                         Ok(Value::Integer(IntVariant::from_u64(bytes_read as u64)))
                     })
                 }
-                _ => {
-                    return Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "Read argument must be a resource",
-                    ));
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Read argument must be a resource",
+                )),
             }
         })),
     );
@@ -273,7 +263,7 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                                 Err(e) => Err(io_error(
                                     ctx,
                                     exec_ctx,
-                                    &format!("Failed to read from resource: {}", e),
+                                    &format!("Failed to read from resource: {e}"),
                                 )),
                                 Ok((n, buffer)) => {
                                     slice[..n].copy_from_slice(&buffer[..n]);
@@ -283,13 +273,11 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                         },
                     )
                 }
-                _ => {
-                    return Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "Read argument must be an async resource",
-                    ));
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Read argument must be an async resource",
+                )),
             }
         })),
     );
@@ -304,22 +292,16 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     let buf = expect_buffer_arg(ctx, exec_ctx, &args[1])?;
                     buf.with_slice(|slice| {
                         let bytes_written = res_ref.write(slice).map_err(|e| {
-                            io_error(
-                                ctx,
-                                exec_ctx,
-                                &format!("Failed to write to resource: {}", e),
-                            )
+                            io_error(ctx, exec_ctx, &format!("Failed to write to resource: {e}"))
                         })?;
                         Ok(Value::Integer(IntVariant::from_u64(bytes_written as u64)))
                     })
                 }
-                _ => {
-                    return Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "Write argument must be a resource",
-                    ));
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Write argument must be a resource",
+                )),
             }
         })),
     );

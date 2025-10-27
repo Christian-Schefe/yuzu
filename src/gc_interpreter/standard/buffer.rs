@@ -36,12 +36,12 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
         };
         env.define_const(
             ctx,
-            &format!("{}_of", name),
+            &format!("{name}_of"),
             Value::Function(make_builtin_function(ctx, move |ctx, exec_ctx, args, _| {
                 expect_arg_len(ctx, exec_ctx, &args, 1)?;
                 let buf = expect_buffer_arg(ctx, exec_ctx, &args[0])?;
                 Ok(Value::TypedBuffer {
-                    buffer: buf.clone(),
+                    buffer: buf,
                     buffer_type: buffer_type.clone(),
                 })
             })),
@@ -68,11 +68,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     Ok(Value::Integer(IntVariant::from_u64(length as u64)))
                 }
                 _ => {
-                    return Err(type_error(
+                    Err(type_error(
                         ctx,
                         exec_ctx,
                         "length can only be called on TypedSlice",
-                    ));
+                    ))
                 }
             }
         })),
@@ -121,15 +121,15 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
             }
             match &args[0] {
                 Value::Buffer(buf) => buf.with_slice(|slice| {
-                    let s = String::from_utf8_lossy(&slice);
+                    let s = String::from_utf8_lossy(slice);
                     Ok(Value::String(ctx.gc(StringVariant::from_string(&s))))
                 }),
                 _ => {
-                    return Err(type_error(
+                    Err(type_error(
                         ctx,
                         exec_ctx,
                         "to_string can only be called on Buffer",
-                    ));
+                    ))
                 }
             }
         })),
@@ -155,11 +155,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     })))
                 }
                 _ => {
-                    return Err(type_error(
+                    Err(type_error(
                         ctx,
                         exec_ctx,
                         "from_string can only be called on String",
-                    ));
+                    ))
                 }
             }
         })),
@@ -194,7 +194,7 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
             }
             dst_buf.with_mut_slice(ctx, |dst_slice| {
                 src_buf.with_slice(|src_slice| {
-                    dst_slice.copy_from_slice(&src_slice);
+                    dst_slice.copy_from_slice(src_slice);
                 })
             });
             Ok(Value::Null)

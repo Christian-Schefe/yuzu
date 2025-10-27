@@ -144,7 +144,8 @@ fn pattern_parser<'tokens, 'src: 'tokens, I>()
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
-    let pattern = recursive(|pattern| {
+    
+    recursive(|pattern| {
         let ident = select! { Token::Ident(name) => match name {
             "_" => Pattern::Wildcard,
             s => Pattern::Ident(s.to_string())
@@ -153,7 +154,6 @@ where
         .boxed();
 
         let object = select! { Token::Ident(name) => name.to_string() }
-            .clone()
             .then(just(Token::Colon).ignore_then(pattern.clone()).or_not())
             .map_with(|(name, pattern), extra| {
                 let pattern =
@@ -188,7 +188,7 @@ where
                 }
                 Ok(located(
                     Pattern::Object {
-                        entries: entries,
+                        entries,
                         rest,
                     },
                     extra.span(),
@@ -228,8 +228,7 @@ where
             .boxed();
 
         choice((object, array, ident))
-    });
-    pattern
+    })
 }
 
 fn parser<'tokens, 'src: 'tokens, I>(
@@ -241,7 +240,6 @@ where
     let ident = select! { Token::Ident(name) => name.to_string() };
 
     let double_colon_identifier_with_name = ident
-        .clone()
         .separated_by(just(Token::DoubleColon))
         .at_least(1)
         .collect::<Vec<_>>()
@@ -274,10 +272,9 @@ where
     let pattern = pattern_parser().boxed();
 
     let parameter_list = ident
-        .clone()
         .map(|name| (name, false))
         .or(just(Token::ThreeDots)
-            .ignore_then(ident.clone())
+            .ignore_then(ident)
             .map(|name| (name, true)))
         .separated_by(just(Token::Comma))
         .allow_trailing()
@@ -374,7 +371,6 @@ where
 
             let pair_list = choice((
                 ident
-                    .clone()
                     .then_ignore(just(Token::Colon))
                     .map(Option::Some),
                 just(Token::ThreeDots).map(|_| None),
@@ -614,7 +610,6 @@ where
             .ignore_then(just(Token::LParen))
             .ignore_then(
                 ident
-                    .clone()
                     .then_ignore(just(Token::In))
                     .then(expr.clone()),
             )
@@ -711,7 +706,7 @@ where
         let function =  just(Token::Async)
             .or_not()
             .then_ignore(just(Token::Fn))
-            .then(ident.clone())
+            .then(ident)
             .map_with(|(is_async , name), extra| (is_async.is_some(), located(Pattern::Ident(name), extra.span())))
             .then(function_literal.clone())
             .map_with(|((is_async, pattern), mut func), extra| {
@@ -736,7 +731,7 @@ where
                     just(Token::Async).or_not()
                         .then(just(Token::Static).or_not())
                         .then_ignore(just(Token::Fn))
-                        .then(ident.clone())
+                        .then(ident)
                         .then(function_literal.clone())
                         .try_map(|(((is_async, is_static), name), mut func), span| {
                             set_function_literal_async(&mut func, is_async.is_some());
@@ -830,7 +825,7 @@ where
                     .then(just(Token::Semicolon).or_not()),
                 inline_expr
                     .clone()
-                    .then(just(Token::Semicolon).map(|x| Some(x))),
+                    .then(just(Token::Semicolon).map(Some)),
             ))
             .boxed();
             let last_statement = choice((no_semi_statements, inline_expr.clone()));
@@ -864,7 +859,7 @@ where
     .boxed();
 
     let module = just(Token::Mod)
-        .ignore_then(ident.clone())
+        .ignore_then(ident)
         .then_ignore(just(Token::Semicolon))
         .map_with(|name, extra| ParsedModuleItem::Module(located(name.to_string(), extra.span())))
         .boxed();

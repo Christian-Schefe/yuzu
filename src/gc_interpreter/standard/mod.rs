@@ -48,7 +48,7 @@ pub fn define_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>) {
                 .map(|arg| value_to_string(&arg))
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("{}", str);
+            println!("{str}");
             Ok(Value::Null)
         })),
     );
@@ -66,7 +66,7 @@ pub fn define_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a>>) {
 fn expect_arg_len<'a>(
     ctx: &Context<'a>,
     exec_ctx: &ExecContext<'a>,
-    args: &Vec<Value<'a>>,
+    args: &[Value<'a>],
     expected: usize,
 ) -> Result<(), LocatedError<'a>> {
     if args.len() != expected {
@@ -86,7 +86,7 @@ fn expect_class_arg<'a>(
     value: &Value<'a>,
 ) -> Result<GcRefLock<'a, ClassValue<'a>>, LocatedError<'a>> {
     if let Value::Class(c) = value {
-        Ok(c.clone())
+        Ok(*c)
     } else {
         Err(type_error(
             ctx,
@@ -102,7 +102,7 @@ fn expect_class_instance_arg<'a>(
     value: &Value<'a>,
 ) -> Result<GcRefLock<'a, ClassInstanceValue<'a>>, LocatedError<'a>> {
     if let Value::ClassInstance(c) = value {
-        Ok(c.clone())
+        Ok(*c)
     } else {
         Err(type_error(
             ctx,
@@ -140,7 +140,7 @@ fn expect_future_arg<'a>(
     value: &Value<'a>,
 ) -> Result<GcRefLock<'a, FutureValue<'a>>, LocatedError<'a>> {
     if let Value::Future(f) = value {
-        Ok(f.clone())
+        Ok(*f)
     } else {
         Err(type_error(
             ctx,
@@ -188,7 +188,7 @@ fn expect_string_arg<'a>(
     value: &Value<'a>,
 ) -> Result<Gc<'a, StringVariant<'a>>, LocatedError<'a>> {
     if let Value::String(s) = value {
-        Ok(s.clone())
+        Ok(*s)
     } else {
         Err(type_error(
             ctx,

@@ -14,7 +14,7 @@ pub enum LexingError {
 impl fmt::Display for LexingError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::InvalidChar(c) => write!(f, "Invalid character: {}", c),
+            Self::InvalidChar(c) => write!(f, "Invalid character: {c}"),
             Self::Other => write!(f, "Unknown lexing error"),
         }
     }
@@ -24,7 +24,7 @@ impl LexingError {
     fn at(&self, span: core::ops::Range<usize>) -> LocatedLexingError {
         LocatedLexingError {
             error: self.clone(),
-            span: span,
+            span,
         }
     }
 }
@@ -218,8 +218,8 @@ pub enum Token<'a> {
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let slice = lex.slice();
         let unquoted = &slice[1..slice.len() - 1];
-        let unescaped = unquoted.replace(r#"\""#, r#"""#).replace(r#"\n"#, "\n").replace(r#"\t"#, "\t");
-        unescaped
+        
+        unquoted.replace(r#"\""#, r#"""#).replace(r#"\n"#, "\n").replace(r#"\t"#, "\t")
     })]
     String(String),
 }
@@ -227,7 +227,7 @@ pub enum Token<'a> {
 impl fmt::Display for Token<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Bool(b) => write!(f, "Bool({})", b),
+            Self::Bool(b) => write!(f, "Bool({b})"),
             Self::Colon => write!(f, ":"),
             Self::Dot => write!(f, "."),
             Self::ThreeDots => write!(f, "..."),
@@ -288,11 +288,11 @@ impl fmt::Display for Token<'_> {
             Self::Use => write!(f, "use"),
             Self::Mod => write!(f, "mod"),
             Self::Constructor => write!(f, "constructor"),
-            Self::Ident(s) => write!(f, "Ident({})", s),
-            Self::Number(n) => write!(f, "Number({})", n),
-            Self::Integer(i) => write!(f, "Integer({})", i),
-            Self::String(s) => write!(f, "String(\"{}\")", s),
-            Self::Char(c) => write!(f, "Char('{}')", c),
+            Self::Ident(s) => write!(f, "Ident({s})"),
+            Self::Number(n) => write!(f, "Number({n})"),
+            Self::Integer(i) => write!(f, "Integer({i})"),
+            Self::String(s) => write!(f, "String(\"{s}\")"),
+            Self::Char(c) => write!(f, "Char('{c}')"),
         }
     }
 }

@@ -49,7 +49,7 @@ pub fn array_index_out_of_bounds<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Array index out of bounds: {}", index),
+        &format!("Array index out of bounds: {index}"),
         "ArrayIndexOutOfBounds",
     )
 }
@@ -62,7 +62,7 @@ pub fn index_out_of_bounds<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Array index out of bounds: {}", index),
+        &format!("Array index out of bounds: {index}"),
         "ArrayIndexOutOfBounds",
     )
 }
@@ -91,7 +91,7 @@ pub fn field_access_error<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Field access error: {}", field),
+        &format!("Field access error: {field}"),
         "FieldAccessError",
     )
 }
@@ -103,7 +103,7 @@ pub fn cyclic_static_initialization<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Cyclic static initialization"),
+        "Cyclic static initialization",
         "CyclicStaticInitialization",
     )
 }
@@ -116,7 +116,7 @@ pub fn undefined_variable<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Undefined variable: {}", name),
+        &format!("Undefined variable: {name}"),
         "UndefinedVariable",
     )
 }
@@ -129,7 +129,7 @@ pub fn duplicate_variable_definition<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Duplicate variable definition: {}", name),
+        &format!("Duplicate variable definition: {name}"),
         "DuplicateVariableDefinition",
     )
 }
@@ -179,7 +179,7 @@ pub fn cannot_assign_to_constant<'a>(
     runtime_error(
         ctx,
         exec_ctx,
-        &format!("Cannot assign to constant: {}", name),
+        &format!("Cannot assign to constant: {name}"),
         "AssignmentToConstant",
     )
 }

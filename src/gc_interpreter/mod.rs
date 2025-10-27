@@ -168,112 +168,116 @@ pub async fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) {
     loop {
         for _ in 0..instruction_batch_size {
             tokio::task::yield_now().await;
-            if let Some(_) = arena.mutate(|mc, root| {
-                let ctx = Context { mc, root };
-                let code = ctx.root.code.borrow();
-                let mut executor = ctx.root.executor.borrow_mut(mc);
+            if arena
+                .mutate(|mc, root| {
+                    let ctx = Context { mc, root };
+                    let code = ctx.root.code.borrow();
+                    let mut executor = ctx.root.executor.borrow_mut(mc);
 
-                let Some(front) = executor.queue.front() else {
-                    panic!("Executor queue is empty");
-                };
-                let mut task = front.borrow_mut(mc);
+                    let Some(front) = executor.queue.front() else {
+                        panic!("Executor queue is empty");
+                    };
+                    let mut task = front.borrow_mut(mc);
 
-                if let FutureValue::Pending(Task::Future(fut)) = &mut *task {
-                    if let Some(val) = fut.poll(&ctx) {
-                        *task = match val {
-                            Ok(v) => FutureValue::Completed(v),
-                            Err(e) => FutureValue::Failed(e),
-                        };
-                        executor.queue.pop_front();
-                        if executor.queue.is_empty() {
-                            return Some(());
+                    if let FutureValue::Pending(Task::Future(fut)) = &mut *task {
+                        if let Some(val) = fut.poll(&ctx) {
+                            *task = match val {
+                                Ok(v) => FutureValue::Completed(v),
+                                Err(e) => FutureValue::Failed(e),
+                            };
+                            executor.queue.pop_front();
+                            if executor.queue.is_empty() {
+                                return Some(());
+                            }
+                            return None;
                         }
+                        executor.cycle();
                         return None;
                     }
-                    executor.cycle();
-                    return None;
-                }
 
-                let FutureValue::Pending(Task::Exec(exec_ctx)) = &mut *task else {
-                    panic!("Executor contained non-pending or non-exec task");
-                };
+                    let FutureValue::Pending(Task::Exec(exec_ctx)) = &mut *task else {
+                        panic!("Executor contained non-pending or non-exec task");
+                    };
 
-                /*println!(
-                    "Tasks: {:?}, IP: {}, Loc: {:?}",
-                    executor.queue,
-                    exec_ctx.ip,
-                    root.source_map.borrow().0[exec_ctx.ip]
-                );*/
+                    /*println!(
+                        "Tasks: {:?}, IP: {}, Loc: {:?}",
+                        executor.queue,
+                        exec_ctx.ip,
+                        root.source_map.borrow().0[exec_ctx.ip]
+                    );*/
 
-                drop(executor);
-                let res = eval_instruction(&ctx, exec_ctx, &code);
-                let mut executor = ctx.root.executor.borrow_mut(mc);
+                    drop(executor);
+                    let res = eval_instruction(&ctx, exec_ctx, &code);
+                    let mut executor = ctx.root.executor.borrow_mut(mc);
 
-                match res {
-                    Ok(EvalResult::Exit(val)) => {
-                        println!("Task completed with value: {:?}", value_to_string(&val));
-                        *task = FutureValue::Completed(val);
-                        executor.queue.pop_front();
-                        if executor.queue.is_empty() {
-                            return Some(());
-                        }
-                    }
-                    Ok(EvalResult::Continue) => {
-                        exec_ctx.advance();
-                    }
-                    Ok(EvalResult::Yield) => {
-                        executor.cycle();
-                    }
-                    Err(e) => match bubble_error(exec_ctx, e) {
-                        None => {
-                            exec_ctx.advance();
-                        }
-                        Some(err_val) => {
-                            println!("Uncaught error: {:?}", err_val);
-                            let err = convert_error(&ctx, exec_ctx, &err_val);
-                            *task = FutureValue::Failed(err_val);
+                    match res {
+                        Ok(EvalResult::Exit(val)) => {
+                            println!("Task completed with value: {:?}", value_to_string(&val));
+                            *task = FutureValue::Completed(val);
                             executor.queue.pop_front();
-                            let traceback_msg = err
-                                .trace
-                                .iter()
-                                .rev()
-                                .map(|loc| {
-                                    format!(
-                                        "  at File \"{}\", line {}, module {}",
-                                        loc.file_path, loc.start.line, loc.module
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let traceback_msg = format!("{}\n{}", err.message, traceback_msg);
-                            let location = err.trace.last().expect("Traceback empty").clone();
-                            Report::build(
-                                ReportKind::Error,
-                                (location.module.clone(), location.span()),
-                            )
-                            .with_config(
-                                ariadne::Config::new().with_index_type(ariadne::IndexType::Byte),
-                            )
-                            .with_message(traceback_msg.clone())
-                            .with_label(
-                                Label::new((location.module.clone(), location.span()))
-                                    .with_message(err.message)
-                                    .with_color(Color::Red),
-                            )
-                            .finish()
-                            .eprint(ariadne::sources(
-                                ctx.root.sources.0.iter().map(|(a, b)| (a.clone(), b)),
-                            ))
-                            .unwrap();
-
                             if executor.queue.is_empty() {
                                 return Some(());
                             }
                         }
-                    },
-                }
-                None
-            }) {
+                        Ok(EvalResult::Continue) => {
+                            exec_ctx.advance();
+                        }
+                        Ok(EvalResult::Yield) => {
+                            executor.cycle();
+                        }
+                        Err(e) => match bubble_error(exec_ctx, e) {
+                            None => {
+                                exec_ctx.advance();
+                            }
+                            Some(err_val) => {
+                                println!("Uncaught error: {err_val:?}");
+                                let err = convert_error(&ctx, exec_ctx, &err_val);
+                                *task = FutureValue::Failed(err_val);
+                                executor.queue.pop_front();
+                                let traceback_msg = err
+                                    .trace
+                                    .iter()
+                                    .rev()
+                                    .map(|loc| {
+                                        format!(
+                                            "  at File \"{}\", line {}, module {}",
+                                            loc.file_path, loc.start.line, loc.module
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let traceback_msg = format!("{}\n{}", err.message, traceback_msg);
+                                let location = err.trace.last().expect("Traceback empty").clone();
+                                Report::build(
+                                    ReportKind::Error,
+                                    (location.module.clone(), location.span()),
+                                )
+                                .with_config(
+                                    ariadne::Config::new()
+                                        .with_index_type(ariadne::IndexType::Byte),
+                                )
+                                .with_message(traceback_msg.clone())
+                                .with_label(
+                                    Label::new((location.module.clone(), location.span()))
+                                        .with_message(err.message)
+                                        .with_color(Color::Red),
+                                )
+                                .finish()
+                                .eprint(ariadne::sources(
+                                    ctx.root.sources.0.iter().map(|(a, b)| (a.clone(), b)),
+                                ))
+                                .unwrap();
+
+                                if executor.queue.is_empty() {
+                                    return Some(());
+                                }
+                            }
+                        },
+                    }
+                    None
+                })
+                .is_some()
+            {
                 return;
             }
         }
@@ -332,7 +336,7 @@ impl<'a> Executor<'a> {
         }
     }
     pub fn enqueue(&mut self, task: GcRefLock<'a, FutureValue<'a>>) {
-        println!("Enqueuing task: {:?}", task);
+        println!("Enqueuing task: {task:?}");
         self.queue.push_back(task);
     }
     pub fn cycle(&mut self) {
@@ -480,7 +484,7 @@ fn bubble_error<'a>(exec_ctx: &mut ExecContext<'a>, err: Value<'a>) -> Option<Va
             return Some(err);
         }
     }
-    return Some(err);
+    Some(err)
 }
 fn bubble_control_flow<'a>(
     ctx: &Context<'a>,
@@ -514,7 +518,7 @@ fn bubble_control_flow<'a>(
             _ => {}
         }
     }
-    return Err(unhandled_control_flow(ctx, exec_ctx));
+    Err(unhandled_control_flow(ctx, exec_ctx))
 }
 
 fn bubble_return<'a>(
@@ -542,7 +546,7 @@ fn bubble_return<'a>(
             return Ok(Some(ret));
         }
     }
-    return Err(unhandled_control_flow(ctx, exec_ctx));
+    Err(unhandled_control_flow(ctx, exec_ctx))
 }
 
 pub enum EvalResult<'a> {
@@ -554,7 +558,7 @@ pub enum EvalResult<'a> {
 pub fn eval_instruction<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    code: &Vec<Instruction>,
+    code: &[Instruction],
 ) -> Result<EvalResult<'a>, LocatedError<'a>> {
     let instruction = &code[exec_ctx.ip];
     let env = exec_ctx.frame_stack.last().unwrap().env;
@@ -612,9 +616,9 @@ pub fn eval_instruction<'a>(
             let pattern = resolve_pattern(ctx, exec_ctx, pattern, value)?;
             for (name, val) in pattern {
                 let res = if *is_const {
-                    env.define_const(ctx, &name, val)
+                    env.define_const(ctx, name, val)
                 } else {
-                    env.define(ctx, &name, val)
+                    env.define(ctx, name, val)
                 };
                 if !res {
                     return Err(duplicate_variable_definition(ctx, exec_ctx, name));
@@ -627,7 +631,7 @@ pub fn eval_instruction<'a>(
                 env,
             }));
             if !env.define_const(ctx, name, item) {
-                return Err(duplicate_variable_definition(ctx, exec_ctx, &name));
+                return Err(duplicate_variable_definition(ctx, exec_ctx, name));
             }
         }
         Instruction::InitModule => {
@@ -739,19 +743,17 @@ pub fn eval_instruction<'a>(
             for (key, value) in entries.into_iter().rev() {
                 if let Some(key) = key {
                     entry_map.insert(key, value);
+                } else if let Value::Object(obj) = value {
+                    let obj_ref = obj.borrow();
+                    for (k, v) in obj_ref.iter() {
+                        entry_map.insert(k.clone(), v.clone());
+                    }
                 } else {
-                    if let Value::Object(obj) = value {
-                        let obj_ref = obj.borrow();
-                        for (k, v) in obj_ref.iter() {
-                            entry_map.insert(k.clone(), v.clone());
-                        }
-                    } else {
-                        return Err(type_error(
-                            ctx,
-                            exec_ctx,
-                            "Spread operator can only be applied to objects",
-                        ));
-                    };
+                    return Err(type_error(
+                        ctx,
+                        exec_ctx,
+                        "Spread operator can only be applied to objects",
+                    ));
                 }
             }
             exec_ctx.push(Value::Object(ctx.gc_lock(entry_map)));
@@ -862,9 +864,8 @@ pub fn eval_instruction<'a>(
         }
         Instruction::Return => {
             let ret = exec_ctx.pop();
-            match bubble_return(ctx, exec_ctx, ret)? {
-                Some(val) => return Ok(EvalResult::Exit(val)),
-                None => {}
+            if let Some(val) = bubble_return(ctx, exec_ctx, ret)? {
+                return Ok(EvalResult::Exit(val));
             }
         }
         Instruction::Jump(target) => {
@@ -1051,7 +1052,7 @@ pub fn eval_instruction<'a>(
             let future_borrow = future_ref.borrow();
             match &*future_borrow {
                 FutureValue::Completed(value) => {
-                    println!("Future completed with value {:?}", value);
+                    println!("Future completed with value {value:?}");
                     exec_ctx.pop();
                     exec_ctx.push(value.clone());
                 }
@@ -1071,7 +1072,7 @@ pub fn eval_instruction<'a>(
 fn pop_spread_args<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    items: &Vec<bool>,
+    items: &[bool],
 ) -> Result<Vec<Value<'a>>, LocatedError<'a>> {
     let mut items: Vec<(Value<'a>, bool)> = items
         .iter()
@@ -1158,7 +1159,10 @@ fn set_at_index<'a>(
                 return Err(type_error(ctx, exec_ctx, "Array index must be an integer"));
             };
             if let Some(index) = i.try_to_usize() {
-                if let Some(_) = buffer_type.try_write_buffer(ctx, *buffer, index, result) {
+                if buffer_type
+                    .try_write_buffer(ctx, *buffer, index, result)
+                    .is_some()
+                {
                     Ok(())
                 } else {
                     Err(type_error(
@@ -1196,12 +1200,7 @@ fn call_function<'a>(
     let f_ref = f.borrow();
     let is_async = f_ref.is_async;
 
-    let args = f_ref
-        .bound_args
-        .iter()
-        .cloned()
-        .chain(args.into_iter())
-        .collect();
+    let args = f_ref.bound_args.iter().cloned().chain(args).collect();
     let func = f_ref.func;
     drop(f_ref);
     let async_exec_ctx = match *func {
@@ -1222,10 +1221,7 @@ fn call_function<'a>(
                     return Err(type_error(
                         ctx,
                         exec_ctx,
-                        &format!(
-                            "Expected at least {} arguments, got {}",
-                            param_len, args_len
-                        ),
+                        &format!("Expected at least {param_len} arguments, got {args_len}"),
                     ));
                 } else {
                     let call_env = ctx.gc(Environment::new(ctx, func_env));
@@ -1244,24 +1240,22 @@ fn call_function<'a>(
                     }
                     exec_ctx.call_fn_async(call_env, body)
                 }
+            } else if args_len != param_len {
+                return Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    &format!("Expected {param_len} arguments, got {args_len}"),
+                ));
             } else {
-                if args_len != param_len {
-                    return Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        &format!("Expected {} arguments, got {}", param_len, args_len),
-                    ));
-                } else {
-                    let call_env = ctx.gc(Environment::new(ctx, func_env));
-                    for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
-                        call_env.define(ctx, param, arg);
-                    }
-                    if !is_async {
-                        exec_ctx.call_fn(call_env, body, true);
-                        return Ok(());
-                    }
-                    exec_ctx.call_fn_async(call_env, body)
+                let call_env = ctx.gc(Environment::new(ctx, func_env));
+                for (param, arg) in parameters.parameters.iter().zip(args.into_iter()) {
+                    call_env.define(ctx, param, arg);
                 }
+                if !is_async {
+                    exec_ctx.call_fn(call_env, body, true);
+                    return Ok(());
+                }
+                exec_ctx.call_fn_async(call_env, body)
             }
         }
     };
@@ -1279,7 +1273,7 @@ fn interpret_short_circuit<'a>(op: &BinaryOp, left: &Value<'a>) -> bool {
         (BinaryOp::Or, Value::Bool(true)) => true,
         (BinaryOp::NullCoalesce, Value::Null) => false,
         (BinaryOp::NullCoalesce, _) => true,
-        _ => return false,
+        _ => false,
     }
 }
 
@@ -1413,8 +1407,8 @@ pub fn get_std_env<'a>(ctx: &Context<'a>) -> Gc<'a, Environment<'a>> {
     let Some(Value::Module(std)) = root_ref.as_ref().unwrap().borrow().env.get("std") else {
         panic!("Standard library module not found");
     };
-    let std_env = std.borrow().env;
-    std_env
+
+    std.borrow().env
 }
 
 fn get_class_maybe_lazy<'a>(
@@ -1442,7 +1436,7 @@ fn get_classes<'a>(
     let class_name = target.get_type();
     let std_env = get_std_env(ctx);
     let Some(value_class) = get_class_maybe_lazy(std_env, class_name) else {
-        panic!("Standard class {} not found", class_name);
+        panic!("Standard class {class_name} not found");
     };
 
     let extra_class = if let Value::ClassInstance(instance) = target {
@@ -1513,7 +1507,7 @@ fn get_property<'a>(
             }
 
             if let Some(parent) = &cur_ref.parent {
-                let parent = parent.clone();
+                let parent = *parent;
                 drop(cur_ref);
                 class = parent;
             } else {
@@ -1548,7 +1542,7 @@ fn get_at_index<'a>(
         }
         &cur.borrow().inner
     } else {
-        &array
+        array
     };
     match array {
         Value::Array(arr) => {
@@ -1623,7 +1617,7 @@ fn set_property<'a>(
     ctx: &Context<'a>,
     exec_ctx: &ExecContext<'a>,
     object: &Value<'a>,
-    field: &String,
+    field: &str,
     result: &Value<'a>,
 ) -> Result<(), LocatedError<'a>> {
     let object = if let Value::ClassInstance(instance) = object {
@@ -1637,7 +1631,8 @@ fn set_property<'a>(
     };
     match object {
         Value::Object(obj) => {
-            obj.borrow_mut(ctx.mc).insert(field.clone(), result.clone());
+            obj.borrow_mut(ctx.mc)
+                .insert(field.to_string(), result.clone());
             Ok(())
         }
         _ => Err(type_error(
@@ -1665,7 +1660,7 @@ fn is_instance_of<'a>(object: &Value<'a>, class: GcRefLock<'a, ClassValue<'a>>) 
 fn eval_identifier<'a>(
     ctx: &Context<'a>,
     exec_ctx: &mut ExecContext<'a>,
-    ident: &String,
+    ident: &str,
     env: Gc<'a, Environment<'a>>,
 ) -> Result<(), LocatedError<'a>> {
     let val = if let Some(val) = env.get(ident) {
