@@ -1,8 +1,13 @@
-mod mod1;
+export mod mod1;
 
 print("Module main loaded");
-use root::mod1::test_fn;
+use mod1::test_fn;
 use root::mod1::TestClass2;
+
+mod inline_mod {
+    print("Inline module loaded");
+    export let val = 42;
+}
 
 async fn test_async() {
     print("Before test_async");
@@ -61,6 +66,9 @@ async fn handle_connection(stream) {
                 break;
             }
             print("Received line:", line);
+            await stream.write_string("Echo:");
+            await stream.write_string(line);
+            await stream.write_string("\n");
         }
         print("Connection closed");
     } catch (e) {
@@ -86,5 +94,6 @@ print(fut);
 print(await fut);
 print(fut);
 print("After await");
+print(inline_mod::val);
 std::std_test();
 await main_fut;

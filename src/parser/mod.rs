@@ -5,11 +5,12 @@ use chumsky::{
     input::{Stream, ValueInput},
     pratt::{Associativity, infix, postfix, prefix},
     prelude::*,
+    recursive::Indirect,
 };
 
 use crate::{
     lexer::{LocatedToken, Token},
-    location::{LineIndex, Located, Location, Position},
+    location::{Located, Location, Position},
 };
 
 mod expression;
@@ -27,10 +28,7 @@ fn located<T>(expr: T, span: SimpleSpan) -> Located<T> {
         line: 0,
         column: 0,
     };
-    Located::new(
-        expr,
-        Location::new(start, end, String::new(), String::new()),
-    )
+    Located::new(expr, Location::new(start, end, String::new()))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,7 +142,6 @@ fn pattern_parser<'tokens, 'src: 'tokens, I>()
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
-    
     recursive(|pattern| {
         let ident = select! { Token::Ident(name) => match name {
             "_" => Pattern::Wildcard,
@@ -186,13 +183,7 @@ where
                         }
                     }
                 }
-                Ok(located(
-                    Pattern::Object {
-                        entries,
-                        rest,
-                    },
-                    extra.span(),
-                ))
+                Ok(located(Pattern::Object { entries, rest }, extra.span()))
             })
             .boxed();
 
@@ -233,7 +224,7 @@ where
 
 fn parser<'tokens, 'src: 'tokens, I>(
     root_name: String,
-) -> impl Parser<'tokens, I, Vec<ParsedModuleItem>, extra::Err<Rich<'tokens, Token<'src>>>>
+) -> impl Parser<'tokens, I, Vec<LocatedExpression>, extra::Err<Rich<'tokens, Token<'src>>>>
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = SimpleSpan>,
 {
@@ -309,420 +300,420 @@ where
         })
         .boxed();
 
-    let expr = recursive(move |expr| {
-        let function_literal = parameter_list
-            .clone()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .then(expr.clone())
-            .map_with(|(params, body), extra| {
-                Box::new(located(
-                    Expression::FunctionLiteral {
-                        parameters: params,
-                        body: Box::new(body),
-                        is_async: false
-                    },
-                    extra.span(),
-                ))
-            })
-            .boxed();
+    let mut expr = Recursive::declare();
 
-        let let_ = just(Token::Let).or(just(Token::Const))
-            .then(pattern.clone())
-            .then_ignore(just(Token::Assign))
-            .then(expr.clone())
-            .map_with(|((is_const, pattern), value), extra| {
-                located(
-                    Expression::Define {
-                        pattern,
-                        value: Box::new(value),
-                        is_const: is_const == Token::Const,
-                    },
-                    extra.span(),
-                )
-            })
-            .boxed();
-
-        let parenthesized = expr
-            .clone()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .map_with(|expr, extra| located(expr.data, extra.span()));
-
-        let inline_expr = {
-            let val = select! {
-                Token::Number(n) => Expression::Number(n),
-                Token::Integer(i) => Expression::Integer(i.to_string()),
-                Token::Bool(b) => Expression::Bool(b),
-                Token::String(s) => Expression::String(s),
-                Token::Char(c) => Expression::String(c.to_string()),
-                Token::Null => Expression::Null,
-                Token::Break => Expression::Break,
-                Token::Continue => Expression::Continue,
-            }
-            .map_with(|expr, extra| located(expr, extra.span()));
-
-            let expression_spread_list = just(Token::ThreeDots)
-                .or_not()
-                .then(expr.clone())
-                .map(|(spread, expr)| (expr, spread.is_some()))
-                .clone()
-                .separated_by(just(Token::Comma))
-                .allow_trailing()
-                .collect::<Vec<_>>();
-
-            let pair_list = choice((
-                ident
-                    .then_ignore(just(Token::Colon))
-                    .map(Option::Some),
-                just(Token::ThreeDots).map(|_| None),
+    let function_literal = parameter_list
+        .clone()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .then(expr.clone())
+        .map_with(|(params, body), extra| {
+            Box::new(located(
+                Expression::FunctionLiteral {
+                    parameters: params,
+                    body: Box::new(body),
+                    is_async: false,
+                },
+                extra.span(),
             ))
+        })
+        .boxed();
+
+    let let_ = just(Token::Let)
+        .or(just(Token::Const))
+        .then(pattern.clone())
+        .then_ignore(just(Token::Assign))
+        .then(expr.clone())
+        .map_with(|((is_const, pattern), value), extra| {
+            located(
+                Expression::Define {
+                    pattern,
+                    value: Box::new(value),
+                    is_const: is_const == Token::Const,
+                },
+                extra.span(),
+            )
+        })
+        .boxed();
+
+    let parenthesized = expr
+        .clone()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .map_with(|expr, extra| located(expr.data, extra.span()));
+
+    let inline_expr = {
+        let val = select! {
+            Token::Number(n) => Expression::Number(n),
+            Token::Integer(i) => Expression::Integer(i.to_string()),
+            Token::Bool(b) => Expression::Bool(b),
+            Token::String(s) => Expression::String(s),
+            Token::Char(c) => Expression::String(c.to_string()),
+            Token::Null => Expression::Null,
+            Token::Break => Expression::Break,
+            Token::Continue => Expression::Continue,
+        }
+        .map_with(|expr, extra| located(expr, extra.span()));
+
+        let expression_spread_list = just(Token::ThreeDots)
+            .or_not()
             .then(expr.clone())
+            .map(|(spread, expr)| (expr, spread.is_some()))
+            .clone()
             .separated_by(just(Token::Comma))
             .allow_trailing()
-            .collect::<Vec<_>>()
-            .boxed();
+            .collect::<Vec<_>>();
 
-            let new_expr = just(Token::New)
-                .ignore_then(choice((parenthesized.clone(), double_colon_identifier.clone())))
-                .then(
-                    expr.clone()
-                        .separated_by(just(Token::Comma))
-                        .collect::<Vec<_>>()
-                        .delimited_by(just(Token::LParen), just(Token::RParen)),
-                )
-                .map_with(|(expr, args), extra| {
-                    located(
-                        Expression::New {
-                            expr: Box::new(expr),
-                            arguments: args,
-                        },
-                        extra.span(),
-                    )
-                })
-                .boxed();
+        let pair_list = choice((
+            ident.then_ignore(just(Token::Colon)).map(Option::Some),
+            just(Token::ThreeDots).map(|_| None),
+        ))
+        .then(expr.clone())
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .boxed();
 
-            let import_expr = just(Token::Use)
-                .ignore_then(
-                    double_colon_identifier_with_name
-                        .map_with(|(expr, name), extra| {
-                            located(
-                                Expression::Define {
-                                    pattern: located(Pattern::Ident(name.clone()), extra.span()),
-                                    value: Box::new(expr),
-                                    is_const: true,
-                                },
-                                extra.span(),
-                            )
-                        }),
-                )
-                .boxed();
-
-            let atom = choice((
-                double_colon_identifier,
-                val,
-                new_expr,
-                import_expr,
-                just(Token::Return)
-                    .ignore_then(expr.clone().or_not())
-                    .map_with(|expr, extra| {
-                        located(Expression::Return(expr.map(Box::new)), extra.span())
-                    }),
-                just(Token::Raise)
-                    .ignore_then(expr.clone())
-                    .map_with(|expr, extra| {
-                        located(Expression::Raise(Box::new(expr)), extra.span())
-                    }),
-                just(Token::Await)
-                    .ignore_then(expr.clone().or_not())
-                    .map_with(|expr, extra| {
-                        located(Expression::Await(expr.map(Box::new)), extra.span())
-                    }),
-                let_.clone(),
-                just(Token::Async)
-                    .or_not()
-                    .then(parameter_list)
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .then_ignore(just(Token::DoubleArrow))
-                    .then(expr.clone())
-                    .map_with(|((is_async, params), body), extra| {
-                        located(
-                            Expression::FunctionLiteral {
-                                parameters: params,
-                                body: Box::new(body),
-                                is_async: is_async.is_some(),
-                            },
-                            extra.span(),
-                        )
-                    }),
-                expression_spread_list
-                    .clone()
-                    .delimited_by(just(Token::LBracket), just(Token::RBracket))
-                    .map(Expression::ArrayLiteral)
-                    .map_with(|expr, extra| located(expr, extra.span())),
+        let new_expr = just(Token::New)
+            .ignore_then(choice((
                 parenthesized.clone(),
-                pair_list
-                    .clone()
-                    .delimited_by(just(Token::LBrace), just(Token::RBrace))
-                    .map_with(|pairs, extra| {
-                        located(Expression::ObjectLiteral(pairs), extra.span())
-                    }),
-            ))
-            .labelled("expression")
-            .boxed();
-
-            let op = |c| just(c);
-            let bin_infix = |assoc, token, binary_op: BinaryOp| {
-                infix(assoc, op(token), move |lhs, _, rhs, extra| {
-                    located(
-                        Expression::BinaryOp {
-                            op: binary_op.clone(),
-                            left: Box::new(lhs),
-                            right: Box::new(rhs),
-                        },
-                        extra.span(),
-                    )
-                })
-            };
-            let bin_infix_assign = |assoc, token, binary_op: Option<BinaryOp>| {
-                infix(assoc, op(token), move |lhs, _, rhs, extra| {
-                    located(
-                        Expression::Assign {
-                            op: binary_op.clone(),
-                            target: Box::new(lhs),
-                            value: Box::new(rhs),
-                        },
-                        extra.span(),
-                    )
-                })
-            };
-
-            let unary_prefix = |token, unary_op: UnaryOp| {
-                prefix(14, op(token), move |_, expr, extra| {
-                    located(
-                        Expression::UnaryOp {
-                            op: unary_op.clone(),
-                            expr: Box::new(expr),
-                        },
-                        extra.span(),
-                    )
-                })
-            };
-
-            let operators = atom.pratt((
-                unary_prefix(Token::Minus, UnaryOp::Negate),
-                unary_prefix(Token::Not, UnaryOp::Not),
-                bin_infix(Associativity::Left(13), Token::Star, BinaryOp::Multiply),
-                bin_infix(Associativity::Left(13), Token::Slash, BinaryOp::Divide),
-                bin_infix(Associativity::Left(13), Token::Percent, BinaryOp::Modulo),
-                bin_infix(Associativity::Left(12), Token::Plus, BinaryOp::Add),
-                bin_infix(Associativity::Left(12), Token::Minus, BinaryOp::Subtract),
-                bin_infix(Associativity::Left(10), Token::Less, BinaryOp::Less),
-                bin_infix(
-                    Associativity::Left(10),
-                    Token::LessEqual,
-                    BinaryOp::LessEqual,
-                ),
-                bin_infix(Associativity::Left(10), Token::Greater, BinaryOp::Greater),
-                bin_infix(
-                    Associativity::Left(10),
-                    Token::GreaterEqual,
-                    BinaryOp::GreaterEqual,
-                ),
-                bin_infix(Associativity::Left(9), Token::Equal, BinaryOp::Equal),
-                bin_infix(Associativity::Left(9), Token::NotEqual, BinaryOp::NotEqual),
-                bin_infix(Associativity::Left(6), Token::And, BinaryOp::And),
-                bin_infix(Associativity::Left(5), Token::Or, BinaryOp::Or),
-                bin_infix(
-                    Associativity::Left(4),
-                    Token::NullCoalesce,
-                    BinaryOp::NullCoalesce,
-                ),
-                bin_infix_assign(Associativity::Right(3), Token::Assign, None),
-                bin_infix_assign(
-                    Associativity::Right(3),
-                    Token::PlusAssign,
-                    Some(BinaryOp::Add),
-                ),
-                bin_infix_assign(
-                    Associativity::Right(3),
-                    Token::MinusAssign,
-                    Some(BinaryOp::Subtract),
-                ),
-                bin_infix_assign(
-                    Associativity::Right(3),
-                    Token::StarAssign,
-                    Some(BinaryOp::Multiply),
-                ),
-                bin_infix_assign(
-                    Associativity::Right(3),
-                    Token::SlashAssign,
-                    Some(BinaryOp::Divide),
-                ),
-                postfix(
-                    15,
-                    just(Token::Dot).or(just(Token::DoubleColon))
-                        .ignore_then(select! { Token::Ident(name) => name.to_string() }),
-                    |lhs, op, extra| {
-                        located(
-                            Expression::FieldAccess {
-                                object: Box::new(lhs),
-                                field: op,
-                            },
-                            extra.span(),
-                        )
-                    },
-                ),
-                postfix(
-                    15,
-                    expression_spread_list
-                        .clone()
-                        .delimited_by(just(Token::LParen), just(Token::RParen))
-                        .boxed(),
-                    |lhs, op, extra| {
-                        located(
-                            Expression::FunctionCall {
-                                function: Box::new(lhs),
-                                arguments: op,
-                            },
-                            extra.span(),
-                        )
-                    },
-                ),
-                postfix(
-                    15,
-                    just(Token::LBracket)
-                        .ignore_then(expr.clone())
-                        .then_ignore(just(Token::RBracket)),
-                    |lhs, op, extra| {
-                        located(
-                            Expression::ArrayIndex {
-                                array: Box::new(lhs),
-                                index: Box::new(op),
-                            },
-                            extra.span(),
-                        )
-                    },
-                ),
-            ));
-
-            operators.labelled("expression").boxed()
-        };
-        let for_iter_loop = just(Token::For)
-            .ignore_then(just(Token::LParen))
-            .ignore_then(
-                ident
-                    .then_ignore(just(Token::In))
-                    .then(expr.clone()),
-            )
-            .then_ignore(just(Token::RParen))
-            .then(expr.clone())
-            .map_with(|((item, iterable), body), extra| {
-                located(desugar_iter_loop(item, iterable, body), extra.span())
-            })
-            .boxed();
-
-        let for_loop = just(Token::For)
-            .ignore_then(
+                double_colon_identifier.clone(),
+            )))
+            .then(
                 expr.clone()
-                    .then_ignore(just(Token::Semicolon))
-                    .then(expr.clone())
-                    .then_ignore(just(Token::Semicolon))
-                    .then(expr.clone())
+                    .separated_by(just(Token::Comma))
+                    .collect::<Vec<_>>()
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             )
-            .then(expr.clone())
-            .map_with(|(((init, condition), increment), body), extra| {
+            .map_with(|(expr, args), extra| {
                 located(
-                    Expression::Loop {
-                        init: Some(Box::new(init)),
-                        condition: Box::new(condition),
-                        increment: Some(Box::new(increment)),
-                        body: Box::new(body),
+                    Expression::New {
+                        expr: Box::new(expr),
+                        arguments: args,
                     },
                     extra.span(),
                 )
             })
             .boxed();
 
-        let while_loop = just(Token::While)
-            .ignore_then(parenthesized.clone())
-            .then(expr.clone())
-            .map_with(|(condition, body), extra| {
-                located(
-                    Expression::Loop {
-                        init: None,
-                        condition: Box::new(condition),
-                        increment: None,
-                        body: Box::new(body),
-                    },
-                    extra.span(),
-                )
-            })
-            .boxed();
-
-        let try_catch = just(Token::Try)
-            .ignore_then(expr.clone())
-            .then(
-                just(Token::Catch)
-                    .ignore_then(
-                        expr.clone()
-                            .then_ignore(just(Token::As))
-                            .or_not()
-                            .then(select! { Token::Ident(name) => name.to_string() })
-                            .delimited_by(just(Token::LParen), just(Token::RParen)),
-                    )
-                    .then(expr.clone()),
-            )
-            .map_with(
-                |(try_block, ((exception_type, exception_name), catch_block)), extra| {
+        let import_expr = just(Token::Use)
+            .ignore_then(
+                double_colon_identifier_with_name.map_with(|(expr, name), extra| {
                     located(
-                        Expression::TryCatch {
-                            try_block: Box::new(try_block),
-                            catch_block: Box::new(catch_block),
-                            exception_var: exception_name,
-                            exception_prototype: exception_type.map(Box::new),
+                        Expression::Define {
+                            pattern: located(Pattern::Ident(name.clone()), extra.span()),
+                            value: Box::new(expr),
+                            is_const: true,
+                        },
+                        extra.span(),
+                    )
+                }),
+            )
+            .boxed();
+
+        let atom = choice((
+            double_colon_identifier,
+            val,
+            new_expr,
+            import_expr,
+            just(Token::Return)
+                .ignore_then(expr.clone().or_not())
+                .map_with(|expr, extra| {
+                    located(Expression::Return(expr.map(Box::new)), extra.span())
+                }),
+            just(Token::Raise)
+                .ignore_then(expr.clone())
+                .map_with(|expr, extra| located(Expression::Raise(Box::new(expr)), extra.span())),
+            just(Token::Await)
+                .ignore_then(expr.clone().or_not())
+                .map_with(|expr, extra| {
+                    located(Expression::Await(expr.map(Box::new)), extra.span())
+                }),
+            let_.clone(),
+            just(Token::Async)
+                .or_not()
+                .then(parameter_list)
+                .delimited_by(just(Token::LParen), just(Token::RParen))
+                .then_ignore(just(Token::DoubleArrow))
+                .then(expr.clone())
+                .map_with(|((is_async, params), body), extra| {
+                    located(
+                        Expression::FunctionLiteral {
+                            parameters: params,
+                            body: Box::new(body),
+                            is_async: is_async.is_some(),
+                        },
+                        extra.span(),
+                    )
+                }),
+            expression_spread_list
+                .clone()
+                .delimited_by(just(Token::LBracket), just(Token::RBracket))
+                .map(Expression::ArrayLiteral)
+                .map_with(|expr, extra| located(expr, extra.span())),
+            parenthesized.clone(),
+            pair_list
+                .clone()
+                .delimited_by(just(Token::LBrace), just(Token::RBrace))
+                .map_with(|pairs, extra| located(Expression::ObjectLiteral(pairs), extra.span())),
+        ))
+        .labelled("expression")
+        .boxed();
+
+        let op = |c| just(c);
+        let bin_infix = |assoc, token, binary_op: BinaryOp| {
+            infix(assoc, op(token), move |lhs, _, rhs, extra| {
+                located(
+                    Expression::BinaryOp {
+                        op: binary_op.clone(),
+                        left: Box::new(lhs),
+                        right: Box::new(rhs),
+                    },
+                    extra.span(),
+                )
+            })
+        };
+        let bin_infix_assign = |assoc, token, binary_op: Option<BinaryOp>| {
+            infix(assoc, op(token), move |lhs, _, rhs, extra| {
+                located(
+                    Expression::Assign {
+                        op: binary_op.clone(),
+                        target: Box::new(lhs),
+                        value: Box::new(rhs),
+                    },
+                    extra.span(),
+                )
+            })
+        };
+
+        let unary_prefix = |token, unary_op: UnaryOp| {
+            prefix(14, op(token), move |_, expr, extra| {
+                located(
+                    Expression::UnaryOp {
+                        op: unary_op.clone(),
+                        expr: Box::new(expr),
+                    },
+                    extra.span(),
+                )
+            })
+        };
+
+        let operators = atom.pratt((
+            unary_prefix(Token::Minus, UnaryOp::Negate),
+            unary_prefix(Token::Not, UnaryOp::Not),
+            bin_infix(Associativity::Left(13), Token::Star, BinaryOp::Multiply),
+            bin_infix(Associativity::Left(13), Token::Slash, BinaryOp::Divide),
+            bin_infix(Associativity::Left(13), Token::Percent, BinaryOp::Modulo),
+            bin_infix(Associativity::Left(12), Token::Plus, BinaryOp::Add),
+            bin_infix(Associativity::Left(12), Token::Minus, BinaryOp::Subtract),
+            bin_infix(Associativity::Left(10), Token::Less, BinaryOp::Less),
+            bin_infix(
+                Associativity::Left(10),
+                Token::LessEqual,
+                BinaryOp::LessEqual,
+            ),
+            bin_infix(Associativity::Left(10), Token::Greater, BinaryOp::Greater),
+            bin_infix(
+                Associativity::Left(10),
+                Token::GreaterEqual,
+                BinaryOp::GreaterEqual,
+            ),
+            bin_infix(Associativity::Left(9), Token::Equal, BinaryOp::Equal),
+            bin_infix(Associativity::Left(9), Token::NotEqual, BinaryOp::NotEqual),
+            bin_infix(Associativity::Left(6), Token::And, BinaryOp::And),
+            bin_infix(Associativity::Left(5), Token::Or, BinaryOp::Or),
+            bin_infix(
+                Associativity::Left(4),
+                Token::NullCoalesce,
+                BinaryOp::NullCoalesce,
+            ),
+            bin_infix_assign(Associativity::Right(3), Token::Assign, None),
+            bin_infix_assign(
+                Associativity::Right(3),
+                Token::PlusAssign,
+                Some(BinaryOp::Add),
+            ),
+            bin_infix_assign(
+                Associativity::Right(3),
+                Token::MinusAssign,
+                Some(BinaryOp::Subtract),
+            ),
+            bin_infix_assign(
+                Associativity::Right(3),
+                Token::StarAssign,
+                Some(BinaryOp::Multiply),
+            ),
+            bin_infix_assign(
+                Associativity::Right(3),
+                Token::SlashAssign,
+                Some(BinaryOp::Divide),
+            ),
+            postfix(
+                15,
+                just(Token::Dot)
+                    .or(just(Token::DoubleColon))
+                    .ignore_then(select! { Token::Ident(name) => name.to_string() }),
+                |lhs, op, extra| {
+                    located(
+                        Expression::FieldAccess {
+                            object: Box::new(lhs),
+                            field: op,
                         },
                         extra.span(),
                     )
                 },
+            ),
+            postfix(
+                15,
+                expression_spread_list
+                    .clone()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .boxed(),
+                |lhs, op, extra| {
+                    located(
+                        Expression::FunctionCall {
+                            function: Box::new(lhs),
+                            arguments: op,
+                        },
+                        extra.span(),
+                    )
+                },
+            ),
+            postfix(
+                15,
+                just(Token::LBracket)
+                    .ignore_then(expr.clone())
+                    .then_ignore(just(Token::RBracket)),
+                |lhs, op, extra| {
+                    located(
+                        Expression::ArrayIndex {
+                            array: Box::new(lhs),
+                            index: Box::new(op),
+                        },
+                        extra.span(),
+                    )
+                },
+            ),
+        ));
+
+        operators.labelled("expression").boxed()
+    };
+    let for_iter_loop = just(Token::For)
+        .ignore_then(just(Token::LParen))
+        .ignore_then(ident.then_ignore(just(Token::In)).then(expr.clone()))
+        .then_ignore(just(Token::RParen))
+        .then(expr.clone())
+        .map_with(|((item, iterable), body), extra| {
+            located(desugar_iter_loop(item, iterable, body), extra.span())
+        })
+        .boxed();
+
+    let for_loop = just(Token::For)
+        .ignore_then(
+            expr.clone()
+                .then_ignore(just(Token::Semicolon))
+                .then(expr.clone())
+                .then_ignore(just(Token::Semicolon))
+                .then(expr.clone())
+                .delimited_by(just(Token::LParen), just(Token::RParen)),
+        )
+        .then(expr.clone())
+        .map_with(|(((init, condition), increment), body), extra| {
+            located(
+                Expression::Loop {
+                    init: Some(Box::new(init)),
+                    condition: Box::new(condition),
+                    increment: Some(Box::new(increment)),
+                    body: Box::new(body),
+                },
+                extra.span(),
             )
-            .boxed();
+        })
+        .boxed();
 
-        let if_else = just(Token::If)
-            .ignore_then(parenthesized.clone())
-            .then(expr.clone())
-            .then(just(Token::Else).ignore_then(expr.clone()).or_not())
-            .map_with(|((condition, then_branch), else_branch), extra| {
+    let while_loop = just(Token::While)
+        .ignore_then(parenthesized.clone())
+        .then(expr.clone())
+        .map_with(|(condition, body), extra| {
+            located(
+                Expression::Loop {
+                    init: None,
+                    condition: Box::new(condition),
+                    increment: None,
+                    body: Box::new(body),
+                },
+                extra.span(),
+            )
+        })
+        .boxed();
+
+    let try_catch = just(Token::Try)
+        .ignore_then(expr.clone())
+        .then(
+            just(Token::Catch)
+                .ignore_then(
+                    expr.clone()
+                        .then_ignore(just(Token::As))
+                        .or_not()
+                        .then(select! { Token::Ident(name) => name.to_string() })
+                        .delimited_by(just(Token::LParen), just(Token::RParen)),
+                )
+                .then(expr.clone()),
+        )
+        .map_with(
+            |(try_block, ((exception_type, exception_name), catch_block)), extra| {
                 located(
-                    Expression::If {
-                        condition: Box::new(condition),
-                        then_branch: Box::new(then_branch),
-                        else_branch: else_branch.map(Box::new),
+                    Expression::TryCatch {
+                        try_block: Box::new(try_block),
+                        catch_block: Box::new(catch_block),
+                        exception_var: exception_name,
+                        exception_prototype: exception_type.map(Box::new),
                     },
                     extra.span(),
                 )
-            })
-            .boxed();
+            },
+        )
+        .boxed();
 
-        let function =  just(Token::Async)
-            .or_not()
-            .then_ignore(just(Token::Fn))
-            .then(ident)
-            .map_with(|(is_async , name), extra| (is_async.is_some(), located(Pattern::Ident(name), extra.span())))
-            .then(function_literal.clone())
-            .map_with(|((is_async, pattern), mut func), extra| {
-                set_function_literal_async(&mut func, is_async);
-                located(
-                    Expression::Define {
-                        pattern,
-                        value: func,
-                        is_const: true,
-                    },
-                    extra.span(),
-                )
-            })
-            .boxed();
+    let if_else = just(Token::If)
+        .ignore_then(parenthesized.clone())
+        .then(expr.clone())
+        .then(just(Token::Else).ignore_then(expr.clone()).or_not())
+        .map_with(|((condition, then_branch), else_branch), extra| {
+            located(
+                Expression::If {
+                    condition: Box::new(condition),
+                    then_branch: Box::new(then_branch),
+                    else_branch: else_branch.map(Box::new),
+                },
+                extra.span(),
+            )
+        })
+        .boxed();
 
-        let class = just(Token::Class)
+    let function = just(Token::Async)
+        .or_not()
+        .then_ignore(just(Token::Fn))
+        .then(ident)
+        .map_with(|(is_async, name), extra| {
+            (
+                is_async.is_some(),
+                located(Pattern::Ident(name), extra.span()),
+            )
+        })
+        .then(function_literal.clone())
+        .map_with(|((is_async, pattern), mut func), extra| {
+            set_function_literal_async(&mut func, is_async);
+            located(
+                Expression::Define {
+                    pattern,
+                    value: func,
+                    is_const: true,
+                },
+                extra.span(),
+            )
+        })
+        .boxed();
+
+    let class = just(Token::Class)
             .ignore_then(select! { Token::Ident(name) => name.to_string() })
             .map_with(|name, extra| located(Pattern::Ident(name), extra.span()))
             .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
@@ -805,77 +796,85 @@ where
                 ))
             })
             .boxed();
-        let block = recursive(|block| {
-            let no_semi_statements = choice((
-                function.clone(),
-                class.clone(),
-                if_else.clone(),
-                try_catch.clone(),
-                for_loop.clone(),
-                for_iter_loop.clone(),
-                while_loop.clone(),
-                block.clone(),
-            ))
-            .boxed();
-            // Note the order here matters: we want to try parsing no-semi statements first,
-            // so that an empty block {} is not interpreted as an object literal.
-            let statement = choice((
-                no_semi_statements
-                    .clone()
-                    .then(just(Token::Semicolon).or_not()),
-                inline_expr
-                    .clone()
-                    .then(just(Token::Semicolon).map(Some)),
-            ))
-            .boxed();
-            let last_statement = choice((no_semi_statements, inline_expr.clone()));
-            statement
+
+    let mut block: Recursive<Indirect<_, Located<Expression>, _>> = Recursive::declare();
+
+    let mut module_item: Recursive<Indirect<_, Located<Expression>, _>> = Recursive::declare();
+
+    let inline_module = just(Token::Mod)
+        .ignore_then(ident)
+        .then(
+            module_item
+                .clone()
                 .repeated()
                 .collect::<Vec<_>>()
-                .then(last_statement.or_not())
                 .delimited_by(just(Token::LBrace), just(Token::RBrace))
-                .map_with(|(statements, last_statement), extra| {
-                    located(
-                        statements_to_block(statements, last_statement),
-                        extra.span(),
-                    )
-                })
+                .or_not(),
+        )
+        .map_with(|(name, body), extra| {
+            let expr = if let Some(body) = body {
+                Expression::ModuleLiteral { expressions: body }
+            } else {
+                Expression::ExternalModule(name.clone())
+            };
+            located(
+                Expression::Define {
+                    pattern: located(Pattern::Ident(name.to_string()), extra.span()),
+                    value: Box::new(located(expr, extra.span())),
+                    is_const: true,
+                },
+                extra.span(),
+            )
         })
         .boxed();
 
-        choice((
-            function,
-            class,
-            if_else,
-            try_catch,
-            for_loop,
-            for_iter_loop,
-            while_loop,
-            block,
-            inline_expr,
-        ))
-        .boxed()
-    })
+    let no_semi_statements = choice((
+        function.clone(),
+        class.clone(),
+        if_else.clone(),
+        try_catch.clone(),
+        for_loop.clone(),
+        for_iter_loop.clone(),
+        while_loop.clone(),
+        inline_module.clone(),
+        block.clone(),
+    ))
     .boxed();
 
-    let module = just(Token::Mod)
-        .ignore_then(ident)
-        .then_ignore(just(Token::Semicolon))
-        .map_with(|name, extra| ParsedModuleItem::Module(located(name.to_string(), extra.span())))
+    // Note the order here matters: we want to try parsing no-semi statements first,
+    // so that an empty block {} is not interpreted as an object literal.
+    let statement = choice((
+        no_semi_statements
+            .clone()
+            .then(just(Token::Semicolon).or_not()),
+        inline_expr.clone().then(just(Token::Semicolon).map(Some)),
+    ))
+    .boxed();
+
+    let last_statement = choice((no_semi_statements.clone(), inline_expr.clone()));
+
+    let inner_block = statement
+        .clone()
+        .repeated()
+        .collect::<Vec<_>>()
+        .then(last_statement.or_not())
+        .map_with(|(statements, last_statement), extra| {
+            located(
+                statements_to_block(statements, last_statement),
+                extra.span(),
+            )
+        })
         .boxed();
 
-    let module_item = choice((
+    block.define(inner_block.delimited_by(just(Token::LBrace), just(Token::RBrace)));
+
+    expr.define(choice((no_semi_statements, inline_expr)).boxed());
+
+    module_item.define(
         just(Token::Export)
             .or_not()
-            .then(expr.clone())
-            .then(just(Token::Semicolon).or_not())
-            .try_map_with(|((is_export, data), semicolon), extra| {
-                if needs_semi(&data.data) && semicolon.is_none() {
-                    return Err(chumsky::error::Rich::custom(
-                        extra.span(),
-                        "Expected ';' after expression in block",
-                    ));
-                };
+            .then(statement.clone())
+            .try_map_with(|(is_export, (data, _)), extra| {
                 if is_export.is_some() {
                     let Expression::Define {
                         pattern,
@@ -898,52 +897,28 @@ where
                         }
                     };
                     let expr = Expression::CanonicDefine { name, value };
-                    Ok(ParsedModuleItem::Expression(Located::new(
-                        expr,
-                        data.location,
-                    )))
+                    Ok(Located::new(expr, data.location))
                 } else {
-                    Ok(ParsedModuleItem::Expression(data))
+                    Ok(data)
                 }
             }),
-        module.clone(),
-    ));
+    );
 
     module_item.repeated().collect::<Vec<_>>()
 }
 
 pub fn parse<'a>(
     source: &str,
-    line_index: &LineIndex,
     root_name: String,
-    module_path: &str,
-    file_path: &str,
     tokens: Vec<LocatedToken<'a>>,
-) -> Result<Vec<ParsedModuleItem>, Vec<Rich<'a, Token<'a>>>> {
+) -> Result<Vec<LocatedExpression>, Vec<Rich<'a, Token<'a>>>> {
     let token_iter = tokens
         .into_iter()
         .map(|lt| (lt.data, lt.location.span().into()));
     let source_len = source.len();
     let token_stream =
         Stream::from_iter(token_iter).map((source_len..source_len).into(), |(t, s): (_, _)| (t, s));
-    parser(root_name)
-        .parse(token_stream)
-        .into_result()
-        .map(|mut pm| {
-            for item in &mut pm {
-                match item {
-                    ParsedModuleItem::Expression(e) => {
-                        e.set_module(module_path, file_path, line_index)
-                    }
-                    ParsedModuleItem::Module(m) => {
-                        m.location.module = module_path.to_string();
-                        m.location.file_path = file_path.to_string();
-                        m.location.update_position(line_index);
-                    }
-                }
-            }
-            pm
-        })
+    parser(root_name).parse(token_stream).into_result()
 }
 
 fn needs_semi(expr: &Expression) -> bool {

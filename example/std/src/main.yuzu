@@ -44,6 +44,13 @@ export class AsyncResource {
     async fn read(buffer) {
         await intrinsics::resource_read_async(this, buffer)
     }
+    async fn write(buffer) {
+        await intrinsics::resource_write_async(this, buffer)
+    }
+    async fn write_string(string) {
+        let buffer = intrinsics::buffer_from_string(string);
+        await intrinsics::resource_write_async(this, buffer);
+    }
 }
 
 export class Resource {
@@ -52,6 +59,9 @@ export class Resource {
     }
     fn read(buffer) {
         intrinsics::resource_read(this, buffer)
+    }
+    fn write(buffer) {
+        intrinsics::resource_write(this, buffer)
     }
 }
 
@@ -193,6 +203,8 @@ export class TcpListener {
     }
 }
 
+export class Module {}
+
 print("Loading std.yuzu", TcpListener);
 
 //initialize lazy statics
@@ -210,3 +222,4 @@ Object;
 Bool;
 Null;
 Option;
+Module;

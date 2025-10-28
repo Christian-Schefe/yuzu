@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use crate::{
-    location::{LineIndex, Located},
+    location::{LineIndex, Located, Location},
     parser::{BinaryOp, UnaryOp},
 };
 
@@ -37,6 +37,7 @@ pub enum Expression {
     ModuleLiteral {
         expressions: Vec<LocatedExpression>,
     },
+    ExternalModule(String),
     Assign {
         target: Box<LocatedExpression>,
         value: Box<LocatedExpression>,
@@ -144,11 +145,6 @@ impl ClassMember {
             properties,
         }
     }
-}
-
-pub enum ParsedModuleItem {
-    Expression(LocatedExpression),
-    Module(Located<String>),
 }
 
 #[derive(Debug, Clone)]
@@ -312,8 +308,7 @@ pub fn desugar_iter_loop(
 }
 
 impl Located<Pattern> {
-    pub fn set_module(&mut self, module_path: &str, file_path: &str, line_index: &LineIndex) {
-        self.location.module = module_path.to_string();
+    pub fn set_module(&mut self, file_path: &str, line_index: &LineIndex) {
         self.location.file_path = file_path.to_string();
         self.location.update_position(line_index);
 
@@ -322,10 +317,10 @@ impl Located<Pattern> {
             Pattern::Ident(_) => {}
             Pattern::Object { entries, rest: _ } => entries
                 .iter_mut()
-                .for_each(|(_, p)| p.set_module(module_path, file_path, line_index)),
+                .for_each(|(_, p)| p.set_module(file_path, line_index)),
             Pattern::Array { items, rest: _ } => items
                 .iter_mut()
-                .for_each(|e| e.set_module(module_path, file_path, line_index)),
+                .for_each(|e| e.set_module(file_path, line_index)),
         }
     }
 }
@@ -361,152 +356,202 @@ impl Display for FunctionParameters {
 }
 
 impl LocatedExpression {
-    pub fn set_module(&mut self, module_path: &str, file_path: &str, line_index: &LineIndex) {
-        self.location.module = module_path.to_string();
-        self.location.file_path = file_path.to_string();
-        self.location.update_position(line_index);
-
-        match &mut self.data {
-            Expression::Number(_) => {}
-            Expression::Integer(_) => {}
-            Expression::Bool(_) => {}
-            Expression::String(_) => {}
-            Expression::ArrayLiteral(elements) => elements
-                .iter_mut()
-                .for_each(|e| e.0.set_module(module_path, file_path, line_index)),
-            Expression::ObjectLiteral(fields) => fields
-                .iter_mut()
-                .for_each(|(_, v)| v.set_module(module_path, file_path, line_index)),
-            Expression::CanonicDefine { value, .. } => {
-                value.set_module(module_path, file_path, line_index)
-            }
-            Expression::FunctionLiteral {
-                body,
-                parameters: _,
-                is_async: _,
-            } => body.set_module(module_path, file_path, line_index),
-            Expression::ClassLiteral {
-                parent: _,
-                constructor,
-                properties,
-            } => {
-                properties
-                    .iter_mut()
-                    .for_each(|(_, v, _)| v.set_module(module_path, file_path, line_index));
-                if let Some(constructor) = constructor {
-                    constructor.set_module(module_path, file_path, line_index);
+    pub fn set_module(&mut self, file_path: &str, line_index: &LineIndex) {
+        self.visit(|e| {
+            e.location.file_path = file_path.to_string();
+            e.location.update_position(line_index);
+            match &mut e.data {
+                Expression::Define { pattern, .. } => {
+                    pattern.set_module(file_path, line_index);
                 }
+                _ => {}
             }
-            Expression::ModuleLiteral { expressions } => {
-                expressions
-                    .iter_mut()
-                    .for_each(|e| e.set_module(module_path, file_path, line_index));
-            }
-            Expression::Null => {}
-            Expression::Assign {
-                target,
-                value,
-                op: _,
-            } => {
-                target.set_module(module_path, file_path, line_index);
-                value.set_module(module_path, file_path, line_index);
-            }
-            Expression::BinaryOp { op: _, left, right } => {
-                left.set_module(module_path, file_path, line_index);
-                right.set_module(module_path, file_path, line_index);
-            }
-            Expression::UnaryOp { op: _, expr } => {
-                expr.set_module(module_path, file_path, line_index)
-            }
-            Expression::Define {
-                pattern,
+        });
+    }
+
+    pub fn replace_external_modules<F>(&mut self, mut handler: F) -> bool
+    where
+        F: FnMut(&String, &Location) -> Option<LocatedExpression>,
+    {
+        let mut success = true;
+        self.visit(|e| {
+            if let Expression::CanonicDefine { name: _, value }
+            | Expression::Define {
+                pattern: _,
                 value,
                 is_const: _,
-            } => {
-                pattern.set_module(module_path, file_path, line_index);
-                value.set_module(module_path, file_path, line_index);
-            }
-            Expression::Block(exprs, ret) => {
-                exprs
-                    .iter_mut()
-                    .for_each(|e| e.set_module(module_path, file_path, line_index));
-                if let Some(ret) = ret {
-                    ret.set_module(module_path, file_path, line_index);
+            } = &mut e.data
+            {
+                if let Expression::ExternalModule(name) = &value.data {
+                    let Some(res) = handler(name, &value.location) else {
+                        success = false;
+                        return;
+                    };
+                    *value = Box::new(res);
                 }
             }
-            Expression::If {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                condition.set_module(module_path, file_path, line_index);
-                then_branch.set_module(module_path, file_path, line_index);
-                if let Some(else_branch) = else_branch {
-                    else_branch.set_module(module_path, file_path, line_index);
+        });
+        success
+    }
+
+    pub fn visit<F>(&mut self, mut accept: F)
+    where
+        F: FnMut(&mut LocatedExpression),
+    {
+        let mut stack = vec![self];
+        while let Some(current) = stack.pop() {
+            accept(current);
+            match &mut current.data {
+                Expression::Block(statements, last_expr) => {
+                    stack.extend(statements.iter_mut());
+                    if let Some(last) = last_expr {
+                        stack.push(last);
+                    }
                 }
-            }
-            Expression::TryCatch {
-                try_block,
-                exception_prototype,
-                exception_var: _,
-                catch_block,
-            } => {
-                try_block.set_module(module_path, file_path, line_index);
-                if let Some(exception_prototype) = exception_prototype {
-                    exception_prototype.set_module(module_path, file_path, line_index);
+                Expression::Loop {
+                    init,
+                    condition,
+                    increment,
+                    body,
+                } => {
+                    if let Some(init) = init {
+                        stack.push(init);
+                    }
+                    stack.push(condition);
+                    if let Some(inc) = increment {
+                        stack.push(inc);
+                    }
+                    stack.push(body);
                 }
-                catch_block.set_module(module_path, file_path, line_index);
-            }
-            Expression::Loop {
-                init,
-                condition,
-                increment,
-                body,
-            } => {
-                if let Some(init) = init {
-                    init.set_module(module_path, file_path, line_index);
+                Expression::Null => {}
+                Expression::Number(_) => {}
+                Expression::Integer(_) => {}
+                Expression::Bool(_) => {}
+                Expression::String(_) => {}
+                Expression::Ident(_) => {}
+                Expression::Break => {}
+                Expression::Continue => {}
+                Expression::Return(located) => {
+                    if let Some(expr) = located {
+                        stack.push(expr);
+                    }
                 }
-                condition.set_module(module_path, file_path, line_index);
-                if let Some(increment) = increment {
-                    increment.set_module(module_path, file_path, line_index);
+                Expression::ArrayLiteral(items) => {
+                    for (item, _) in items.iter_mut() {
+                        stack.push(item);
+                    }
                 }
-                body.set_module(module_path, file_path, line_index);
-            }
-            Expression::Ident(_) => {}
-            Expression::ArrayIndex { array, index } => {
-                array.set_module(module_path, file_path, line_index);
-                index.set_module(module_path, file_path, line_index);
-            }
-            Expression::FieldAccess { object, field: _ } => {
-                object.set_module(module_path, file_path, line_index);
-            }
-            Expression::FunctionCall {
-                function,
-                arguments,
-            } => {
-                function.set_module(module_path, file_path, line_index);
-                arguments.iter_mut().for_each(|(arg, _)| {
-                    arg.set_module(module_path, file_path, line_index);
-                });
-            }
-            Expression::Break => {}
-            Expression::Continue => {}
-            Expression::Return(expr) => {
-                if let Some(expr) = expr {
-                    expr.set_module(module_path, file_path, line_index);
+                Expression::CanonicDefine { name: _, value } => {
+                    stack.push(value);
                 }
-            }
-            Expression::Raise(expr) => expr.set_module(module_path, file_path, line_index),
-            Expression::Await(expr) => {
-                if let Some(expr) = expr {
-                    expr.set_module(module_path, file_path, line_index);
+                Expression::FunctionLiteral {
+                    parameters: _,
+                    body,
+                    is_async: _,
+                } => {
+                    stack.push(body);
                 }
-            }
-            Expression::New { expr, arguments } => {
-                expr.set_module(module_path, file_path, line_index);
-                arguments
-                    .iter_mut()
-                    .for_each(|arg| arg.set_module(module_path, file_path, line_index));
+                Expression::ClassLiteral {
+                    parent,
+                    constructor,
+                    properties,
+                } => {
+                    if let Some(parent) = parent {
+                        stack.push(parent);
+                    }
+                    if let Some(constructor) = constructor {
+                        stack.push(constructor);
+                    }
+                    for (_, value, _) in properties.iter_mut() {
+                        stack.push(value);
+                    }
+                }
+                Expression::ObjectLiteral(items) => {
+                    for (_, value) in items.iter_mut() {
+                        stack.push(value);
+                    }
+                }
+                Expression::ModuleLiteral { expressions } => {
+                    for expr in expressions.iter_mut() {
+                        stack.push(expr);
+                    }
+                }
+                Expression::ExternalModule(_) => {}
+                Expression::Assign {
+                    target,
+                    value,
+                    op: _,
+                } => {
+                    stack.push(target);
+                    stack.push(value);
+                }
+                Expression::BinaryOp { op: _, left, right } => {
+                    stack.push(left);
+                    stack.push(right);
+                }
+                Expression::UnaryOp { op: _, expr } => {
+                    stack.push(expr);
+                }
+                Expression::Define {
+                    pattern: _,
+                    value,
+                    is_const: _,
+                } => {
+                    stack.push(value);
+                }
+                Expression::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    stack.push(condition);
+                    stack.push(then_branch);
+                    if let Some(else_branch) = else_branch {
+                        stack.push(else_branch);
+                    }
+                }
+                Expression::TryCatch {
+                    try_block,
+                    exception_prototype,
+                    exception_var: _,
+                    catch_block,
+                } => {
+                    stack.push(try_block);
+                    if let Some(proto) = exception_prototype {
+                        stack.push(proto);
+                    }
+                    stack.push(catch_block);
+                }
+                Expression::ArrayIndex { array, index } => {
+                    stack.push(array);
+                    stack.push(index);
+                }
+                Expression::FieldAccess { object, field: _ } => {
+                    stack.push(object);
+                }
+                Expression::FunctionCall {
+                    function,
+                    arguments,
+                } => {
+                    stack.push(function);
+                    for (arg, _) in arguments.iter_mut() {
+                        stack.push(arg);
+                    }
+                }
+                Expression::Raise(located) => {
+                    stack.push(located);
+                }
+                Expression::Await(located) => {
+                    if let Some(expr) = located {
+                        stack.push(expr);
+                    }
+                }
+                Expression::New { expr, arguments } => {
+                    stack.push(expr);
+                    for arg in arguments.iter_mut() {
+                        stack.push(arg);
+                    }
+                }
             }
         }
     }

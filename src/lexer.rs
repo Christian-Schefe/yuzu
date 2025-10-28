@@ -218,7 +218,6 @@ pub enum Token<'a> {
     #[regex(r#""([^"\\]|\\.)*""#, |lex| {
         let slice = lex.slice();
         let unquoted = &slice[1..slice.len() - 1];
-        
         unquoted.replace(r#"\""#, r#"""#).replace(r#"\n"#, "\n").replace(r#"\t"#, "\t")
     })]
     String(String),
@@ -319,10 +318,7 @@ pub fn lex<'a>(
             line: end_pos.0,
             column: end_pos.1,
         };
-        let token = Located::new(
-            token?,
-            Location::new(start_pos, end_pos, String::new(), String::new()),
-        );
+        let token = Located::new(token?, Location::new(start_pos, end_pos, String::new()));
         tokens.push(token);
     }
     Ok(tokens)

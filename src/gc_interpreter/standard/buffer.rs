@@ -67,13 +67,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     let length = buffer.length / buffer_type.byte_size();
                     Ok(Value::Integer(IntVariant::from_u64(length as u64)))
                 }
-                _ => {
-                    Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "length can only be called on TypedSlice",
-                    ))
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "length can only be called on TypedSlice",
+                )),
             }
         })),
     );
@@ -124,13 +122,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                     let s = String::from_utf8_lossy(slice);
                     Ok(Value::String(ctx.gc(StringVariant::from_string(&s))))
                 }),
-                _ => {
-                    Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "to_string can only be called on Buffer",
-                    ))
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "to_string can only be called on Buffer",
+                )),
             }
         })),
     );
@@ -154,13 +150,11 @@ pub fn define_typed_buffer_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environmen
                         start: 0,
                     })))
                 }
-                _ => {
-                    Err(type_error(
-                        ctx,
-                        exec_ctx,
-                        "from_string can only be called on String",
-                    ))
-                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "from_string can only be called on String",
+                )),
             }
         })),
     );

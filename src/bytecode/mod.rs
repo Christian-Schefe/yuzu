@@ -8,6 +8,9 @@ pub use instruction::*;
 
 pub fn compile(expression: &LocatedExpression, code: &mut Vec<Located<Instruction>>) {
     match &expression.data {
+        Expression::ExternalModule(_) => {
+            panic!("ExternalModule expressions should not appear in bytecode compilation");
+        }
         Expression::Null => code.push(located(Instruction::PushNull, expression)),
         Expression::Number(num) => code.push(located(Instruction::PushNumber(*num), expression)),
         Expression::Integer(num) => code.push(located(

@@ -37,16 +37,14 @@ pub struct Position {
 pub struct Location {
     pub start: Position,
     pub end: Position,
-    pub module: String,
     pub file_path: String,
 }
 
 impl Location {
-    pub fn new(start: Position, end: Position, module: String, file_path: String) -> Self {
+    pub fn new(start: Position, end: Position, file_path: String) -> Self {
         Self {
             start,
             end,
-            module,
             file_path,
         }
     }
@@ -65,7 +63,6 @@ impl Location {
         Location {
             start: self.start.clone(),
             end: other.end.clone(),
-            module: self.module.clone(),
             file_path: self.file_path.clone(),
         }
     }

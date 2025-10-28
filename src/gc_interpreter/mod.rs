@@ -241,7 +241,7 @@ pub async fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) {
                                     .map(|loc| {
                                         format!(
                                             "  at File \"{}\", line {}, module {}",
-                                            loc.file_path, loc.start.line, loc.module
+                                            loc.file_path, loc.start.line, loc.file_path
                                         )
                                     })
                                     .collect::<Vec<_>>()
@@ -250,7 +250,7 @@ pub async fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) {
                                 let location = err.trace.last().expect("Traceback empty").clone();
                                 Report::build(
                                     ReportKind::Error,
-                                    (location.module.clone(), location.span()),
+                                    (location.file_path.clone(), location.span()),
                                 )
                                 .with_config(
                                     ariadne::Config::new()
@@ -258,7 +258,7 @@ pub async fn interpret(mut arena: Arena<Rootable![MyRoot<'_>]>) {
                                 )
                                 .with_message(traceback_msg.clone())
                                 .with_label(
-                                    Label::new((location.module.clone(), location.span()))
+                                    Label::new((location.file_path.clone(), location.span()))
                                         .with_message(err.message)
                                         .with_color(Color::Red),
                                 )
@@ -580,14 +580,15 @@ pub fn eval_instruction<'a>(
             .map(|f| value_to_string(f))
             .collect::<Vec<_>>()
     );
+
     println!(
         "IP {}: {:?} at {}, frames: {}",
         exec_ctx.ip,
         instruction,
-        ctx.root.source_map.borrow()[exec_ctx.ip].module,
+        ctx.root.source_map.borrow()[exec_ctx.ip].file_path,
         exec_ctx.frame_stack.len()
     );
-     */
+    */
     match instruction {
         Instruction::SetRootModule => {
             let Value::Module(module) = exec_ctx.peek() else {
@@ -657,6 +658,7 @@ pub fn eval_instruction<'a>(
             let object = exec_ctx.pop();
             if let Value::Module(module) = &object {
                 let mut module_ref = module.borrow_mut(ctx.mc);
+
                 if let Some(initializer) = module_ref.initializer
                     && !module_ref.initialized
                 {

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, vec};
+use std::{collections::HashMap, path::PathBuf};
 
 use clap::Parser;
 
@@ -76,65 +76,4 @@ async fn main() {
         &main_module_name,
     )
     .await;
-}
-
-#[derive(Clone, Debug)]
-pub struct ModulePath {
-    path: Vec<String>,
-}
-
-impl std::fmt::Display for ModulePath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.path.join("::"))
-    }
-}
-
-impl ModulePath {
-    pub fn std() -> Self {
-        Self {
-            path: vec!["std".to_string()],
-        }
-    }
-    pub fn intrinsics() -> Self {
-        Self {
-            path: vec!["intrinsics".to_string()],
-        }
-    }
-    pub fn get_root(&self) -> &str {
-        &self.path[0]
-    }
-    pub fn from_root(root: &str) -> Self {
-        Self {
-            path: vec![root.to_string()],
-        }
-    }
-    pub fn new(path: Vec<String>) -> Self {
-        if path.is_empty() {
-            panic!("ModulePath cannot be empty");
-        }
-        Self { path }
-    }
-    pub fn push(&self, segment: String) -> Self {
-        let mut new_path = self.path.clone();
-        new_path.push(segment);
-        Self { path: new_path }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CanonicalPath {
-    pub path: ModulePath,
-    pub item: String,
-}
-
-impl std::fmt::Display for CanonicalPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}::{}", self.path, self.item)
-    }
-}
-
-impl CanonicalPath {
-    pub fn new(path: ModulePath, item: String) -> Self {
-        Self { path, item }
-    }
 }

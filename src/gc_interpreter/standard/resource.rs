@@ -209,6 +209,38 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             }
         })),
     );
+    env.define(
+        ctx,
+        "resource_close_async",
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 1)?;
+            match &args[0] {
+                Value::AsyncResource(res) => {
+                    let resource = res.0.clone();
+                    let fut = async move { resource.close().await };
+                    do_async(
+                        ctx,
+                        exec_ctx,
+                        fut,
+                        vec![],
+                        move |ctx, exec_ctx, res, _| match res {
+                            Err(e) => Err(io_error(
+                                ctx,
+                                exec_ctx,
+                                &format!("Failed to close resource: {e}"),
+                            )),
+                            Ok(_) => Ok(Value::Null),
+                        },
+                    )
+                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Close argument must be an async resource",
+                )),
+            }
+        })),
+    );
     env.define_const(
         ctx,
         "resource_read",
@@ -240,12 +272,12 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
             expect_arg_len(ctx, exec_ctx, &args, 2)?;
             match &args[0] {
                 Value::AsyncResource(res) => {
-                    let resourec = res.0.clone();
+                    let resource = res.0.clone();
                     let buf = expect_buffer_arg(ctx, exec_ctx, &args[1])?;
                     let len = buf.length;
                     let fut = async move {
                         let mut buffer = vec![0u8; len];
-                        let read_fut = resourec.read(&mut buffer);
+                        let read_fut = resource.read(&mut buffer);
                         let bytes_read = read_fut.await;
                         bytes_read.map(|n| (n, buffer))
                     };
@@ -301,6 +333,44 @@ pub fn define_resource_globals<'a>(ctx: &Context<'a>, env: Gc<'a, Environment<'a
                     ctx,
                     exec_ctx,
                     "Write argument must be a resource",
+                )),
+            }
+        })),
+    );
+    env.define(
+        ctx,
+        "resource_write_async",
+        Value::Function(make_builtin_function(ctx, |ctx, exec_ctx, args, _| {
+            expect_arg_len(ctx, exec_ctx, &args, 2)?;
+            match &args[0] {
+                Value::AsyncResource(res) => {
+                    let resource = res.0.clone();
+                    let buf = expect_buffer_arg(ctx, exec_ctx, &args[1])?;
+                    let data = buf.with_slice(|slice| slice.to_vec());
+                    let fut = async move {
+                        let write_fut = resource.write(&data);
+                        let bytes_written = write_fut.await;
+                        bytes_written
+                    };
+                    do_async(
+                        ctx,
+                        exec_ctx,
+                        fut,
+                        vec![Value::Buffer(buf)],
+                        move |ctx, exec_ctx, res, _| match res {
+                            Err(e) => Err(io_error(
+                                ctx,
+                                exec_ctx,
+                                &format!("Failed to write to resource: {e}"),
+                            )),
+                            Ok(n) => Ok(Value::Integer(IntVariant::from_u64(n as u64))),
+                        },
+                    )
+                }
+                _ => Err(type_error(
+                    ctx,
+                    exec_ctx,
+                    "Write argument must be an async resource",
                 )),
             }
         })),
